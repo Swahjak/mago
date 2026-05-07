@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
+use mago_atom::Atom;
 use mago_atom::AtomMap;
 use mago_atom::ascii_lowercase_constant_name_atom;
 use mago_atom::atom;
@@ -76,6 +77,7 @@ use crate::utils::str_is_numeric;
 /// These constants (`true`, `false`, `null`) are parsed as `Literal` nodes when bare,
 /// but become `ConstantAccess` nodes when accessed via FQN (e.g. `\true`).
 #[inline]
+#[must_use]
 pub fn get_literal_constant_type(name: &str) -> Option<TUnion> {
     let name = name.strip_prefix('\\').unwrap_or(name);
 
@@ -118,13 +120,13 @@ pub fn get_platform_constant_type(name: &str) -> Option<TUnion> {
     });
 
     const PHP_INT_MAX_SLICE: &[TAtomic] = &[
-        TAtomic::Scalar(TScalar::Integer(TInteger::Literal(9_223_372_036_854_775_807))),
-        TAtomic::Scalar(TScalar::Integer(TInteger::Literal(2_147_483_647))),
+        TAtomic::Scalar(TScalar::Integer(TInteger::Literal(i64::MAX))),
+        TAtomic::Scalar(TScalar::Integer(TInteger::Literal(i32::MAX as i64))),
     ];
 
     const PHP_INT_MIN_SLICE: &[TAtomic] = &[
-        TAtomic::Scalar(TScalar::Integer(TInteger::Literal(-9_223_372_036_854_775_808))),
-        TAtomic::Scalar(TScalar::Integer(TInteger::Literal(-2_147_483_648))),
+        TAtomic::Scalar(TScalar::Integer(TInteger::Literal(i64::MIN))),
+        TAtomic::Scalar(TScalar::Integer(TInteger::Literal(i32::MIN as i64))),
     ];
 
     const PHP_MAJOR_VERSION_ATOMIC: &TAtomic = &TAtomic::Scalar(TScalar::Integer(TInteger::Range(8, 9)));
@@ -194,8 +196,9 @@ pub(super) fn infer<'arena>(
     context: &Context<'_, 'arena>,
     scope: &NamespaceScope,
     expression: &'arena Expression<'arena>,
+    enclosing_class: Option<Atom>,
 ) -> Option<TUnion> {
-    infer_with_constants(context, scope, expression, None)
+    infer_with_constants(context, scope, expression, enclosing_class, None)
 }
 
 #[inline]
@@ -203,6 +206,7 @@ pub(super) fn infer_with_constants<'arena>(
     context: &Context<'_, 'arena>,
     scope: &NamespaceScope,
     expression: &'arena Expression<'arena>,
+    enclosing_class: Option<Atom>,
     constants: Option<&AtomMap<ConstantMetadata>>,
 ) -> Option<TUnion> {
     match expression {
@@ -286,7 +290,7 @@ pub(super) fn infer_with_constants<'arena>(
             if contains_content { Some(get_non_empty_string()) } else { Some(get_string()) }
         }
         Expression::UnaryPrefix(UnaryPrefix { operator, operand }) => {
-            let operand_type = infer_with_constants(context, scope, operand, constants)?;
+            let operand_type = infer_with_constants(context, scope, operand, enclosing_class, constants)?;
 
             match operator {
                 UnaryPrefixOperator::Plus(_) => {
@@ -300,7 +304,7 @@ pub(super) fn infer_with_constants<'arena>(
                 }
                 UnaryPrefixOperator::Negation(_) => {
                     Some(if let Some(operand_value) = operand_type.get_single_literal_int_value() {
-                        get_literal_int(operand_value.saturating_mul(-1))
+                        get_literal_int(operand_value.wrapping_neg())
                     } else if let Some(operand_value) = operand_type.get_single_literal_float_value() {
                         TUnion::from_single(Cow::Owned(TAtomic::Scalar(TScalar::Float(TFloat::literal(
                             -operand_value,
@@ -327,21 +331,19 @@ pub(super) fn infer_with_constants<'arena>(
             }
         }
         Expression::Binary(Binary { operator: BinaryOperator::StringConcat(_), lhs, rhs }) => {
-            let Some(lhs_type) = infer_with_constants(context, scope, lhs, constants) else {
+            let Some(lhs_type) = infer_with_constants(context, scope, lhs, enclosing_class, constants) else {
                 return Some(get_string());
             };
-            let Some(rhs_type) = infer_with_constants(context, scope, rhs, constants) else {
+            let Some(rhs_type) = infer_with_constants(context, scope, rhs, enclosing_class, constants) else {
                 return Some(get_string());
             };
 
-            let lhs_string = match lhs_type.get_single_owned() {
-                TAtomic::Scalar(TScalar::String(s)) => s,
-                _ => return Some(get_string()),
+            let TAtomic::Scalar(TScalar::String(lhs_string)) = lhs_type.get_single_owned() else {
+                return Some(get_string());
             };
 
-            let rhs_string = match rhs_type.get_single_owned() {
-                TAtomic::Scalar(TScalar::String(s)) => s,
-                _ => return Some(get_string()),
+            let TAtomic::Scalar(TScalar::String(rhs_string)) = rhs_type.get_single_owned() else {
+                return Some(get_string());
             };
 
             if let (Some(left_val), Some(right_val)) =
@@ -370,8 +372,8 @@ pub(super) fn infer_with_constants<'arena>(
             Some(wrap_atomic(TAtomic::Scalar(TScalar::String(final_string_type))))
         }
         Expression::Binary(Binary { operator, lhs, rhs }) if operator.is_bitwise() => {
-            let lhs = infer_with_constants(context, scope, lhs, constants);
-            let rhs = infer_with_constants(context, scope, rhs, constants);
+            let lhs = infer_with_constants(context, scope, lhs, enclosing_class, constants);
+            let rhs = infer_with_constants(context, scope, rhs, enclosing_class, constants);
 
             Some(wrap_atomic(
                 match (
@@ -406,6 +408,7 @@ pub(super) fn infer_with_constants<'arena>(
                                     }
                                 }
                             }
+                            #[allow(clippy::unreachable)]
                             _ => {
                                 unreachable!("unexpected bitwise operator: {:?}", operator);
                             }
@@ -418,8 +421,8 @@ pub(super) fn infer_with_constants<'arena>(
             ))
         }
         Expression::Binary(Binary { operator, lhs, rhs }) if operator.is_arithmetic() => {
-            let lhs = infer_with_constants(context, scope, lhs, constants);
-            let rhs = infer_with_constants(context, scope, rhs, constants);
+            let lhs = infer_with_constants(context, scope, lhs, enclosing_class, constants);
+            let rhs = infer_with_constants(context, scope, rhs, enclosing_class, constants);
 
             match (
                 lhs.and_then(|v| v.get_single_literal_int_value()),
@@ -430,6 +433,7 @@ pub(super) fn infer_with_constants<'arena>(
                         BinaryOperator::Addition(_) => lhs_val.checked_add(rhs_val),
                         BinaryOperator::Subtraction(_) => lhs_val.checked_sub(rhs_val),
                         BinaryOperator::Multiplication(_) => lhs_val.checked_mul(rhs_val),
+                        #[allow(clippy::modulo_arithmetic)]
                         BinaryOperator::Modulo(_) if rhs_val != 0 => Some(lhs_val % rhs_val),
                         BinaryOperator::Exponentiation(_) if rhs_val >= 0 => lhs_val.checked_pow(rhs_val as u32),
                         BinaryOperator::Division(_) if rhs_val != 0 && lhs_val % rhs_val == 0 => {
@@ -461,6 +465,8 @@ pub(super) fn infer_with_constants<'arena>(
         })) => {
             let class_name_str = if let Expression::Identifier(identifier) = class {
                 context.resolved_names.get(identifier)
+            } else if matches!(class, Expression::Self_(_) | Expression::Static(_)) {
+                enclosing_class.as_ref().map(Atom::as_str)?
             } else {
                 return None;
             };
@@ -505,8 +511,8 @@ pub(super) fn infer_with_constants<'arena>(
                     return None;
                 };
 
-                let value_type =
-                    infer_with_constants(context, scope, element.value, constants).unwrap_or_else(get_mixed);
+                let value_type = infer_with_constants(context, scope, element.value, enclosing_class, constants)
+                    .unwrap_or_else(get_mixed);
 
                 entries.insert(i, (false, value_type));
             }
@@ -528,11 +534,11 @@ pub(super) fn infer_with_constants<'arena>(
                     return None;
                 };
 
-                let value_type =
-                    infer_with_constants(context, scope, element.value, constants).unwrap_or_else(get_mixed);
+                let value_type = infer_with_constants(context, scope, element.value, enclosing_class, constants)
+                    .unwrap_or_else(get_mixed);
 
-                let Some(key_type) =
-                    infer_with_constants(context, scope, element.key, constants).and_then(|v| v.get_single_array_key())
+                let Some(key_type) = infer_with_constants(context, scope, element.key, enclosing_class, constants)
+                    .and_then(|v| v.get_single_array_key())
                 else {
                     unknown_key_values.push(value_type);
                     continue;

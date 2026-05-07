@@ -87,6 +87,11 @@ impl<'arena> NameResolutionContext<'arena> {
         self.arena.alloc_str(&qualified_str)
     }
 
+    /// Allocates `s` in the arena and returns a borrow with the arena lifetime.
+    pub fn intern(&self, s: &str) -> &'arena str {
+        self.arena.alloc_str(s)
+    }
+
     /// Performs full name resolution for a given identifier within the current scope.
     ///
     /// # Arguments
@@ -100,7 +105,7 @@ impl<'arena> NameResolutionContext<'arena> {
     ///  - The `bool` is `true` if resolution occurred via an explicit alias or construct
     ///    (like `\` or `namespace\`), and `false` otherwise (e.g., resolved relative
     ///    to the namespace or returned as-is).
-    pub fn resolve<'a>(&self, kind: NameKind, name_str: &'a str) -> (&'arena str, bool) {
+    pub fn resolve<'name>(&self, kind: NameKind, name_str: &'name str) -> (&'arena str, bool) {
         let (cow, is_imported) = self.scope.resolve_str(kind, name_str);
 
         (self.arena.alloc_str(&cow), is_imported)

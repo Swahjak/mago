@@ -12,7 +12,6 @@ use mago_syntax_core::start_of_binary_number;
 use mago_syntax_core::start_of_float_number;
 use mago_syntax_core::start_of_hexadecimal_number;
 use mago_syntax_core::start_of_identifier;
-use mago_syntax_core::start_of_number;
 use mago_syntax_core::start_of_octal_number;
 use mago_syntax_core::start_of_octal_or_float_number;
 use mago_syntax_core::utils::read_digits_of_base;
@@ -22,14 +21,14 @@ use crate::token::TypeToken;
 use crate::token::TypeTokenKind;
 
 #[derive(Debug)]
-pub struct TypeLexer<'input> {
-    input: Input<'input>,
+pub struct TypeLexer<'arena> {
+    input: Input<'arena>,
 }
 
-impl<'input> TypeLexer<'input> {
+impl<'arena> TypeLexer<'arena> {
     #[inline]
     #[must_use]
-    pub fn new(input: Input<'input>) -> TypeLexer<'input> {
+    pub fn new(input: Input<'arena>) -> TypeLexer<'arena> {
         TypeLexer { input }
     }
 
@@ -47,13 +46,13 @@ impl<'input> TypeLexer<'input> {
 
     #[inline]
     #[must_use]
-    pub fn slice_in_range(&self, from: u32, to: u32) -> &'input str {
+    pub fn slice_in_range(&self, from: u32, to: u32) -> &'arena str {
         let bytes_slice = self.input.slice_in_range(from, to);
         bytes_slice.utf8_chunks().next().map_or("", |chunk| chunk.valid())
     }
 
     #[inline]
-    pub fn advance(&mut self) -> Option<Result<TypeToken<'input>, SyntaxError>> {
+    pub fn advance(&mut self) -> Option<Result<TypeToken<'arena>, SyntaxError>> {
         if self.input.has_reached_eof() {
             return None;
         }
@@ -65,42 +64,58 @@ impl<'input> TypeLexer<'input> {
             return Some(Ok(self.token(TypeTokenKind::Whitespace, whitespaces, start, end)));
         }
 
-        let (kind, length) = match self.input.read(3) {
-            [b'*', ..] => (TypeTokenKind::Asterisk, 1),
-            [b'.', b'.', b'.'] => (TypeTokenKind::Ellipsis, 3),
-            [b':', b':', ..] => (TypeTokenKind::ColonColon, 2),
-            [b'/', b'/', ..] => self.read_single_line_comment(),
-            [b'.', start_of_number!(), ..] => self.read_decimal(),
-            [start_of_number!(), ..] => self.read_number(),
-            [quote @ (b'\'' | b'"'), ..] => self.read_literal_string(*quote),
-            [b'\\', start_of_identifier!(), ..] => self.read_fully_qualified_identifier(),
-            [start_of_identifier!(), ..] => self.read_identifier_or_keyword(),
-            [b'$', start_of_identifier!(), ..] => self.read_variable(),
-            [b':', ..] => (TypeTokenKind::Colon, 1),
-            [b'=', ..] => (TypeTokenKind::Equals, 1),
-            [b'?', ..] => (TypeTokenKind::Question, 1),
-            [b'!', ..] => (TypeTokenKind::Exclamation, 1),
-            [b'&', ..] => (TypeTokenKind::Ampersand, 1),
-            [b'|', ..] => (TypeTokenKind::Pipe, 1),
-            [b'>', ..] => (TypeTokenKind::GreaterThan, 1),
-            [b'<', ..] => (TypeTokenKind::LessThan, 1),
-            [b'(', ..] => (TypeTokenKind::LeftParenthesis, 1),
-            [b')', ..] => (TypeTokenKind::RightParenthesis, 1),
-            [b'[', ..] => (TypeTokenKind::LeftBracket, 1),
-            [b']', ..] => (TypeTokenKind::RightBracket, 1),
-            [b'{', ..] => (TypeTokenKind::LeftBrace, 1),
-            [b'}', ..] => (TypeTokenKind::RightBrace, 1),
-            [b',', ..] => (TypeTokenKind::Comma, 1),
-            [b'+', ..] => (TypeTokenKind::Plus, 1),
-            [b'-', ..] => (TypeTokenKind::Minus, 1),
-            [unknown_byte, ..] => {
-                return Some(Err(SyntaxError::UnrecognizedToken(
-                    self.file_id(),
-                    *unknown_byte,
-                    self.input.current_position(),
-                )));
+        let remaining = self.input.read_remaining();
+        // SAFETY: has_reached_eof() was checked at the top; remaining is non-empty.
+        let first = unsafe { *remaining.get_unchecked(0) };
+        let second = remaining.get(1).copied();
+
+        let (kind, length) = match first {
+            b'*' => (TypeTokenKind::Asterisk, 1),
+            b':' => {
+                if second == Some(b':') {
+                    (TypeTokenKind::ColonColon, 2)
+                } else {
+                    (TypeTokenKind::Colon, 1)
+                }
             }
-            [] => unreachable!(),
+            b'=' => (TypeTokenKind::Equals, 1),
+            b'?' => (TypeTokenKind::Question, 1),
+            b'!' => (TypeTokenKind::Exclamation, 1),
+            b'&' => (TypeTokenKind::Ampersand, 1),
+            b'|' => (TypeTokenKind::Pipe, 1),
+            b'>' => (TypeTokenKind::GreaterThan, 1),
+            b'<' => (TypeTokenKind::LessThan, 1),
+            b'(' => (TypeTokenKind::LeftParenthesis, 1),
+            b')' => (TypeTokenKind::RightParenthesis, 1),
+            b'[' => (TypeTokenKind::LeftBracket, 1),
+            b']' => (TypeTokenKind::RightBracket, 1),
+            b'{' => (TypeTokenKind::LeftBrace, 1),
+            b'}' => (TypeTokenKind::RightBrace, 1),
+            b',' => (TypeTokenKind::Comma, 1),
+            b'+' => (TypeTokenKind::Plus, 1),
+            b'-' => (TypeTokenKind::Minus, 1),
+            b'.' => match remaining.get(..3) {
+                Some([b'.', b'.', b'.']) => (TypeTokenKind::Ellipsis, 3),
+                _ if matches!(second, Some(b'0'..=b'9')) => self.read_decimal(),
+                _ => {
+                    return Some(Err(SyntaxError::UnrecognizedToken(
+                        self.file_id(),
+                        first,
+                        self.input.current_position(),
+                    )));
+                }
+            },
+            b'/' if second == Some(b'/') => self.read_single_line_comment(),
+            b'\'' | b'"' => self.read_literal_string(first),
+            b'\\' if second.is_some_and(|b| b.is_ascii_alphabetic() || b == b'_' || b >= 0x80) => {
+                self.read_fully_qualified_identifier()
+            }
+            b'$' if second.is_some_and(|b| b.is_ascii_alphabetic() || b == b'_' || b >= 0x80) => self.read_variable(),
+            b'0'..=b'9' => self.read_number(),
+            b if b.is_ascii_alphabetic() || b == b'_' || b >= 0x80 => self.read_identifier_or_keyword(),
+            _ => {
+                return Some(Err(SyntaxError::UnrecognizedToken(self.file_id(), first, self.input.current_position())));
+            }
         };
 
         let buffer = self.input.consume(length);
@@ -190,11 +205,15 @@ impl<'input> TypeLexer<'input> {
         }
 
         if let float_exponent!() = self.input.peek(length, 1) {
-            length += 1;
-            if let number_sign!() = self.input.peek(length, 1) {
-                length += 1;
+            let mut exp_length = length + 1;
+            if let number_sign!() = self.input.peek(exp_length, 1) {
+                exp_length += 1;
             }
-            length = read_digits_of_base(&self.input, length, 10);
+
+            let after_exp = read_digits_of_base(&self.input, exp_length, 10);
+            if after_exp > exp_length {
+                length = after_exp;
+            }
         }
 
         (TypeTokenKind::LiteralFloat, length)
@@ -263,23 +282,40 @@ impl<'input> TypeLexer<'input> {
     /// This is the hot path - optimized for common case (simple identifiers).
     #[inline]
     fn read_identifier_or_keyword(&self) -> (TypeTokenKind, usize) {
+        let remaining = self.input.read_remaining();
+        let total = remaining.len();
         let mut length = 1;
         let mut next_is_hyphen = false;
         let mut next_is_backslash = false;
 
-        loop {
-            match self.input.peek(length, 2) {
-                [part_of_identifier!(), ..] => length += 1,
-                [b'-', start_of_identifier!() | part_of_identifier!(), ..] => {
-                    next_is_hyphen = true;
-                    break;
-                }
-                [b'\\', start_of_identifier!(), ..] => {
-                    next_is_backslash = true;
-                    break;
-                }
-                _ => break,
+        // Scan identifier bytes greedily. Break on `-` or `\\` if the next
+        // byte after them could extend the identifier (hyphen-joined keyword
+        // or namespace separator).
+        while length < total {
+            // SAFETY: length < total guarantees the index is in bounds.
+            let b = unsafe { *remaining.get_unchecked(length) };
+            if mago_syntax_core::utils::is_part_of_identifier(&b) {
+                length += 1;
+                continue;
             }
+
+            if b == b'-' && length + 1 < total {
+                // SAFETY: `length + 1 < total` was just checked.
+                let b2 = unsafe { *remaining.get_unchecked(length + 1) };
+                if mago_syntax_core::utils::is_part_of_identifier(&b2) {
+                    next_is_hyphen = true;
+                }
+            } else if b == b'\\' && length + 1 < total {
+                // SAFETY: `length + 1 < total` was just checked.
+                let b2 = unsafe { *remaining.get_unchecked(length + 1) };
+                if mago_syntax_core::utils::is_start_of_identifier(&b2) {
+                    next_is_backslash = true;
+                }
+            } else {
+                // Any other byte ends the identifier scan; nothing to record.
+            }
+
+            break;
         }
 
         if next_is_backslash {
@@ -287,7 +323,8 @@ impl<'input> TypeLexer<'input> {
         }
 
         if !next_is_hyphen {
-            let bytes = self.input.read(length);
+            // SAFETY: length <= total (identifier was scanned in bounds).
+            let bytes = unsafe { remaining.get_unchecked(..length) };
             if let Some(kind) = keyword::lookup_keyword(bytes) {
                 return (kind, length);
             }
@@ -295,20 +332,34 @@ impl<'input> TypeLexer<'input> {
         }
 
         let base_len = length;
-        loop {
-            match self.input.peek(length, 2) {
-                [part_of_identifier!(), ..] => length += 1,
-                [b'-', start_of_identifier!() | part_of_identifier!(), ..] => length += 1,
-                _ => break,
+        while length < total {
+            // SAFETY: `length < total` was just checked.
+            let b = unsafe { *remaining.get_unchecked(length) };
+            if mago_syntax_core::utils::is_part_of_identifier(&b) {
+                length += 1;
+                continue;
             }
+
+            if b == b'-' && length + 1 < total {
+                // SAFETY: `length + 1 < total` was just checked.
+                let b2 = unsafe { *remaining.get_unchecked(length + 1) };
+                if mago_syntax_core::utils::is_part_of_identifier(&b2) {
+                    length += 1;
+                    continue;
+                }
+            }
+
+            break;
         }
 
-        let bytes = self.input.read(length);
+        // SAFETY: `length` was only ever advanced while `length < total`, so it is in bounds.
+        let bytes = unsafe { remaining.get_unchecked(..length) };
         if let Some(kind) = keyword::lookup_keyword(bytes) {
             return (kind, length);
         }
 
-        let base_bytes = self.input.read(base_len);
+        // SAFETY: `base_len <= length <= total`.
+        let base_bytes = unsafe { remaining.get_unchecked(..base_len) };
         if let Some(kind) = keyword::lookup_keyword(base_bytes) {
             return (kind, base_len);
         }
@@ -355,9 +406,11 @@ impl<'input> TypeLexer<'input> {
     }
 
     #[inline]
-    fn token(&self, kind: TypeTokenKind, value: &'input [u8], start: Position, _end: Position) -> TypeToken<'input> {
-        let value_str = value.utf8_chunks().next().map_or("", |chunk| chunk.valid());
-        debug_assert_eq!(value_str.len(), value.len());
+    fn token(&self, kind: TypeTokenKind, value: &'arena [u8], start: Position, _end: Position) -> TypeToken<'arena> {
+        // SAFETY: `Input` is constructed from a `&str` so the underlying bytes
+        // are valid UTF-8. Token boundaries are either ASCII stop bytes or end
+        // of input, which land on UTF-8 char boundaries.
+        let value_str = unsafe { std::str::from_utf8_unchecked(value) };
         TypeToken { kind, start, value: value_str }
     }
 }

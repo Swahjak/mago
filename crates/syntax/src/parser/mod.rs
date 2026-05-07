@@ -18,7 +18,7 @@ mod internal;
 pub mod stream;
 
 /// Maximum recursion depth for expression parsing.
-/// This prevents stack overflow on deeply nested expressions.
+/// This prevents stack overflow on deeply nested expressions and statements.
 const MAX_RECURSION_DEPTH: u16 = 512;
 
 #[derive(Debug, Default)]
@@ -32,6 +32,7 @@ pub struct State {
 ///
 /// The parser holds an arena reference, the token stream, and parsing state.
 #[derive(Debug)]
+#[allow(clippy::field_scoped_visibility_modifiers)]
 pub struct Parser<'input, 'arena> {
     pub(crate) arena: &'arena Bump,
     pub(crate) state: State,

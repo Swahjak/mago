@@ -2,7 +2,7 @@ use crate::token::TypeTokenKind;
 
 /// Fast keyword lookup using two-level dispatch.
 /// Returns the TypeTokenKind if the bytes match a keyword (case-insensitive).
-#[inline(always)]
+#[inline]
 pub fn lookup_keyword(bytes: &[u8]) -> Option<TypeTokenKind> {
     match bytes.len() {
         2 => lookup_len2(bytes),
@@ -30,7 +30,7 @@ pub fn lookup_keyword(bytes: &[u8]) -> Option<TypeTokenKind> {
     }
 }
 
-#[inline(always)]
+#[inline]
 fn eq(a: &[u8], b: &[u8]) -> bool {
     a.eq_ignore_ascii_case(b)
 }
@@ -57,7 +57,15 @@ fn lookup_len3(bytes: &[u8]) -> Option<TypeTokenKind> {
                 None
             }
         }
-        b'n' if eq(bytes, b"not") => Some(TypeTokenKind::Not),
+        b'n' => {
+            if eq(bytes, b"not") {
+                Some(TypeTokenKind::Not)
+            } else if eq(bytes, b"new") {
+                Some(TypeTokenKind::New)
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -178,6 +186,8 @@ fn lookup_len12(bytes: &[u8]) -> Option<TypeTokenKind> {
                 Some(TypeTokenKind::NeverReturn)
             } else if eq(bytes, b"negative-int") {
                 Some(TypeTokenKind::NegativeInt)
+            } else if eq(bytes, b"non-zero-int") {
+                Some(TypeTokenKind::NonZeroInt)
             } else {
                 None
             }
@@ -211,7 +221,15 @@ fn lookup_len13(bytes: &[u8]) -> Option<TypeTokenKind> {
                 None
             }
         }
-        b't' if eq(bytes, b"truthy-string") => Some(TypeTokenKind::TruthyString),
+        b't' => {
+            if eq(bytes, b"truthy-string") {
+                Some(TypeTokenKind::TruthyString)
+            } else if eq(bytes, b"template-type") {
+                Some(TypeTokenKind::TemplateType)
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }

@@ -4,6 +4,7 @@ use mago_syntax::ast::Constant;
 use mago_syntax::ast::Enum;
 use mago_syntax::ast::Function;
 use mago_syntax::ast::Interface;
+use mago_syntax::ast::ModifierSequenceExt;
 use mago_syntax::ast::Namespace;
 use mago_syntax::ast::Trait;
 use mago_syntax::walker::MutWalker;
@@ -370,6 +371,8 @@ impl<'ast, 'ctx, 'arena> MutWalker<'ast, 'arena, GuardContext<'ctx, 'arena>> for
                 }
             }
         }
+
+        context.structural_flaws.extend(structural_flaws);
     }
 
     fn walk_in_enum(&mut self, r#enum: &'ast Enum<'arena>, context: &mut GuardContext<'ctx, 'arena>) {

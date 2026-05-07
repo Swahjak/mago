@@ -15,7 +15,7 @@ use crate::ast::ast::LiteralStringKind;
 use crate::error::ParseError;
 use crate::parser::Parser;
 
-impl<'input, 'arena> Parser<'input, 'arena> {
+impl<'arena> Parser<'_, 'arena> {
     pub(crate) fn parse_literal(&mut self) -> Result<Literal<'arena>, ParseError> {
         let token = self.stream.consume()?;
 
@@ -23,8 +23,9 @@ impl<'input, 'arena> Parser<'input, 'arena> {
             T![LiteralFloat] => Literal::Float(LiteralFloat {
                 span: token.span_for(self.stream.file_id()),
                 raw: token.value,
-                // Use 0.0 as fallback for malformed floats (e.g., "1.0e" without exponent)
-                // This enables fault-tolerant parsing without panicking.
+                // `parse_literal_float` only fails on lexer output the lexer would already have
+                // rejected; substitute `0.0` defensively rather than panicking if that invariant
+                // ever drifts.
                 value: OrderedFloat(parse_literal_float(token.value).unwrap_or(0.0)),
             }),
             T![LiteralInteger] => Literal::Integer(LiteralInteger {
@@ -36,14 +37,14 @@ impl<'input, 'arena> Parser<'input, 'arena> {
             T!["false"] => Literal::False(Keyword { span: token.span_for(self.stream.file_id()), value: token.value }),
             T!["null"] => Literal::Null(Keyword { span: token.span_for(self.stream.file_id()), value: token.value }),
             T![LiteralString] => Literal::String(LiteralString {
-                kind: Some(
-                    if token.value.starts_with('"') || token.value.starts_with("b\"") || token.value.starts_with("B\"")
-                    {
-                        LiteralStringKind::DoubleQuoted
-                    } else {
-                        LiteralStringKind::SingleQuoted
-                    },
-                ),
+                kind: if token.value.starts_with('"')
+                    || token.value.starts_with("b\"")
+                    || token.value.starts_with("B\"")
+                {
+                    LiteralStringKind::DoubleQuoted
+                } else {
+                    LiteralStringKind::SingleQuoted
+                },
                 span: token.span_for(self.stream.file_id()),
                 raw: token.value,
                 value: parse_literal_string_in(self.arena, token.value, None, true),

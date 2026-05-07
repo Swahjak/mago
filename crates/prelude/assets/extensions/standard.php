@@ -896,14 +896,14 @@ function sapi_windows_set_ctrl_handler(?callable $handler, bool $add = true): bo
 function sapi_windows_generate_ctrl_event(int $event, int $pid = 0): bool {}
 
 /**
- * @template TKey
+ * @template-covariant TKey
  * @template-covariant TValue
  * @template TSend
  * @template-covariant TReturn
  *
- * @template-implements Traversable<TKey, TValue>
+ * @template-implements Iterator<TKey, TValue>
  */
-class Generator implements Traversable
+class Generator implements Iterator
 {
     /**
      * @return ?TValue
@@ -1144,6 +1144,8 @@ function phpinfo(int $flags = INFO_ALL): bool {}
 
 /**
  * @pure
+ *
+ * @return ($extension is null ? non-empty-string : non-empty-string|false)
  */
 function phpversion(?string $extension): string|false {}
 
@@ -1515,6 +1517,15 @@ function explode(string $separator, string $string, int $limit = PHP_INT_MAX): a
  * @param array<string>|string $separator
  * @param array<int|string|float|bool|null|Stringable>|null $array
  *
+ * @return (
+ *     $array is non-empty-array<non-empty-literal-string|literal-int|literal-float>
+ *     ? ($separator is literal-string ? non-empty-literal-string : non-empty-string)
+ *     : ($array is non-empty-array<non-empty-string|int|float>
+ *         ? non-empty-string
+ *         : string
+ *     )
+ * )
+ *
  * @pure
  */
 function implode(array|string $separator = '', ?array $array = null): string {}
@@ -1522,6 +1533,22 @@ function implode(array|string $separator = '', ?array $array = null): string {}
 /**
  * @param array<string>|string $separator
  * @param array<int|string|float|bool|null|Stringable>|null $array
+ *
+ * @return (
+ *     $separator is non-empty-string
+ *     ? ($array is non-empty-array
+ *         ? ($array is array<literal-string|literal-int>
+ *             ? ($separator is literal-string ? non-empty-literal-string : non-empty-string)
+ *             : non-empty-string
+ *         )
+ *         : string)
+ *     : ($array is non-empty-array
+ *         ? ($array is array<non-empty-literal-string|non-empty-string>
+ *             ? ($array is array<non-empty-literal-string> ? non-empty-literal-string : non-empty-string)
+ *             : string
+ *         )
+ *         : string)
+ * )
  *
  * @pure
  */
@@ -2749,6 +2776,8 @@ function highlight_string(string $string, bool $return = false): string|bool {}
  * @return ($as_number is true ? int|float|false : list{int, int}|false)
  *
  * @mutation-free
+ *
+ * @psalm-ignore-falsable-return
  */
 function hrtime(bool $as_number = false): array|int|float|false {}
 
@@ -3511,10 +3540,13 @@ const ARRAY_FILTER_USE_KEY = 2;
 function array_merge_recursive(array ...$arrays) {}
 
 /**
- * @param array<array-key, mixed> $array
- * @param array<array-key, mixed> ...$replacements
+ * @template K of array-key
+ * @template V
  *
- * @return array<array-key, mixed>
+ * @param array<K, V> $array
+ * @param array<K, V> ...$replacements
+ *
+ * @return array<K, V>
  *
  * @no-named-arguments
  * @pure
@@ -3522,10 +3554,13 @@ function array_merge_recursive(array ...$arrays) {}
 function array_replace(array $array, array ...$replacements): array {}
 
 /**
- * @param array<array-key, mixed> $array
- * @param array<array-key, mixed> ...$replacements
+ * @template K of array-key
+ * @template V
  *
- * @return array<array-key, mixed>
+ * @param array<K, V> $array
+ * @param array<K, V> ...$replacements
+ *
+ * @return array<K, V>
  *
  * @no-named-arguments
  * @pure
@@ -3623,7 +3658,9 @@ function array_reduce(array $array, callable $callback, mixed $initial = null): 
  * @param array<K, V> $array
  * @param T $value
  *
- * @return ($length is int<1, max> ? non-empty-array<K, V|T> : array<K, V|T>)
+ * @return ($array is list<V>
+ *     ? ($length is int<1, max> ? non-empty-list<V|T> : list<V|T>)
+ *     : ($length is int<1, max> ? non-empty-array<K, V|T> : array<K, V|T>))
  *
  * @pure
  */
@@ -3801,6 +3838,7 @@ function array_map(?callable $callback, array $array, array ...$arrays): array {
  * @template V
  *
  * @param array<K, V> $array
+ * @param int<1, max> $length
  *
  * @return ($preserve_keys is true ? list<array<K, V>> : list<list<V>>)
  *
@@ -3824,7 +3862,7 @@ function array_combine(array $keys, array $values): array {}
 /**
  * @pure
  */
-function array_key_exists(string|int|float|bool|null $key, array $array): bool {}
+function array_key_exists(string|int|float|bool $key, array $array): bool {}
 
 /**
  * @template K as array-key
@@ -4195,9 +4233,9 @@ function next(object|array &$array): mixed {}
  * @template V
  *
  * @param object|array<K, V> $array
- * @param-out ($array is object ? object : ($array is list<V> ? list<V> : array<K, V>)) $array
+ * @param-out ($array is object ? object : ($array is list<V> ? ($array is non-empty-list<V> ? non-empty-list<V> : list<V>) : ($array is non-empty-array<K, V> ? non-empty-array<K,V> : array<K, V>))) $array
  *
- * @return V|false
+ * @return ($array is non-empty-list ? V : ($array is non-empty-array ? V : V|false))
  */
 function reset(object|array &$array): mixed {}
 
@@ -4226,7 +4264,7 @@ function key(object|array $array): string|int|null {}
 /**
  * @template T
  *
- * @param array<T>|T $value
+ * @param non-empty-array<T>|T $value
  * @param T ...$values
  *
  * @return T
@@ -4238,7 +4276,7 @@ function min(mixed $value, mixed ...$values): mixed {}
 /**
  * @template T
  *
- * @param array<T>|T $value
+ * @param non-empty-array<T>|T $value
  * @param T ...$values
  *
  * @return T
@@ -4248,9 +4286,10 @@ function min(mixed $value, mixed ...$values): mixed {}
 function max(mixed $value, mixed ...$values): mixed {}
 
 /**
+ * @template T
  * @template V
  *
- * @param V $needle
+ * @param T $needle
  * @param array<V> $haystack
  *
  * @pure
@@ -4273,6 +4312,7 @@ function array_search(mixed $needle, array $haystack, bool $strict = false): str
 /**
  * @template T
  *
+ * @param int<0, max> $count
  * @param T $value
  *
  * @return (

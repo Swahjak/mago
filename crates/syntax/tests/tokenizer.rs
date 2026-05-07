@@ -1,3 +1,5 @@
+#![allow(clippy::panic_in_result_fn)]
+
 use mago_database::file::FileId;
 use pretty_assertions::assert_eq;
 
@@ -247,6 +249,62 @@ echo $a;
         TokenKind::Whitespace,
         TokenKind::Variable,
         TokenKind::Semicolon,
+        TokenKind::Whitespace,
+    ];
+
+    test_lexer(code, expected).map_err(|err| {
+        panic!("unexpected error: {err}");
+    })
+}
+
+#[test]
+fn test_heredoc_with_label_prefix_identifier_inside() -> Result<(), SyntaxError> {
+    let code = b"<?php
+
+$a = <<<PHP
+    PHP_MAJOR_VERSION == 5;
+    PHPx_FOO
+    PHP
+";
+    let expected = &[
+        TokenKind::OpenTag,
+        TokenKind::Whitespace,
+        TokenKind::Variable,
+        TokenKind::Whitespace,
+        TokenKind::Equal,
+        TokenKind::Whitespace,
+        TokenKind::DocumentStart(DocumentKind::Heredoc),
+        TokenKind::StringPart,
+        TokenKind::StringPart,
+        TokenKind::DocumentEnd,
+        TokenKind::Whitespace,
+    ];
+
+    test_lexer(code, expected).map_err(|err| {
+        panic!("unexpected error: {err}");
+    })
+}
+
+#[test]
+fn test_nowdoc_with_label_prefix_identifier_inside() -> Result<(), SyntaxError> {
+    let code = b"<?php
+
+$a = <<<'PHP'
+    PHP_MAJOR_VERSION == 5;
+    PHPx_FOO
+    PHP
+";
+    let expected = &[
+        TokenKind::OpenTag,
+        TokenKind::Whitespace,
+        TokenKind::Variable,
+        TokenKind::Whitespace,
+        TokenKind::Equal,
+        TokenKind::Whitespace,
+        TokenKind::DocumentStart(DocumentKind::Nowdoc),
+        TokenKind::StringPart,
+        TokenKind::StringPart,
+        TokenKind::DocumentEnd,
         TokenKind::Whitespace,
     ];
 
@@ -928,7 +986,7 @@ fn test_escape() -> Result<(), SyntaxError> {
 
 #[test]
 fn test_sep_literal_num() -> Result<(), SyntaxError> {
-    let code = r"<?= 1_200;";
+    let code = "<?= 1_200;";
 
     let expected = &[TokenKind::EchoTag, TokenKind::Whitespace, TokenKind::LiteralInteger, TokenKind::Semicolon];
 
@@ -1224,6 +1282,24 @@ fn test_b_identifier_not_followed_by_string() -> Result<(), SyntaxError> {
     test_lexer(code, expected).map_err(|err| {
         panic!("unexpected error: {err}");
     })
+}
+
+#[test]
+fn test_unrecognized_byte_inside_bracket_interpolation_surfaces_error() {
+    let code: &[u8] = b"<?php\n\"$a[-0\x00x0]\";";
+    let input = Input::new(FileId::zero(), code);
+    let mut lexer = Lexer::new(input, LexerSettings::default());
+
+    let mut saw_error = false;
+    while let Some(result) = lexer.advance() {
+        if let Err(SyntaxError::UnrecognizedToken(_, byte, _)) = result {
+            assert_eq!(byte, 0, "expected the NUL byte to be reported as unrecognized");
+            saw_error = true;
+            break;
+        }
+    }
+
+    assert!(saw_error, "lexer should surface the unrecognized NUL byte instead of silently terminating");
 }
 
 fn test_lexer(code: &[u8], expected_kinds: &[TokenKind]) -> Result<(), SyntaxError> {

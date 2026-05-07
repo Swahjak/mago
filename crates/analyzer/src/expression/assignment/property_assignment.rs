@@ -2,6 +2,8 @@ use std::rc::Rc;
 
 use mago_codex::ttype::TType;
 use mago_codex::ttype::add_optional_union_type;
+use mago_codex::ttype::add_union_type;
+use mago_codex::ttype::combiner::CombinerOptions;
 use mago_codex::ttype::comparator::ComparisonResult;
 use mago_codex::ttype::comparator::union_comparator;
 use mago_codex::ttype::get_mixed;
@@ -59,6 +61,7 @@ pub fn analyze<'ctx, 'arena>(
 
     let mut resolved_property_type = None;
     let mut matched_all_properties = true;
+    let mut widened_assigned_type: Option<TUnion> = None;
     for resolved_property in resolution_result.properties {
         let mut union_comparison_result = ComparisonResult::new();
 
@@ -66,11 +69,18 @@ pub fn analyze<'ctx, 'arena>(
             context.codebase,
             assigned_value_type,
             &resolved_property.property_type,
-            true,
+            assigned_value_type.ignore_nullable_issues(),
             assigned_value_type.ignore_falsable_issues(),
             false,
             &mut union_comparison_result,
         );
+
+        if type_match_found && let Some(replacement) = union_comparison_result.replacement_union_type {
+            widened_assigned_type = Some(match widened_assigned_type {
+                Some(existing) => add_union_type(existing, &replacement, context.codebase, CombinerOptions::default()),
+                None => replacement,
+            });
+        }
 
         if !type_match_found {
             let property_name = resolved_property.property_name;
@@ -79,7 +89,7 @@ pub fn analyze<'ctx, 'arena>(
 
             let mut issue;
 
-            if let Some(true) = union_comparison_result.type_coerced {
+            if union_comparison_result.type_coerced == Some(true) {
                 let issue_kind;
 
                 if union_comparison_result.type_coerced_from_nested_mixed.unwrap_or(false) {
@@ -172,7 +182,7 @@ pub fn analyze<'ctx, 'arena>(
     }
 
     let mut resulting_type = if matched_all_properties && context.settings.memoize_properties {
-        Some(assigned_value_type.clone())
+        Some(widened_assigned_type.unwrap_or_else(|| assigned_value_type.clone()))
     } else {
         resolved_property_type
     };
@@ -193,7 +203,7 @@ pub fn analyze<'ctx, 'arena>(
     if context.settings.memoize_properties
         && let Some(property_access_id) = property_access_id
     {
-        block_context.locals.insert(property_access_id, resulting_type.clone());
+        block_context.locals.insert(property_access_id, Rc::clone(&resulting_type));
     }
 
     artifacts.set_rc_expression_type(property_access, resulting_type);
@@ -219,7 +229,7 @@ mod tests {
 
     test_analysis! {
         name = memoized_property_assignment,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             class A {

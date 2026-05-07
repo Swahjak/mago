@@ -1,9 +1,13 @@
-use std::collections::VecDeque;
 use std::fmt::Debug;
+
+use bumpalo::Bump;
+use bumpalo::collections::Vec as BVec;
 
 use mago_database::file::FileId;
 use mago_database::file::HasFileId;
 use mago_span::Position;
+use mago_span::Span;
+use mago_syntax_core::parser::LookaheadBuf;
 
 use crate::error::ParseError;
 use crate::error::SyntaxError;
@@ -14,20 +18,68 @@ use crate::token::TypeTokenKind;
 /// A buffered token stream that wraps a `TypeLexer`, providing lookahead
 /// capabilities and automatically skipping trivia tokens (whitespace, comments).
 #[derive(Debug)]
-pub struct TypeTokenStream<'input> {
-    pub(crate) lexer: TypeLexer<'input>,
-    buffer: VecDeque<TypeToken<'input>>,
+#[allow(clippy::field_scoped_visibility_modifiers)]
+pub struct TypeTokenStream<'arena> {
+    pub(crate) arena: &'arena Bump,
+    pub(crate) lexer: TypeLexer<'arena>,
+    file_id: FileId,
+    buffer: LookaheadBuf<TypeToken<'arena>, 64>,
     position: Position,
 }
 
-impl<'input> TypeTokenStream<'input> {
+impl<'arena> TypeTokenStream<'arena> {
     /// Creates a new `TypeTokenStream` wrapping the given `TypeLexer`.
     #[inline]
-    pub fn new(lexer: TypeLexer<'input>) -> TypeTokenStream<'input> {
+    pub fn new(arena: &'arena Bump, lexer: TypeLexer<'arena>) -> TypeTokenStream<'arena> {
         let position = lexer.current_position();
+        let file_id = lexer.file_id();
+        TypeTokenStream { arena, lexer, file_id, buffer: LookaheadBuf::new(), position }
+    }
 
-        // Pre-allocate buffer - typical lookahead is 1-2 tokens
-        TypeTokenStream { lexer, buffer: VecDeque::with_capacity(4), position }
+    /// Consume the next token and return its [`Span`]. Equivalent to
+    /// `stream.consume_span()?` but avoids the extra
+    /// method dispatch through `HasFileId`.
+    #[inline]
+    pub fn consume_span(&mut self) -> Result<Span, ParseError> {
+        let token = self.consume()?;
+        Ok(Span::new(self.file_id, token.start, token.end()))
+    }
+
+    /// Eat a token of `kind` and return its [`Span`].
+    #[inline]
+    pub fn eat_span(&mut self, kind: TypeTokenKind) -> Result<Span, ParseError> {
+        let token = self.eat(kind)?;
+        Ok(Span::new(self.file_id, token.start, token.end()))
+    }
+
+    /// Consume the next token and wrap it as a [`Keyword`](crate::ast::Keyword).
+    #[inline]
+    pub fn consume_keyword(&mut self) -> Result<crate::ast::Keyword<'arena>, ParseError> {
+        let token = self.consume()?;
+        let span = Span::new(self.file_id, token.start, token.end());
+        Ok(crate::ast::Keyword { span, value: token.value })
+    }
+
+    /// Eat a token of `kind` and wrap it as a [`Keyword`](crate::ast::Keyword).
+    #[inline]
+    pub fn eat_keyword(&mut self, kind: TypeTokenKind) -> Result<crate::ast::Keyword<'arena>, ParseError> {
+        let token = self.eat(kind)?;
+        let span = Span::new(self.file_id, token.start, token.end());
+        Ok(crate::ast::Keyword { span, value: token.value })
+    }
+
+    /// Arena-allocate a value and return an `&'arena T` reference.
+    #[inline]
+    #[must_use]
+    pub fn alloc<T>(&self, value: T) -> &'arena T {
+        self.arena.alloc(value)
+    }
+
+    /// A fresh arena-backed [`BVec`].
+    #[inline]
+    #[must_use]
+    pub fn new_bvec<T>(&self) -> BVec<'arena, T> {
+        BVec::new_in(self.arena)
     }
 
     /// Returns the current position of the stream within the source file.
@@ -49,7 +101,7 @@ impl<'input> TypeTokenStream<'input> {
     /// - `Err(ParseError::UnexpectedEndOfFile)`: If EOF is reached.
     /// - `Err(ParseError::SyntaxError)`: If the underlying lexer returned an error.
     #[inline]
-    pub fn consume(&mut self) -> Result<TypeToken<'input>, ParseError> {
+    pub fn consume(&mut self) -> Result<TypeToken<'arena>, ParseError> {
         match self.advance() {
             Some(Ok(token)) => Ok(token),
             Some(Err(error)) => Err(error.into()),
@@ -68,9 +120,18 @@ impl<'input> TypeTokenStream<'input> {
     /// - `Err(ParseError::UnexpectedEndOfFile)`: If EOF is reached.
     /// - `Err(ParseError::SyntaxError)`: If the underlying lexer returned an error.
     #[inline]
-    pub fn eat(&mut self, kind: TypeTokenKind) -> Result<TypeToken<'input>, ParseError> {
-        let token_result = self.consume();
+    pub fn eat(&mut self, kind: TypeTokenKind) -> Result<TypeToken<'arena>, ParseError> {
+        if let Some(token) = self.buffer.get(0) {
+            if kind == token.kind {
+                let _ = self.buffer.pop_front();
+                self.position = token.end();
+                return Ok(token);
+            }
 
+            return Err(self.unexpected(Some(token), &[kind]));
+        }
+
+        let token_result = self.consume();
         match token_result {
             Ok(token) => {
                 if kind == token.kind {
@@ -87,7 +148,7 @@ impl<'input> TypeTokenStream<'input> {
     /// Internal use or when trivia needs to be observed. `consume()` is preferred for parsers.
     /// Returns `None` on EOF, `Some(Err)` on lexer error, `Some(Ok)` on success.
     #[inline]
-    fn advance(&mut self) -> Option<Result<TypeToken<'input>, SyntaxError>> {
+    fn advance(&mut self) -> Option<Result<TypeToken<'arena>, SyntaxError>> {
         match self.fill_buffer(1) {
             Ok(true) => {
                 if let Some(token) = self.buffer.pop_front() {
@@ -113,8 +174,12 @@ impl<'input> TypeTokenStream<'input> {
     /// - `Err(ParseError)`: If the underlying lexer produced an error.
     #[inline]
     pub fn peek_kind(&mut self) -> Result<Option<TypeTokenKind>, ParseError> {
+        if let Some(t) = self.buffer.get(0) {
+            return Ok(Some(t.kind));
+        }
+
         match self.fill_buffer(1) {
-            Ok(true) => Ok(self.buffer.front().map(|t| t.kind)),
+            Ok(true) => Ok(self.buffer.get(0).map(|t| t.kind)),
             Ok(false) => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -122,6 +187,10 @@ impl<'input> TypeTokenStream<'input> {
 
     #[inline]
     pub fn is_at(&mut self, kind: TypeTokenKind) -> Result<bool, ParseError> {
+        if let Some(t) = self.buffer.get(0) {
+            return Ok(t.kind == kind);
+        }
+
         Ok(match self.peek_kind()? {
             Some(k) => k == kind,
             None => false,
@@ -138,7 +207,7 @@ impl<'input> TypeTokenStream<'input> {
     /// - `Err(SyntaxError::UnexpectedEndOfFile)`: If EOF is reached.
     /// - `Err(ParseError)`: If the underlying lexer produced an error while peeking.
     #[inline]
-    pub fn peek(&mut self) -> Result<TypeToken<'input>, ParseError> {
+    pub fn peek(&mut self) -> Result<TypeToken<'arena>, ParseError> {
         match self.lookahead(0)? {
             Some(token) => Ok(token),
             None => Err(ParseError::UnexpectedEndOfFile(self.file_id(), vec![], self.current_position())),
@@ -156,10 +225,13 @@ impl<'input> TypeTokenStream<'input> {
     /// - `Ok(None)`: If EOF is reached before the nth token.
     /// - `Err(ParseError)`: If the underlying lexer produced an error.
     #[inline]
-    pub fn lookahead(&mut self, n: usize) -> Result<Option<TypeToken<'input>>, ParseError> {
-        // Ensure the buffer has at least n+1 tokens (or propagate EOF/error).
+    pub fn lookahead(&mut self, n: usize) -> Result<Option<TypeToken<'arena>>, ParseError> {
+        if n < self.buffer.len() {
+            return Ok(self.buffer.get(n));
+        }
+
         match self.fill_buffer(n + 1) {
-            Ok(true) => Ok(self.buffer.get(n).copied()),
+            Ok(true) => Ok(self.buffer.get(n)),
             Ok(false) => Ok(None),
             Err(error) => Err(error.into()),
         }
@@ -168,7 +240,7 @@ impl<'input> TypeTokenStream<'input> {
     /// Creates a `ParseError` for an unexpected token or EOF.
     /// Internal helper for `consume` and `eat`.
     #[inline]
-    fn unexpected(&self, found: Option<TypeToken<'input>>, expected_one_of: &[TypeTokenKind]) -> ParseError {
+    fn unexpected(&self, found: Option<TypeToken<'arena>>, expected_one_of: &[TypeTokenKind]) -> ParseError {
         if let Some(token) = found {
             // Found a token, but it was the wrong kind
             ParseError::UnexpectedToken(expected_one_of.to_vec(), token.kind, token.span_for(self.file_id()))
@@ -183,6 +255,15 @@ impl<'input> TypeTokenStream<'input> {
     /// `Ok(false)` on EOF, `Err` on lexer error.
     #[inline]
     fn fill_buffer(&mut self, n: usize) -> Result<bool, SyntaxError> {
+        if self.buffer.len() >= n {
+            return Ok(true);
+        }
+
+        self.fill_buffer_slow(n)
+    }
+
+    #[inline(never)]
+    fn fill_buffer_slow(&mut self, n: usize) -> Result<bool, SyntaxError> {
         while self.buffer.len() < n {
             match self.lexer.advance() {
                 Some(Ok(token)) => {
@@ -200,7 +281,8 @@ impl<'input> TypeTokenStream<'input> {
 }
 
 impl HasFileId for TypeTokenStream<'_> {
+    #[inline]
     fn file_id(&self) -> FileId {
-        self.lexer.file_id()
+        self.file_id
     }
 }

@@ -3,7 +3,6 @@ use std::hash::Hash;
 use foldhash::HashSet;
 use foldhash::HashSetExt;
 use indexmap::IndexMap;
-use itertools::Itertools;
 
 use mago_atom::Atom;
 use mago_atom::AtomSet;
@@ -64,6 +63,7 @@ pub struct AlgebraThresholds {
 }
 
 impl Default for AlgebraThresholds {
+    #[inline]
     fn default() -> Self {
         Self {
             saturation_complexity: DEFAULT_SATURATION_COMPLEXITY,
@@ -108,8 +108,8 @@ impl Default for AlgebraThresholds {
 ///
 /// A new `Vec<Clause>` containing the simplified, owned clauses.
 #[inline]
-pub fn saturate_clauses<'a>(
-    clauses: impl IntoIterator<Item = &'a Clause>,
+pub fn saturate_clauses<'clause>(
+    clauses: impl IntoIterator<Item = &'clause Clause>,
     thresholds: &AlgebraThresholds,
 ) -> Vec<Clause> {
     fn saturate_clauses_inner(
@@ -123,8 +123,27 @@ pub fn saturate_clauses<'a>(
             return vec![];
         }
 
-        let mut removed_indices: HashSet<usize> = HashSet::default();
+        let mut removed_indices: Vec<bool> = vec![false; unique_clauses_len];
         let mut added_clauses: Vec<Clause> = Vec::new();
+
+        // Pre-built index of every (var, possibility-hash) pair that appears
+        // anywhere in the input clauses. Unit propagation needs to know
+        // whether *any* clause contains the negation of a simple clause's
+        // literal; without this index that check is an O(N) scan repeated
+        // for every simple clause, which is the dominant O(N^2) cost on big
+        // match expressions where every arm condition contributes a unit
+        // clause that has no negation in the set.
+        let mut literal_index: HashSet<(Atom, u64)> = HashSet::with_capacity(unique_clauses_len * 2);
+        for clause in &unique_clauses {
+            if !clause.reconcilable || clause.wedge {
+                continue;
+            }
+            for (var_id, possibilities) in &clause.possibilities {
+                for hash in possibilities.keys() {
+                    literal_index.insert((*var_id, *hash));
+                }
+            }
+        }
 
         // Main simplification loop for resolution and unit propagation.
         'outer: for (clause_a_idx, clause_a) in unique_clauses.iter().enumerate() {
@@ -138,14 +157,28 @@ pub fn saturate_clauses<'a>(
             if is_clause_a_simple {
                 // This is unit propagation: (A) & (!A | B) => (B)
                 // `clause_a` is the unit clause (A).
-                let (&clause_var, var_possibilities) = clause_a.possibilities.iter().next().unwrap();
-                let only_type = var_possibilities.values().next().unwrap();
+                let Some((&clause_var, var_possibilities)) = clause_a.possibilities.iter().next() else {
+                    continue;
+                };
+
+                let Some(only_type) = var_possibilities.values().next() else {
+                    continue;
+                };
+
                 let negated_clause_type = only_type.get_negation();
                 let negated_hash = negated_clause_type.to_hash();
 
+                // Fast path: if no clause anywhere in the set contains the
+                // negation of this literal, the inner scan can't possibly do
+                // anything. This collapses the dominant O(N^2) cost to O(N)
+                // when most simple clauses have no contradicting partner.
+                if !literal_index.contains(&(clause_var, negated_hash)) {
+                    continue;
+                }
+
                 // Simple O(N) scan - fast for typical small N
                 for (clause_b_idx, clause_b) in unique_clauses.iter().enumerate() {
-                    if clause_a_idx == clause_b_idx || removed_indices.contains(&clause_b_idx) {
+                    if clause_a_idx == clause_b_idx || removed_indices[clause_b_idx] {
                         continue;
                     }
 
@@ -165,7 +198,7 @@ pub fn saturate_clauses<'a>(
                     let mut clause_var_possibilities = matching_clause_possibilities.clone();
                     clause_var_possibilities.retain(|k, _| k != &negated_hash);
 
-                    removed_indices.insert(clause_b_idx);
+                    removed_indices[clause_b_idx] = true;
 
                     if clause_var_possibilities.is_empty() {
                         if let Some(updated_clause) = clause_b.remove_possibilities(clause_var) {
@@ -181,7 +214,7 @@ pub fn saturate_clauses<'a>(
                 let clause_a_size = clause_a.possibilities.len();
 
                 'inner: for (clause_b_idx, clause_b) in unique_clauses.iter().enumerate() {
-                    if clause_a_idx >= clause_b_idx || removed_indices.contains(&clause_b_idx) {
+                    if clause_a_idx >= clause_b_idx || removed_indices[clause_b_idx] {
                         continue;
                     }
 
@@ -228,7 +261,7 @@ pub fn saturate_clauses<'a>(
                     }
 
                     if let Some(key_to_remove) = opposing_key {
-                        removed_indices.insert(clause_a_idx);
+                        removed_indices[clause_a_idx] = true;
                         let maybe_new_clause = clause_a.remove_possibilities(key_to_remove);
 
                         if let Some(new_clause) = maybe_new_clause {
@@ -248,7 +281,7 @@ pub fn saturate_clauses<'a>(
         let mut combined_clauses: Vec<Clause> = Vec::with_capacity(unique_clauses_len);
 
         for (idx, clause) in unique_clauses.iter().enumerate() {
-            if !removed_indices.contains(&idx) && seen_hashes.insert(clause.hash) {
+            if !removed_indices[idx] && seen_hashes.insert(clause.hash) {
                 combined_clauses.push((*clause).clone());
             }
         }
@@ -261,46 +294,66 @@ pub fn saturate_clauses<'a>(
 
         // Absorption rule: remove redundant clauses. e.g., (A | B) is redundant if A exists.
         // A clause `a` is redundant if a smaller clause `b` exists that is a subset of `a`.
+        //
+        // Fast path: when every clause has exactly one variable in its possibilities map,
+        // no clause can be a strict subset of another (the strict-subset check requires
+        // `b.size < a.size`, which is impossible when both sizes equal 1). Skipping the
+        // O(N²) outer/inner walk is what brings exhaustive `match` analysis down from
+        // cubic to linear in the arm count.
+        let all_combined_size_one =
+            combined_clauses.iter().all(|c| c.wedge || !c.reconcilable || c.possibilities.len() == 1);
+
         let mut simplified_clauses: Vec<Clause> = Vec::with_capacity(combined_clauses.len());
 
-        for clause_a in &combined_clauses {
-            if clause_a.wedge {
-                simplified_clauses.push(clause_a.clone());
-                continue;
-            }
-
-            let mut is_redundant = false;
-
-            // Check if any smaller clause is a subset of clause_a
-            for clause_b in &combined_clauses {
-                if std::ptr::eq(clause_a, clause_b) {
+        if all_combined_size_one {
+            simplified_clauses.extend(combined_clauses.iter().cloned());
+        } else {
+            for clause_a in &combined_clauses {
+                if clause_a.wedge {
+                    simplified_clauses.push(clause_a.clone());
                     continue;
                 }
 
-                if !clause_b.reconcilable || clause_b.wedge {
-                    continue;
+                let mut is_redundant = false;
+
+                // Check if any smaller clause is a subset of clause_a
+                for clause_b in &combined_clauses {
+                    if std::ptr::eq(clause_a, clause_b) {
+                        continue;
+                    }
+
+                    if !clause_b.reconcilable || clause_b.wedge {
+                        continue;
+                    }
+
+                    // Only check if clause_b is strictly smaller
+                    if clause_b.possibilities.len() >= clause_a.possibilities.len() {
+                        continue;
+                    }
+
+                    if clause_a.contains(clause_b) {
+                        is_redundant = true;
+                        break;
+                    }
                 }
 
-                // Only check if clause_b is strictly smaller
-                if clause_b.possibilities.len() >= clause_a.possibilities.len() {
-                    continue;
+                if !is_redundant {
+                    simplified_clauses.push(clause_a.clone());
                 }
-
-                if clause_a.contains(clause_b) {
-                    is_redundant = true;
-                    break;
-                }
-            }
-
-            if !is_redundant {
-                simplified_clauses.push(clause_a.clone());
             }
         }
 
         // Consensus rule: remove redundant consensus clauses.
         // (A | X) & (!A | Y) implies (X | Y). If (X | Y) already exists, it is redundant.
+        //
+        // Fast path: when every clause has exactly one variable, the only way the rule
+        // can fire is on a directly contradictory pair `(A)` and `(!A)`. Such a pair
+        // would already have been resolved away during unit propagation above, so by
+        // the time we reach here in the all-size-one case there is nothing left to do.
         let simplified_clauses_len = simplified_clauses.len();
-        if simplified_clauses_len > 2 && simplified_clauses_len < consensus_limit {
+        let all_simplified_size_one = all_combined_size_one
+            && simplified_clauses.iter().all(|c| c.wedge || !c.reconcilable || c.possibilities.len() == 1);
+        if !all_simplified_size_one && simplified_clauses_len > 2 && simplified_clauses_len < consensus_limit {
             let mut compared_clauses: HashSet<(u32, u32)> = HashSet::default();
             let mut removed_hashes: HashSet<u32> = HashSet::default();
 
@@ -326,14 +379,15 @@ pub fn saturate_clauses<'a>(
 
                     let mut common_negated_keys: HashSet<Atom> = HashSet::default();
                     for common_key in common_keys {
-                        let clause_a_possibilities = &clause_a.possibilities[&common_key];
-                        let clause_b_possibilities = &clause_b.possibilities[&common_key];
+                        let a_possibilities = &clause_a.possibilities[&common_key];
+                        let b_possibilities = &clause_b.possibilities[&common_key];
 
-                        if clause_a_possibilities.len() == 1
-                            && clause_b_possibilities.len() == 1
-                            && clause_a_possibilities.values().next().is_some_and(|a| {
-                                clause_b_possibilities.values().next().is_some_and(|b| a.is_negation_of(b))
-                            })
+                        if a_possibilities.len() == 1
+                            && b_possibilities.len() == 1
+                            && a_possibilities
+                                .values()
+                                .next()
+                                .is_some_and(|a| b_possibilities.values().next().is_some_and(|b| a.is_negation_of(b)))
                         {
                             common_negated_keys.insert(common_key);
                         }
@@ -373,7 +427,8 @@ pub fn saturate_clauses<'a>(
         simplified_clauses
     }
 
-    let unique_clauses = clauses.into_iter().unique().collect::<Vec<_>>();
+    let mut seen: HashSet<u32> = HashSet::default();
+    let unique_clauses: Vec<&Clause> = clauses.into_iter().filter(|c| seen.insert(c.hash)).collect();
 
     saturate_clauses_inner(unique_clauses, thresholds.saturation_complexity.into(), thresholds.consensus_limit.into())
 }
@@ -440,7 +495,10 @@ pub fn find_satisfying_assignments(
         }
 
         // Extract the single variable and its possible assertions.
-        let (variable_id, possible_types) = clause.possibilities.iter().next().unwrap();
+        let Some((variable_id, possible_types)) = clause.possibilities.iter().next() else {
+            continue;
+        };
+
         if variable_id.as_str().starts_with('*') {
             continue;
         }
@@ -514,7 +572,7 @@ pub fn disjoin_clauses(
         return vec![];
     }
 
-    let mut clauses = vec![];
+    let mut clauses = Vec::with_capacity(left_clauses_len.saturating_mul(right_clauses_len));
     let mut has_wedge = false;
 
     // This is creating the cartesian product of two CNF formulas, which is correct for (F1 ∨ F2).
@@ -538,7 +596,14 @@ pub fn disjoin_clauses(
 
             let mut possibilities = left_clause.possibilities.clone();
             for (var, possible_types) in &right_clause.possibilities {
-                possibilities.entry(*var).or_default().extend(possible_types.iter().map(|(&k, v)| (k, v.clone())));
+                match possibilities.get_mut(var) {
+                    Some(existing) => {
+                        existing.extend(possible_types.iter().map(|(&k, v)| (k, v.clone())));
+                    }
+                    None => {
+                        possibilities.insert(*var, possible_types.clone());
+                    }
+                }
             }
 
             // If a combined clause contains `A` and `!A`, it's a tautology (always true)
@@ -640,13 +705,13 @@ fn group_impossibilities(mut clauses: Vec<Clause>, max_complexity: usize) -> Opt
     };
 
     if !clause.wedge {
-        let impossibilities = clause.get_impossibilities();
+        for (var, possibility_map) in &clause.possibilities {
+            for assertion in possibility_map.values() {
+                let impossible_type = assertion.get_negation();
+                let hash = impossible_type.to_hash();
 
-        for (var, impossible_types) in &impossibilities {
-            for impossible_type in impossible_types {
                 let mut seed_clause_possibilities = IndexMap::new();
-                seed_clause_possibilities
-                    .insert(*var, IndexMap::from([(impossible_type.to_hash(), impossible_type.clone())]));
+                seed_clause_possibilities.insert(*var, IndexMap::from([(hash, impossible_type)]));
 
                 let seed_clause =
                     Clause::new(seed_clause_possibilities, clause.condition_span, clause.span, None, None, None);
@@ -662,30 +727,40 @@ fn group_impossibilities(mut clauses: Vec<Clause>, max_complexity: usize) -> Opt
 
     let mut complexity_upper_bound = seed_clauses.len();
     for clause in &clauses {
-        let mut possibilities_count = 0;
-        let impossibilities = clause.get_impossibilities();
-        for impossible_types in impossibilities.values() {
-            possibilities_count += impossible_types.len();
-        }
+        let possibilities_count: usize = clause.possibilities.values().map(IndexMap::len).sum();
 
         complexity_upper_bound = complexity_upper_bound.saturating_mul(possibilities_count);
 
         if complexity_upper_bound > max_complexity {
-            // If the complexity is too high, bail out early
             return None;
         }
     }
 
     while let Some(clause) = clauses.pop() {
         let mut new_clauses = Vec::with_capacity(seed_clauses.len() * 4);
-        let clause_impossibilities = clause.get_impossibilities();
+
+        let clause_negations: Vec<(Atom, Vec<(u64, Assertion)>)> = clause
+            .possibilities
+            .iter()
+            .map(|(var, possibility_map)| {
+                let negs = possibility_map
+                    .values()
+                    .map(|a| {
+                        let neg = a.get_negation();
+                        let hash = neg.to_hash();
+                        (hash, neg)
+                    })
+                    .collect();
+
+                (*var, negs)
+            })
+            .collect();
 
         for grouped_clause in &seed_clauses {
-            for (var, impossible_types) in &clause_impossibilities {
-                'next: for impossible_type in impossible_types {
+            for (var, negations) in &clause_negations {
+                'next: for (impossible_hash, impossible_type) in negations {
                     complexity += 1;
                     if complexity > max_complexity {
-                        // Early bailout
                         return None;
                     }
 
@@ -702,7 +777,7 @@ fn group_impossibilities(mut clauses: Vec<Clause>, max_complexity: usize) -> Opt
                     new_clause_possibilities
                         .entry(*var)
                         .or_insert_with(IndexMap::new)
-                        .insert(impossible_type.to_hash(), impossible_type.clone());
+                        .insert(*impossible_hash, impossible_type.clone());
 
                     new_clauses.push(Clause::new(
                         new_clause_possibilities,

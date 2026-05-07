@@ -23,11 +23,11 @@ use crate::ttype::template::TemplateResult;
 use crate::ttype::union::TUnion;
 
 #[must_use]
-pub fn cast_atomic_to_callable<'a>(
-    atomic: &'a TAtomic,
+pub fn cast_atomic_to_callable<'atomic>(
+    atomic: &'atomic TAtomic,
     codebase: &CodebaseMetadata,
     mut template_result: Option<&mut TemplateResult>,
-) -> Option<Cow<'a, TCallable>> {
+) -> Option<Cow<'atomic, TCallable>> {
     if let Some(intersections) = atomic.get_intersection_types() {
         for intersection in intersections {
             if let Some(callable) = cast_atomic_to_callable(intersection, codebase, template_result.as_deref_mut()) {
@@ -65,6 +65,10 @@ pub fn cast_atomic_to_callable<'a>(
     }
 
     if let TAtomic::Object(TObject::Named(named_object)) = atomic {
+        if named_object.get_name().as_str().eq_ignore_ascii_case("Closure") {
+            return Some(Cow::Owned(TCallable::Signature(TCallableSignature::mixed(true))));
+        }
+
         let method_identifier = MethodIdentifier::new(named_object.get_name(), atom("__invoke"));
         let method_identifier = codebase.get_declaring_method_identifier(&method_identifier);
         if codebase.method_exists(&method_identifier.get_class_name(), &method_identifier.get_method_name()) {

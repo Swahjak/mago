@@ -10,8 +10,9 @@ use mago_span::Span;
 use crate::misc::GenericParent;
 use crate::ttype::union::TUnion;
 
+pub mod bounds;
+pub mod definition_type_replacer;
 pub mod inferred_type_replacer;
-pub mod standin_type_replacer;
 pub mod variance;
 
 /// Represents a template parameter definition with its source and constraint type.
@@ -24,6 +25,9 @@ pub struct GenericTemplate {
     pub defining_entity: GenericParent,
     /// The constraint type for this template parameter (e.g., `object` for `@template T of object`).
     pub constraint: TUnion,
+    /// The default type used when no explicit generic argument is provided
+    /// (e.g., `string` for `@template T of int|string = string`).
+    pub default: Option<TUnion>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -48,7 +52,14 @@ impl GenericTemplate {
     /// Creates a new `GenericTemplate` with the given source and constraint type.
     #[must_use]
     pub fn new(template_source: GenericParent, template_type: TUnion) -> Self {
-        Self { defining_entity: template_source, constraint: template_type }
+        Self { defining_entity: template_source, constraint: template_type, default: None }
+    }
+
+    /// Returns the same `GenericTemplate` with the given default type set.
+    #[must_use]
+    pub fn with_default(mut self, default: Option<TUnion>) -> Self {
+        self.default = default;
+        self
     }
 }
 

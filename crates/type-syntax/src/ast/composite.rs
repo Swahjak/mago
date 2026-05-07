@@ -6,30 +6,36 @@ use mago_span::Span;
 use crate::ast::Type;
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, PartialOrd, Ord)]
-pub struct ParenthesizedType<'input> {
+pub struct ParenthesizedType<'arena> {
     pub left_parenthesis: Span,
-    pub inner: Box<Type<'input>>,
+    pub inner: &'arena Type<'arena>,
     pub right_parenthesis: Span,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, PartialOrd, Ord)]
-pub struct UnionType<'input> {
-    pub left: Box<Type<'input>>,
+pub struct UnionType<'arena> {
+    pub left: &'arena Type<'arena>,
     pub pipe: Span,
-    pub right: Box<Type<'input>>,
+    pub right: &'arena Type<'arena>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, PartialOrd, Ord)]
-pub struct IntersectionType<'input> {
-    pub left: Box<Type<'input>>,
+pub struct IntersectionType<'arena> {
+    pub left: &'arena Type<'arena>,
     pub ampersand: Span,
-    pub right: Box<Type<'input>>,
+    pub right: &'arena Type<'arena>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, PartialOrd, Ord)]
-pub struct NullableType<'input> {
+pub struct NullableType<'arena> {
     pub question_mark: Span,
-    pub inner: Box<Type<'input>>,
+    pub inner: &'arena Type<'arena>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, PartialOrd, Ord)]
+pub struct TrailingPipeType<'arena> {
+    pub inner: &'arena Type<'arena>,
+    pub pipe: Span,
 }
 
 impl HasSpan for ParenthesizedType<'_> {
@@ -56,6 +62,12 @@ impl HasSpan for NullableType<'_> {
     }
 }
 
+impl HasSpan for TrailingPipeType<'_> {
+    fn span(&self) -> Span {
+        self.inner.span().join(self.pipe)
+    }
+}
+
 impl std::fmt::Display for ParenthesizedType<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "({})", self.inner)
@@ -77,5 +89,11 @@ impl std::fmt::Display for IntersectionType<'_> {
 impl std::fmt::Display for NullableType<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "?{}", self.inner)
+    }
+}
+
+impl std::fmt::Display for TrailingPipeType<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}|", self.inner)
     }
 }

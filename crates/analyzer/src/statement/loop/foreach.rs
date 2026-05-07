@@ -1,4 +1,4 @@
-use foldhash::HashSet;
+use std::rc::Rc;
 
 use mago_atom::Atom;
 use mago_codex::ttype::get_mixed;
@@ -31,15 +31,6 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Foreach<'arena> {
         block_context: &mut BlockContext<'ctx>,
         artifacts: &mut AnalysisArtifacts,
     ) -> Result<(), AnalysisError> {
-        let mut safe_variable_ids = HashSet::default();
-        if let Some(key_expression) = self.target.key() {
-            safe_variable_ids.extend(r#loop::scrape_variables_from_expression(key_expression));
-        }
-
-        let value_safe_variables = r#loop::scrape_variables_from_expression(self.target.value());
-
-        safe_variable_ids.extend(value_safe_variables);
-
         let iterator = self.expression;
         let is_by_reference = match &self.target {
             ForeachTarget::Value(v) => v.value.is_reference(),
@@ -83,7 +74,7 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Foreach<'arena> {
                 key_expression,
                 key_expression_id,
                 None,
-                key_type,
+                Rc::new(key_type),
                 false,
             )?;
 
@@ -128,7 +119,7 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Foreach<'arena> {
             value_expression,
             value_expression_id,
             None,
-            value_type,
+            Rc::new(value_type),
             false,
         )?;
 
@@ -189,7 +180,7 @@ mod tests {
 
     test_analysis! {
         name = foreach_basic,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             namespace X;

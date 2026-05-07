@@ -30,7 +30,10 @@
 //! - **User Interaction Errors**: Terminal interaction and dialoguer errors
 //! - **Version Errors**: PHP version validation and parsing errors
 
+use std::path::PathBuf;
+
 use dialoguer::Error as DialoguerError;
+use rayon::ThreadPoolBuildError;
 
 use mago_analyzer::error::AnalysisError;
 use mago_database::error::DatabaseError;
@@ -38,7 +41,8 @@ use mago_orchestrator::OrchestratorError;
 use mago_php_version::PHPVersion;
 use mago_php_version::error::ParsingError;
 use mago_reporting::error::ReportingError;
-use rayon::ThreadPoolBuildError;
+
+use crate::version_check::VersionPinParseError;
 
 /// The main error type for all Mago CLI operations.
 ///
@@ -86,12 +90,28 @@ pub enum Error {
     /// system resource constraints or incompatible runtime configurations.
     BuildingRuntime(std::io::Error),
 
-    /// Failed to build or merge configuration from multiple sources.
-    ///
-    /// This error occurs when loading configuration from environment variables, TOML files,
-    /// or command-line arguments fails due to invalid settings, missing required fields,
-    /// or incompatible configuration values.
-    BuildingConfiguration(config::ConfigError),
+    /// Failed to read a configuration file from disk.
+    ReadConfigFile { path: PathBuf, source: std::io::Error },
+
+    /// Failed to parse a configuration file as TOML/YAML/JSON, or the parsed
+    /// document failed schema validation (`deny_unknown_fields`, type mismatches, …).
+    ParseConfigFile { path: PathBuf, source: Box<dyn std::error::Error + Send + Sync> },
+
+    /// Configuration file path has an unrecognised extension. We support `.toml`, `.yaml`,
+    /// `.yml`, and `.json`.
+    UnsupportedConfigExtension(PathBuf),
+
+    /// Failed to parse the value of an `MAGO_*` environment variable into the target type.
+    EnvVarParse { name: &'static str, source: Box<dyn std::error::Error + Send + Sync> },
+
+    /// Configuration file's `extends` chain cycles back on itself.
+    CircularExtends(PathBuf),
+
+    /// The `extends` field had an unsupported shape (must be a string or an array of strings).
+    InvalidExtendsEntry { path: PathBuf, reason: String },
+
+    /// An `extends` target path could not be resolved on disk.
+    ExtendsTargetNotFound { entry: String, resolved: PathBuf, source: std::io::Error },
 
     /// Failed to deserialize TOML configuration.
     ///
@@ -114,7 +134,7 @@ pub enum Error {
     ///
     /// The first field contains the path that failed to canonicalize, and the second
     /// field contains the underlying I/O error.
-    CanonicalizingPath(std::path::PathBuf, std::io::Error),
+    CanonicalizingPath(PathBuf, std::io::Error),
 
     /// Failed to parse or serialize JSON data.
     ///
@@ -230,6 +250,36 @@ pub enum Error {
 
     /// An unknown formatter preset was requested.
     UnknownFormatterPreset(String),
+
+    /// The `version` pin in `mago.toml` could not be parsed, or the
+    /// installed mago binary's own version string could not be parsed.
+    /// The wrapped error carries both the offending string and the reason.
+    InvalidProjectVersionPin(VersionPinParseError),
+
+    /// The installed mago binary is on a different major version than the
+    /// `version` pinned in `mago.toml`. Always fatal: a major bump may have
+    /// changed the config schema, so continuing would risk silently
+    /// misinterpreting the project's configuration.
+    ///
+    /// Fields are: pinned version string, installed version string.
+    ProjectMajorVersionMismatch(String, String),
+
+    /// The `self-update --to-project-version` flag was used, but the current
+    /// `mago.toml` does not set a `version` pin.
+    NoPinnedProjectVersion,
+
+    /// The `self-update --to-project-version` flag was used with a non-exact
+    /// pin (e.g. `"1"` or `"1.19"`), and the latest available release does
+    /// not satisfy it. The first field is the pin; the second is the latest
+    /// release version we found.
+    LatestReleaseDoesNotSatisfyPin(String, String),
+
+    /// A command-line argument failed surface-level validation (shape or content).
+    ///
+    /// Used for flags whose values are not a clap-level enum or type and need bespoke parsing,
+    /// such as `--substitute ORIG=TEMP`. Semantic validation that depends on filesystem state
+    /// or orchestrator context surfaces through [`Orchestrator`](Self::Orchestrator) instead.
+    InvalidArgument(String),
 }
 
 /// Formats the error for user-friendly display.
@@ -243,7 +293,31 @@ impl std::fmt::Display for Error {
             Self::Database(error) => write!(f, "Failed to load database: {error}"),
             Self::Reporting(error) => write!(f, "Failed to report results: {error}"),
             Self::BuildingRuntime(error) => write!(f, "Failed to build the runtime: {error}"),
-            Self::BuildingConfiguration(error) => write!(f, "Failed to build the configuration: {error}"),
+            Self::ReadConfigFile { path, source } => {
+                write!(f, "Failed to read configuration file `{}`: {source}", path.display())
+            }
+            Self::ParseConfigFile { path, source } => {
+                write!(f, "Failed to parse configuration file `{}`: {source}", path.display())
+            }
+            Self::UnsupportedConfigExtension(path) => {
+                write!(
+                    f,
+                    "Unsupported configuration file extension for `{}` (expected `.toml`, `.yaml`, `.yml`, or `.json`)",
+                    path.display()
+                )
+            }
+            Self::EnvVarParse { name, source } => {
+                write!(f, "Invalid value for environment variable `{name}`: {source}")
+            }
+            Self::CircularExtends(path) => {
+                write!(f, "Configuration `extends` chain cycles back on `{}`", path.display())
+            }
+            Self::InvalidExtendsEntry { path, reason } => {
+                write!(f, "Invalid `extends` declaration in `{}`: {reason}", path.display())
+            }
+            Self::ExtendsTargetNotFound { entry, resolved, source } => {
+                write!(f, "Cannot resolve `extends` entry `{entry}` (looked at `{}`): {source}", resolved.display())
+            }
             Self::DeserializingToml(error) => write!(f, "Failed to deserialize TOML: {error}"),
             Self::SerializingToml(error) => write!(f, "Failed to serialize TOML: {error}"),
             Self::CanonicalizingPath(path, error) => write!(f, "Failed to canonicalize path `{path:?}`: {error}"),
@@ -276,6 +350,23 @@ impl std::fmt::Display for Error {
             Self::UnknownFormatterPreset(preset) => {
                 write!(f, "Unknown formatter preset: `{preset}`. Available presets are: laravel, psr12, default")
             }
+            Self::InvalidArgument(message) => write!(f, "{message}"),
+            Self::InvalidProjectVersionPin(error) => write!(f, "{error}"),
+            Self::ProjectMajorVersionMismatch(pinned, installed) => {
+                write!(
+                    f,
+                    "mago.toml is pinned to major version `{pinned}`, but the installed mago binary is `{installed}`"
+                )
+            }
+            Self::NoPinnedProjectVersion => {
+                write!(f, "`self-update --to-project-version` requires a `version` pin in mago.toml")
+            }
+            Self::LatestReleaseDoesNotSatisfyPin(pinned, latest) => {
+                write!(
+                    f,
+                    "No published mago release satisfies the `version` pin `{pinned}` in mago.toml (most recent: `{latest}`)"
+                )
+            }
         }
     }
 }
@@ -297,7 +388,13 @@ impl std::error::Error for Error {
         match self {
             Self::Database(error) => Some(error),
             Self::Reporting(error) => Some(error),
-            Self::BuildingConfiguration(error) => Some(error),
+            Self::ReadConfigFile { source, .. } => Some(source),
+            Self::ParseConfigFile { source, .. } => Some(source.as_ref()),
+            Self::UnsupportedConfigExtension(_) => None,
+            Self::EnvVarParse { source, .. } => Some(source.as_ref()),
+            Self::CircularExtends(_) => None,
+            Self::InvalidExtendsEntry { .. } => None,
+            Self::ExtendsTargetNotFound { source, .. } => Some(source),
             Self::BuildingRuntime(error) => Some(error),
             Self::DeserializingToml(error) => Some(error),
             Self::SerializingToml(error) => Some(error),
@@ -314,6 +411,7 @@ impl std::error::Error for Error {
             Self::Analysis(error) => Some(error),
             Self::ThreadPoolBuildError(error) => Some(error),
             Self::Orchestrator(error) => Some(error),
+            Self::InvalidProjectVersionPin(error) => Some(error),
             _ => None,
         }
     }
@@ -336,16 +434,6 @@ impl From<DatabaseError> for Error {
 impl From<ReportingError> for Error {
     fn from(error: ReportingError) -> Self {
         Self::Reporting(error)
-    }
-}
-
-/// Converts configuration building errors into CLI errors.
-///
-/// This enables the `?` operator to automatically convert [`config::ConfigError`]
-/// into [`Error`] when propagating errors from configuration loading operations.
-impl From<config::ConfigError> for Error {
-    fn from(error: config::ConfigError) -> Self {
-        Self::BuildingConfiguration(error)
     }
 }
 
@@ -426,5 +514,13 @@ impl From<ThreadPoolBuildError> for Error {
 impl From<OrchestratorError> for Error {
     fn from(error: OrchestratorError) -> Self {
         Self::Orchestrator(error)
+    }
+}
+
+/// Converts [`VersionPinParseError`] into CLI errors, enabling `?`-based
+/// propagation through `VersionPin::parse` / `VersionPin::check`.
+impl From<VersionPinParseError> for Error {
+    fn from(error: VersionPinParseError) -> Self {
+        Self::InvalidProjectVersionPin(error)
     }
 }

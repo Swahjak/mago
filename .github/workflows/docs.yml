@@ -3,74 +3,129 @@ name: Deploy Docs
 on:
   push:
     branches: [main]
+    tags: ["[0-9]+.[0-9]+.[0-9]+"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "override the documentation version. leave empty to derive from the dispatched ref."
+        required: false
+        default: ""
 
 permissions:
-  contents: read
-  pages: write
-  id-token: write
+  contents: write
 
 concurrency:
-  group: "pages"
-  cancel-in-progress: true
+  group: docs-gh-pages
+  cancel-in-progress: false
 
 jobs:
-  build:
+  deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: wasm-build
 
-      - name: Install wasm-pack
-        uses: jetli/wasm-pack-action@v0.4.0
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          version: latest
+          node-version: 22
 
-      - name: Build WASM module
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          coverage: none
+
+      - name: Cache wasm-pack
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/wasm-pack
+          key: wasm-pack-0.13.1-${{ runner.os }}
+
+      - name: Build playground WASM
         run: |
-          cd crates/wasm
-          wasm-pack build --target web --out-dir pkg-web --release
+          if ! command -v wasm-pack &>/dev/null; then
+            cargo install wasm-pack --version 0.13.1 --locked
+          fi
+          wasm-pack build crates/wasm --target web --release --out-dir pkg-web
+          mkdir -p docs/static/playground_wasm
+          cp crates/wasm/pkg-web/mago_wasm.js \
+             crates/wasm/pkg-web/mago_wasm_bg.wasm \
+             crates/wasm/pkg-web/mago_wasm.d.ts \
+             crates/wasm/pkg-web/mago_wasm_bg.wasm.d.ts \
+             crates/wasm/pkg-web/package.json \
+             docs/static/playground_wasm/
 
-      - name: Copy WASM to docs
+      - name: Install documentation Node dependencies
+        run: npm install --prefix docs
+
+      - name: Determine documentation version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        shell: bash
         run: |
-          mkdir -p docs/public/wasm
-          cp crates/wasm/pkg-web/mago_wasm.js docs/public/wasm/
-          cp crates/wasm/pkg-web/mago_wasm_bg.wasm docs/public/wasm/
+          if [[ -n "${INPUT_VERSION}" ]]; then
+            echo "value=${INPUT_VERSION}" >> "${GITHUB_OUTPUT}"
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "value=${GITHUB_REF_NAME}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "value=main" >> "${GITHUB_OUTPUT}"
+          fi
 
-      - uses: oven-sh/setup-bun@v2
+      - name: Build static documentation
+        env:
+          MAGO_DOCS_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          cargo run -p mago-documentation
+
+      - name: Generate configuration schema
+        env:
+          MAGO_DOCS_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          mkdir -p "docs/dist/${MAGO_DOCS_VERSION}"
+          cargo run --quiet -p mago -- config --schema > "docs/dist/${MAGO_DOCS_VERSION}/schema.json"
+
+      - name: Check out existing gh-pages branch
+        uses: actions/checkout@v4
         with:
-          bun-version: latest
+          ref: gh-pages
+          path: gh-pages
+        continue-on-error: true
 
-      - name: Install dependencies
-        run: cd docs && bun install --frozen-lockfile
+      - name: Initialise gh-pages on first deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -d gh-pages/.git ]; then
+            mkdir -p gh-pages
+            cd gh-pages
+            git init -b gh-pages
+            git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          fi
 
-      - name: Build docs
-        run: cd docs && bun run build
+      - name: Stage gh-pages
+        run: php scripts/publish-docs.php "${{ steps.version.outputs.value }}" docs gh-pages
 
-      - name: Upload GitHub Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: docs/.vitepress/dist
-
-  deploy:
-    needs: [build]
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+      - name: Commit and push gh-pages
+        working-directory: gh-pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          touch .nojekyll
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "deploy: ${{ steps.version.outputs.value }}"
+          git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" 2>/dev/null \
+            || git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git push origin HEAD:gh-pages --force

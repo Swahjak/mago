@@ -12,6 +12,10 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+property-tests = []
+
 [dependencies]
 mago-reporting = { workspace = true }
 mago-docblock = { workspace = true }
@@ -29,10 +33,10 @@ strum = { workspace = true }
 indexmap = { workspace = true }
 ordered-float = { workspace = true }
 bumpalo = { workspace = true }
-itertools = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+proptest = { workspace = true }
 
 [[bench]]
 name = "expander"

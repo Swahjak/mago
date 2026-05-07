@@ -10,6 +10,7 @@ use mago_atom::concat_atom;
 use mago_codex::identifier::function_like::FunctionLikeIdentifier;
 use mago_codex::metadata::class_like::ClassLikeMetadata;
 use mago_codex::metadata::function_like::FunctionLikeMetadata;
+use mago_codex::metadata::parameter::FunctionLikeParameterMetadata;
 use mago_codex::metadata::ttype::TypeMetadata;
 use mago_codex::misc::GenericParent;
 use mago_codex::ttype::TType;
@@ -24,6 +25,7 @@ use mago_codex::ttype::atomic::reference::TReference;
 use mago_codex::ttype::atomic::scalar::TScalar;
 use mago_codex::ttype::atomic::scalar::class_like_string::TClassLikeString;
 use mago_codex::ttype::comparator::ComparisonResult;
+use mago_codex::ttype::comparator::atomic_comparator;
 use mago_codex::ttype::comparator::union_comparator;
 use mago_codex::ttype::expander;
 use mago_codex::ttype::expander::StaticClassType;
@@ -34,6 +36,7 @@ use mago_codex::ttype::get_list;
 use mago_codex::ttype::get_mixed;
 use mago_codex::ttype::union::TUnion;
 use mago_codex::ttype::wrap_atomic;
+use mago_php_version::feature::Feature;
 use mago_reporting::Annotation;
 use mago_reporting::Issue;
 use mago_span::HasSpan;
@@ -199,7 +202,7 @@ pub fn analyze_function_like<'ctx, 'ast, 'arena>(
                 block_context.flags.set_inside_return(true);
                 value.analyze(context, block_context, &mut artifacts)?;
                 block_context.flags.set_inside_return(false);
-                block_context.conditionally_referenced_variable_ids = Default::default();
+                block_context.conditionally_referenced_variable_ids.clear();
 
                 let value_type =
                     artifacts.get_rc_expression_type(value).cloned().unwrap_or_else(|| Rc::new(get_mixed()));
@@ -245,6 +248,7 @@ pub fn analyze_function_like<'ctx, 'ast, 'arena>(
         );
     }
 
+    check_return_type_width(context, block_context, &mut artifacts, function_like_metadata);
     check_thrown_types(context, block_context, &mut artifacts, function_like_metadata);
 
     std::mem::swap(&mut context.type_resolution_context, &mut previous_type_resolution_context);
@@ -262,6 +266,15 @@ fn add_parameter_types_to_context<'ctx, 'arena>(
     parameter_list: &FunctionLikeParameterList<'arena>,
     mut inferred_parameter_types: Option<HashMap<usize, TUnion>>,
 ) -> Result<(), AnalysisError> {
+    let is_overriding_method = if function_like_metadata.kind.is_method()
+        && let Some(class_name) = block_context.scope.get_class_like_name()
+        && let Some(method_name) = function_like_metadata.name
+    {
+        context.codebase.method_is_overriding(class_name.as_str(), method_name.as_str())
+    } else {
+        false
+    };
+
     for (i, parameter_metadata) in function_like_metadata.parameters.iter().enumerate() {
         let parameter_variable_str = parameter_metadata.get_name().0;
 
@@ -318,6 +331,62 @@ fn add_parameter_types_to_context<'ctx, 'arena>(
                     ));
 
                     context.collector.report_with_code(IssueCode::DocblockTypeMismatch, issue);
+                } else if !is_overriding_method
+                    && !effective_type.has_template_types()
+                    && !expanded_native.has_template_types()
+                {
+                    let dropped: Vec<&TAtomic> = expanded_native
+                        .types
+                        .iter()
+                        .filter(|native_atomic| {
+                            !effective_type.types.iter().any(|docblock_atomic| {
+                                atomic_comparator::is_contained_by(
+                                    context.codebase,
+                                    native_atomic,
+                                    docblock_atomic,
+                                    false,
+                                    &mut ComparisonResult::default(),
+                                ) || atomic_comparator::is_contained_by(
+                                    context.codebase,
+                                    docblock_atomic,
+                                    native_atomic,
+                                    false,
+                                    &mut ComparisonResult::default(),
+                                )
+                            })
+                        })
+                        .collect();
+
+                    if !dropped.is_empty() {
+                        let docblock_type_str = effective_type.get_id();
+                        let native_type_str = expanded_native.get_id();
+                        let param_name = parameter_metadata.name.0;
+                        let dropped_list =
+                            dropped.iter().map(|a| a.get_id().to_string()).collect::<Vec<_>>().join("`, `");
+
+                        let issue = Issue::error(format!(
+                            "Docblock type `{docblock_type_str}` for parameter `{param_name}` drops part of native type `{native_type_str}`."
+                        ))
+                            .with_annotation(
+                                Annotation::primary(native_type.span)
+                                    .with_message(format!("Native type accepts `{native_type_str}`, including `{dropped_list}`...")),
+                            )
+                            .with_annotation(
+                                Annotation::secondary(parameter_type.span)
+                                    .with_message(format!("...but docblock only covers `{docblock_type_str}`")),
+                            )
+                            .with_note("Callers can still pass values of the excluded branches.")
+                            .with_note("The docblock tells the analyzer those branches are impossible.")
+                            .with_note("Narrowing checks can then collapse to `never` in the body.")
+                            .with_help(format!(
+                                "Widen the docblock to `{native_type_str}`, or tighten the native type."
+                            ))
+                        ;
+
+                        context.collector.report_with_code(IssueCode::DocblockParameterNarrowing, issue);
+                    }
+                } else {
+                    // overriding method or template-bearing types; narrowing check would be unreliable
                 }
             }
 
@@ -339,6 +408,16 @@ fn add_parameter_types_to_context<'ctx, 'arena>(
         } else if let Some(inferred_map) = inferred_parameter_types.as_mut()
             && let Some(inferred_type) = inferred_map.remove(&i)
             && !is_unresolved_template_with_mixed_bound(&inferred_type)
+            && (parameter_metadata.get_type_metadata().is_none()
+                || union_comparator::is_contained_by(
+                    context.codebase,
+                    &inferred_type,
+                    &declared_parameter_type,
+                    true,
+                    true,
+                    false,
+                    &mut ComparisonResult::default(),
+                ))
         {
             if parameter_metadata.get_type_metadata().is_some()
                 && !declared_parameter_type.is_nullable()
@@ -368,7 +447,7 @@ fn add_parameter_types_to_context<'ctx, 'arena>(
                 ReferenceConstraint::new(
                     parameter_metadata.span,
                     ReferenceConstraintSource::Parameter,
-                    Some(constraint_type),
+                    Some(Rc::new(constraint_type)),
                 ),
             );
         }
@@ -391,6 +470,27 @@ fn add_parameter_types_to_context<'ctx, 'arena>(
 
         if let Some(default_value) = parameter_node.default_value.as_ref() {
             default_value.value.analyze(context, block_context, artifacts)?;
+
+            if !parameter_metadata.flags.is_variadic()
+                && let Some(parameter_type_metadata) = parameter_metadata.get_type_metadata()
+                && !parameter_type_metadata.type_union.is_mixed()
+            {
+                let expected_type = expand_type_metadata(
+                    context,
+                    block_context,
+                    artifacts,
+                    function_like_metadata,
+                    parameter_type_metadata,
+                );
+
+                check_parameter_default_value(
+                    context,
+                    parameter_metadata,
+                    &expected_type,
+                    default_value.value,
+                    artifacts,
+                );
+            }
         }
 
         let final_parameter_type = if parameter_metadata.flags.is_variadic() {
@@ -424,8 +524,8 @@ fn is_unresolved_template_with_mixed_bound(union: &TUnion) -> bool {
 }
 
 fn expand_type_metadata<'ctx>(
-    context: &mut Context<'ctx, '_>,
-    block_context: &mut BlockContext<'ctx>,
+    context: &Context<'ctx, '_>,
+    block_context: &BlockContext<'ctx>,
     artifacts: &mut AnalysisArtifacts,
     function_like_metadata: &FunctionLikeMetadata,
     type_metadata: &TypeMetadata,
@@ -688,9 +788,144 @@ fn add_symbol_references(
     }
 }
 
+/// Flags declared return types that are strictly wider than the union of every
+/// value the body actually returns.
+fn check_return_type_width<'ctx>(
+    context: &mut Context<'ctx, '_>,
+    block_context: &BlockContext<'ctx>,
+    artifacts: &mut AnalysisArtifacts,
+    function_like_metadata: &'ctx FunctionLikeMetadata,
+) {
+    if !context.settings.find_overly_wide_return_types {
+        return;
+    }
+
+    if function_like_metadata.flags.has_yield()
+        || function_like_metadata.flags.is_abstract()
+        || function_like_metadata.flags.is_unchecked()
+    {
+        return;
+    }
+
+    let Some(return_type_metadata) = function_like_metadata.return_type_metadata.as_ref() else {
+        return;
+    };
+
+    let declared = &return_type_metadata.type_union;
+    if declared.is_mixed()
+        || declared.is_void()
+        || declared.is_never()
+        || declared.has_template_types()
+        || declared.is_generic_parameter()
+    {
+        return;
+    }
+
+    let is_overriding_method = if function_like_metadata.kind.is_method()
+        && let Some(class_name) = block_context.scope.get_class_like_name()
+        && let Some(method_name) = function_like_metadata.name
+    {
+        context.codebase.method_is_overriding(class_name.as_str(), method_name.as_str())
+    } else {
+        false
+    };
+
+    if is_overriding_method {
+        return;
+    }
+
+    if artifacts.inferred_return_types.is_empty() {
+        return;
+    }
+
+    let any_return_is_uninformative = artifacts.inferred_return_types.iter().any(|ret| {
+        ret.is_mixed() || ret.is_never() || ret.is_void() || ret.has_template_types() || ret.is_generic_parameter()
+    });
+
+    if any_return_is_uninformative {
+        return;
+    }
+
+    let expanded_declared =
+        expand_type_metadata(context, block_context, artifacts, function_like_metadata, return_type_metadata);
+
+    let any_inferred_matches = |declared_atomic: &TAtomic| -> bool {
+        artifacts.inferred_return_types.iter().any(|ret| {
+            ret.types.iter().any(|inferred_atomic| {
+                atomic_comparator::is_contained_by(
+                    context.codebase,
+                    inferred_atomic,
+                    declared_atomic,
+                    false,
+                    &mut ComparisonResult::default(),
+                ) || atomic_comparator::is_contained_by(
+                    context.codebase,
+                    declared_atomic,
+                    inferred_atomic,
+                    false,
+                    &mut ComparisonResult::default(),
+                )
+            })
+        })
+    };
+
+    let inferred_fully_in_declared = artifacts.inferred_return_types.iter().all(|ret| {
+        ret.types.iter().all(|inferred_atomic| {
+            expanded_declared.types.iter().any(|declared_atomic| {
+                atomic_comparator::is_contained_by(
+                    context.codebase,
+                    inferred_atomic,
+                    declared_atomic,
+                    false,
+                    &mut ComparisonResult::default(),
+                )
+            })
+        })
+    });
+
+    if !inferred_fully_in_declared {
+        return;
+    }
+
+    let has_unused = expanded_declared.types.iter().any(|declared_atomic| !any_inferred_matches(declared_atomic));
+    if !has_unused {
+        return;
+    }
+
+    let unused_list = expanded_declared
+        .types
+        .iter()
+        .filter(|declared_atomic| !any_inferred_matches(declared_atomic))
+        .map(|a| a.get_id().to_string())
+        .collect::<Vec<_>>()
+        .join("`, `");
+
+    let declared_str = expanded_declared.get_id();
+    let return_span = return_type_metadata.span;
+    let function_label = function_like_metadata.name.unwrap_or_else(|| atom("closure"));
+
+    let issue = Issue::help(format!(
+        "Declared return type `{declared_str}` for `{function_label}` has unused branches: `{unused_list}`."
+    ))
+    .with_annotation(
+        Annotation::primary(return_span)
+            .with_message(format!("Declared as `{declared_str}`, but `{unused_list}` is never returned.")),
+    )
+    .with_annotation(
+        Annotation::secondary(function_like_metadata.name_span.unwrap_or(function_like_metadata.span))
+            .with_message("No path in this body produces that value."),
+    )
+    .with_note("A return type wider than the body produces is misleading.")
+    .with_note("Callers must handle branches the function never actually returns.")
+    .with_note("It can hide dead code paths meant to produce the missing variant.")
+    .with_help(format!("Remove `{unused_list}` from the return type, or add a branch that returns it."));
+
+    context.collector.report_with_code(IssueCode::OverlyWideReturnType, issue);
+}
+
 fn check_thrown_types<'ctx>(
     context: &mut Context<'ctx, '_>,
-    block_context: &mut BlockContext<'ctx>,
+    block_context: &BlockContext<'ctx>,
     artifacts: &mut AnalysisArtifacts,
     function_like_metadata: &'ctx FunctionLikeMetadata,
 ) {
@@ -744,7 +979,7 @@ fn check_thrown_types<'ctx>(
                 false,
                 false,
                 false,
-                &mut Default::default(),
+                &mut ComparisonResult::default(),
             ) {
                 is_expected = true;
                 break;
@@ -921,6 +1156,65 @@ pub fn check_unused_function_template_parameters<'ctx>(
             )),
         );
     }
+}
+
+/// Verifies that a parameter's default value is assignable to the parameter's declared type.
+fn check_parameter_default_value<'ctx, 'arena>(
+    context: &mut Context<'ctx, 'arena>,
+    parameter_metadata: &'ctx FunctionLikeParameterMetadata,
+    declared_type: &TUnion,
+    default_expression: &Expression<'arena>,
+    artifacts: &AnalysisArtifacts,
+) {
+    if declared_type.is_mixed() || declared_type.has_template_types() || declared_type.is_generic_parameter() {
+        return;
+    }
+
+    let Some(default_type) = artifacts.get_expression_type(default_expression) else {
+        return;
+    };
+
+    if default_type.is_never() {
+        return;
+    }
+
+    let allow_implicit_null_default =
+        default_type.is_null() && context.settings.version.is_supported(Feature::ImplicitlyNullableParameterTypes);
+
+    let mut comparison_result = ComparisonResult::new();
+    if union_comparator::is_contained_by(
+        context.codebase,
+        default_type,
+        declared_type,
+        allow_implicit_null_default,
+        false,
+        false,
+        &mut comparison_result,
+    ) {
+        return;
+    }
+
+    let default_type_str = default_type.get_id();
+    let declared_type_str = declared_type.get_id();
+    let param_name = parameter_metadata.name.0;
+
+    let issue = Issue::error(format!(
+        "Default value for parameter `{param_name}` is not assignable to its declared type."
+    ))
+    .with_annotation(
+        Annotation::primary(default_expression.span())
+            .with_message(format!("This default value has type `{default_type_str}`")),
+    )
+    .with_annotation(
+        Annotation::secondary(parameter_metadata.span)
+            .with_message(format!("Parameter `{param_name}` is declared with type `{declared_type_str}`")),
+    )
+    .with_note("A parameter's default value must be assignable to the parameter's declared type.")
+    .with_help(
+        "Change the default value to match the declared type, or widen the parameter type to accept the default.",
+    );
+
+    context.collector.report_with_code(IssueCode::InvalidParameterDefaultValue, issue);
 }
 
 /// Reports errors for any undefined type references in the given type metadata.

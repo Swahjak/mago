@@ -67,9 +67,22 @@ impl HasSpan for Trivia<'_> {
     }
 }
 
-impl<'arena> Sequence<'arena, Trivia<'arena>> {
-    /// Returns an iterator over the comments in the sequence.
-    pub fn comments(&self) -> impl Iterator<Item = &Trivia<'arena>> {
+/// Iteration helpers over a trivia [`Sequence`].
+///
+/// `Sequence` lives in [`mago_syntax_core`], so PHP-specific helpers are
+/// exposed as an extension trait. `use crate::ast::*;` imports it.
+pub trait TriviaSequenceExt<'arena> {
+    fn comments<'borrow>(&'borrow self) -> impl Iterator<Item = &'borrow Trivia<'arena>>
+    where
+        'arena: 'borrow;
+}
+
+impl<'arena> TriviaSequenceExt<'arena> for Sequence<'arena, Trivia<'arena>> {
+    #[inline]
+    fn comments<'borrow>(&'borrow self) -> impl Iterator<Item = &'borrow Trivia<'arena>>
+    where
+        'arena: 'borrow,
+    {
         self.iter().filter(|trivia| trivia.kind.is_comment())
     }
 }

@@ -62,6 +62,7 @@ use mago_syntax::ast::MissingArrayElement;
 use mago_syntax::ast::NamedArgument;
 use mago_syntax::ast::NamedPlaceholderArgument;
 use mago_syntax::ast::NestedVariable;
+use mago_syntax::ast::Node;
 use mago_syntax::ast::NullSafePropertyAccess;
 use mago_syntax::ast::PartialApplication;
 use mago_syntax::ast::PartialArgument;
@@ -95,6 +96,7 @@ use crate::document::Align;
 use crate::document::BreakMode;
 use crate::document::Document;
 use crate::document::Line;
+use crate::document::group::GroupIdentifier;
 use crate::internal::FormatterState;
 use crate::internal::comment::CommentFlags;
 use crate::internal::format::Format;
@@ -102,6 +104,9 @@ use crate::internal::format::Group;
 use crate::internal::format::IfBreak;
 use crate::internal::format::IndentIfBreak;
 use crate::internal::format::Separator;
+use crate::internal::format::alignment::AlignmentRun;
+use crate::internal::format::alignment::AlignmentWidths;
+use crate::internal::format::alignment::has_comment_between;
 use crate::internal::format::array::ArrayLike;
 use crate::internal::format::array::print_array_like;
 use crate::internal::format::assignment::AssignmentLikeNode;
@@ -128,6 +133,7 @@ use crate::internal::format::string::print_string;
 use crate::internal::format::string::print_uppercase_keyword;
 use crate::internal::utils;
 use crate::internal::utils::could_expand_value;
+use crate::internal::utils::get_expression_width;
 use crate::internal::utils::unwrap_parenthesized;
 use crate::settings::BraceStyle;
 use crate::wrap;
@@ -193,7 +199,9 @@ impl<'arena> Format<'arena> for Expression<'arena> {
                 Expression::MagicConstant(c) => c.format(f),
                 Expression::Pipe(p) => p.format(f),
                 Expression::Error(_) => Document::empty(),
+                #[allow(clippy::unreachable)]
                 Expression::Parenthesized(_) => unreachable!("Parenthesized expressions are handled separately"),
+                #[allow(clippy::unreachable)]
                 _ => unreachable!("An expression variant was not handled in formatter: {self:?}"),
             }
         })
@@ -629,9 +637,19 @@ impl<'arena> Format<'arena> for PositionalArgument<'arena> {
 impl<'arena> Format<'arena> for NamedArgument<'arena> {
     fn format(&'arena self, f: &mut FormatterState<'_, 'arena>) -> Document<'arena> {
         wrap!(f, self, NamedArgument, {
+            let padding = if let Some(padding) = f.argument_state.named_argument_padding {
+                let mut spaces = bumpalo::collections::Vec::with_capacity_in(padding, f.arena);
+                spaces.resize(padding, b' ');
+                // SAFETY: the buffer holds only ASCII space bytes, which is valid UTF-8.
+                Document::String(unsafe { std::str::from_utf8_unchecked(spaces.into_bump_slice()) })
+            } else {
+                Document::empty()
+            };
+
             Document::Group(Group::new(vec![
                 in f.arena;
                 self.name.format(f),
+                padding,
                 Document::String(":"),
                 Document::space(),
                 self.value.format(f),
@@ -896,12 +914,7 @@ impl<'arena> Format<'arena> for ArrayAppend<'arena> {
 
 impl<'arena> Format<'arena> for MatchArm<'arena> {
     fn format(&'arena self, f: &mut FormatterState<'_, 'arena>) -> Document<'arena> {
-        wrap!(f, self, MatchArm, {
-            match self {
-                MatchArm::Expression(a) => a.format(f),
-                MatchArm::Default(a) => a.format(f),
-            }
-        })
+        format_match_arm(f, self, None)
     }
 }
 
@@ -920,51 +933,218 @@ impl<'arena> Format<'arena> for MatchDefaultArm<'arena> {
 
 impl<'arena> Format<'arena> for MatchExpressionArm<'arena> {
     fn format(&'arena self, f: &mut FormatterState<'_, 'arena>) -> Document<'arena> {
-        wrap!(f, self, MatchExpressionArm, {
-            let len = self.conditions.len();
+        format_match_expression_arm(f, self, None)
+    }
+}
 
-            let must_break = self
-                .conditions
-                .iter()
-                .take(len.saturating_sub(1))
-                .any(|condition| f.has_comment(condition.span(), CommentFlags::TRAILING | CommentFlags::LINE));
+#[derive(Debug, Clone, Copy)]
+struct MatchArmAlignment {
+    name_padding: usize,
+}
 
-            let mut contents = vec![in f.arena];
-            for (i, condition) in self.conditions.iter().enumerate() {
-                contents.push(condition.format(f));
-                if i != (len - 1) {
-                    contents.push(Document::String(","));
-                    contents.push(if must_break {
-                        Document::Line(Line::hard())
-                    } else {
-                        Document::Line(Line::default())
-                    });
-                } else if f.settings.trailing_comma && i > 0 {
-                    contents.push(Document::IfBreak(IfBreak::then(f.arena, Document::String(","))));
+fn format_match_arm<'arena>(
+    f: &mut FormatterState<'_, 'arena>,
+    arm: &'arena MatchArm<'arena>,
+    alignment: Option<MatchArmAlignment>,
+) -> Document<'arena> {
+    wrap!(f, arm, MatchArm, {
+        match arm {
+            MatchArm::Expression(a) => format_match_expression_arm(f, a, alignment),
+            MatchArm::Default(a) => format_match_default_arm(f, a, alignment),
+        }
+    })
+}
+
+fn format_match_default_arm<'arena>(
+    f: &mut FormatterState<'_, 'arena>,
+    arm: &'arena MatchDefaultArm<'arena>,
+    alignment: Option<MatchArmAlignment>,
+) -> Document<'arena> {
+    wrap!(f, arm, MatchDefaultArm, {
+        Document::Group(Group::new(vec![
+            in f.arena;
+            arm.default.format(f),
+            match_arm_alignment_padding(f, alignment),
+            format_token(f, arm.arrow, " => "),
+            arm.expression.format(f),
+        ]))
+    })
+}
+
+fn format_match_expression_arm<'arena>(
+    f: &mut FormatterState<'_, 'arena>,
+    arm: &'arena MatchExpressionArm<'arena>,
+    alignment: Option<MatchArmAlignment>,
+) -> Document<'arena> {
+    wrap!(f, arm, MatchExpressionArm, {
+        let len = arm.conditions.len();
+
+        let must_break = arm
+            .conditions
+            .iter()
+            .take(len.saturating_sub(1))
+            .any(|condition| f.has_comment(condition.span(), CommentFlags::TRAILING | CommentFlags::LINE));
+
+        let mut contents = vec![in f.arena];
+        for (i, condition) in arm.conditions.iter().enumerate() {
+            contents.push(condition.format(f));
+            if i != (len - 1) {
+                contents.push(Document::String(","));
+                contents.push(if must_break { Document::Line(Line::hard()) } else { Document::Line(Line::default()) });
+            } else if f.settings.trailing_comma && i > 0 {
+                contents.push(Document::IfBreak(IfBreak::then(f.arena, Document::String(","))));
+            }
+        }
+
+        let group_id = f.next_id();
+        contents.push(match_arm_alignment_padding_unless_breaks(f, alignment, group_id));
+        contents.push(Document::IndentIfBreak(IndentIfBreak::new(
+            group_id,
+            vec![
+                in f.arena;
+                if must_break { Document::Line(Line::hard()) } else { Document::Line(Line::default()) },
+                format_token(f, arm.arrow, "=> "),
+            ],
+        )));
+
+        Document::Group(
+            Group::new(vec![
+                in f.arena;
+                Document::Group(Group::new(contents).with_break_mode(if must_break { BreakMode::Force } else { BreakMode::Auto })),
+                arm.expression.format(f),
+            ])
+            .with_id(group_id)
+            .with_break_mode(if must_break { BreakMode::Force } else { BreakMode::Auto }),
+        )
+    })
+}
+
+fn match_arm_alignment_padding<'arena>(
+    f: &mut FormatterState<'_, 'arena>,
+    alignment: Option<MatchArmAlignment>,
+) -> Document<'arena> {
+    match alignment {
+        Some(MatchArmAlignment { name_padding }) if name_padding > 0 => {
+            Document::String(f.as_str(" ".repeat(name_padding)))
+        }
+        _ => Document::empty(),
+    }
+}
+
+fn match_arm_alignment_padding_unless_breaks<'arena>(
+    f: &mut FormatterState<'_, 'arena>,
+    alignment: Option<MatchArmAlignment>,
+    group_id: GroupIdentifier,
+) -> Document<'arena> {
+    if alignment.is_none_or(|alignment| alignment.name_padding == 0) {
+        return Document::empty();
+    }
+
+    let padding = match_arm_alignment_padding(f, alignment);
+    Document::IfBreak(IfBreak::new(f.arena, Document::empty(), padding).with_id(group_id))
+}
+
+fn detect_match_arm_alignment_runs<'arena>(
+    f: &FormatterState<'_, 'arena>,
+    arms: &'arena [MatchArm<'arena>],
+) -> std::vec::Vec<AlignmentRun> {
+    if !f.settings.align_assignment_like || arms.is_empty() {
+        return std::vec::Vec::new();
+    }
+
+    let mut runs = std::vec::Vec::new();
+    let mut run_start: Option<usize> = None;
+
+    for (i, arm) in arms.iter().enumerate() {
+        let is_alignable = match_arm_lhs_width(arm).is_some();
+        let should_break_run = run_start.is_some_and(|_start_idx| {
+            if !is_alignable {
+                return true;
+            }
+
+            if i > 0 {
+                let prev_span = arms[i - 1].span();
+                let curr_span = arm.span();
+                if has_comment_between(f, prev_span, curr_span) {
+                    return true;
                 }
             }
 
-            let group_id = f.next_id();
-            contents.push(Document::IndentIfBreak(IndentIfBreak::new(
-                group_id,
-                vec![
-                    in f.arena;
-                    if must_break { Document::Line(Line::hard()) } else { Document::Line(Line::default()) },
-                    format_token(f, self.arrow, "=> "),
-                ],
-            )));
+            false
+        });
 
-            Document::Group(
-                Group::new(vec![
-                    in f.arena;
-                    Document::Group(Group::new(contents).with_break_mode(if must_break { BreakMode::Force } else { BreakMode::Auto })),
-                    self.expression.format(f),
-                ])
-                .with_id(group_id)
-                .with_break_mode(if must_break { BreakMode::Force } else { BreakMode::Auto }),
-            )
-        })
+        if should_break_run {
+            if let Some(start_idx) = run_start
+                && i - start_idx >= 2
+            {
+                let widths = calculate_match_arm_widths(&arms[start_idx..i]);
+                runs.push(AlignmentRun::new(start_idx, i, widths));
+            }
+            run_start = None;
+        }
+
+        if is_alignable {
+            if run_start.is_none() {
+                run_start = Some(i);
+            }
+        } else {
+            if let Some(start_idx) = run_start
+                && i - start_idx >= 2
+            {
+                let widths = calculate_match_arm_widths(&arms[start_idx..i]);
+                runs.push(AlignmentRun::new(start_idx, i, widths));
+            }
+            run_start = None;
+        }
     }
+
+    if let Some(start_idx) = run_start {
+        let len = arms.len();
+        if len - start_idx >= 2 {
+            let widths = calculate_match_arm_widths(&arms[start_idx..]);
+            runs.push(AlignmentRun::new(start_idx, len, widths));
+        }
+    }
+
+    runs
+}
+
+fn calculate_match_arm_widths(arms: &[MatchArm<'_>]) -> AlignmentWidths {
+    let max_name_width = arms.iter().filter_map(match_arm_lhs_width).max().unwrap_or(0);
+
+    AlignmentWidths::new(max_name_width)
+}
+
+fn get_match_arm_alignment(runs: &[AlignmentRun], index: usize) -> Option<AlignmentWidths> {
+    runs.iter().find(|run| run.contains(index)).map(|run| run.widths)
+}
+
+fn calculate_match_arm_alignment(arm: &MatchArm<'_>, widths: &AlignmentWidths) -> MatchArmAlignment {
+    let current_width = match_arm_lhs_width(arm).unwrap_or(0);
+    let name_padding = widths.name_width.saturating_sub(current_width);
+
+    MatchArmAlignment { name_padding }
+}
+
+fn match_arm_lhs_width(arm: &MatchArm<'_>) -> Option<usize> {
+    match arm {
+        MatchArm::Expression(arm) => match_expression_arm_conditions_width(arm),
+        MatchArm::Default(_) => Some("default".len()),
+    }
+}
+
+fn match_expression_arm_conditions_width(arm: &MatchExpressionArm<'_>) -> Option<usize> {
+    let mut width = 0usize;
+
+    for (i, condition) in arm.conditions.iter().enumerate() {
+        if i > 0 {
+            width += 2;
+        }
+
+        width += get_expression_width(condition)?;
+    }
+
+    Some(width)
 }
 
 impl<'arena> Format<'arena> for Match<'arena> {
@@ -1005,9 +1185,15 @@ impl<'arena> Format<'arena> for Match<'arena> {
                 });
 
             if !self.arms.is_empty() {
+                let alignment_runs = detect_match_arm_alignment_runs(f, self.arms.as_slice());
                 let mut arms_document = Document::join(
                     f.arena,
-                    self.arms.iter().map(|arm| arm.format(f)),
+                    self.arms.iter().enumerate().map(|(i, arm)| {
+                        let alignment = get_match_arm_alignment(&alignment_runs, i)
+                            .map(|widths| calculate_match_arm_alignment(arm, &widths));
+
+                        format_match_arm(f, arm, alignment)
+                    }),
                     if should_break { Separator::CommaHardLine } else { Separator::CommaLine },
                 );
 
@@ -1071,38 +1257,68 @@ impl<'arena> Format<'arena> for Conditional<'arena> {
 
                     let conditional_id = f.next_id();
                     let then_id = f.next_id();
+                    let condition_id = f.next_id();
+                    let condition_doc = self.condition.format(f);
+                    let question_doc = format_token_with_only_leading_comments(f, self.question_mark, "? ");
+                    let then_doc = then.format(f);
+                    let colon_transition = if inline_colon {
+                        if preserve_break {
+                            Document::space()
+                        } else {
+                            Document::IfBreak(
+                                IfBreak::new(f.arena, Document::space(), {
+                                    Document::IfBreak(
+                                        IfBreak::new(f.arena, Document::Line(Line::hard()), Document::space())
+                                            .with_id(conditional_id),
+                                    )
+                                })
+                                .with_id(then_id),
+                            )
+                        }
+                    } else {
+                        Document::Line(Line::default())
+                    };
+                    let colon_doc = format_token_with_only_leading_comments(f, self.colon, ": ");
+                    let else_doc = self.r#else.format(f);
+
+                    let branches = Document::Indent(vec![
+                        in f.arena;
+                        Document::Line(Line::default()),
+                        question_doc,
+                        Document::Group(Group::new(vec![in f.arena; then_doc]).with_id(then_id)),
+                        colon_transition,
+                        colon_doc,
+                        else_doc,
+                    ]);
+
+                    let has_outer_indent_context = f.grandparent_node().is_some_and(|n| {
+                        matches!(
+                            n,
+                            Node::Assignment(_)
+                                | Node::PropertyItem(_)
+                                | Node::ConstantItem(_)
+                                | Node::Binary(_)
+                                | Node::KeyValueArrayElement(_)
+                                | Node::ValueArrayElement(_)
+                                | Node::VariadicArrayElement(_)
+                                | Node::PositionalArgument(_)
+                                | Node::NamedArgument(_)
+                                | Node::Return(_)
+                                | Node::Throw(_)
+                                | Node::Yield(_)
+                        )
+                    });
+                    let tail = if has_outer_indent_context {
+                        branches
+                    } else {
+                        Document::IndentIfBreak(IndentIfBreak::new(condition_id, vec![in f.arena; branches]))
+                    };
 
                     Document::Group(
                         Group::new(vec![
                             in f.arena;
-                            self.condition.format(f),
-                            Document::Indent(vec![
-                                in f.arena;
-                                Document::Line(Line::default()),
-                                format_token_with_only_leading_comments(f, self.question_mark, "? "),
-                                Document::Group(Group::new(vec![in f.arena; then.format(f)]).with_id(then_id)),
-                                {
-                                    if inline_colon {
-                                        if preserve_break {
-                                            Document::space()
-                                        } else {
-                                            Document::IfBreak(
-                                                IfBreak::new(f.arena, Document::space(), {
-                                                    Document::IfBreak(
-                                                        IfBreak::new(f.arena, Document::Line(Line::hard()), Document::space())
-                                                            .with_id(conditional_id),
-                                                    )
-                                                })
-                                                .with_id(then_id),
-                                            )
-                                        }
-                                    } else {
-                                        Document::Line(Line::default())
-                                    }
-                                },
-                                format_token_with_only_leading_comments(f, self.colon, ": "),
-                                self.r#else.format(f),
-                            ]),
+                            Document::Group(Group::new(vec![in f.arena; condition_doc]).with_id(condition_id)),
+                            tail,
                         ])
                         .with_break_mode(if preserve_break { BreakMode::Preserve } else { BreakMode::Auto })
                         .with_id(conditional_id),
@@ -1170,10 +1386,11 @@ impl<'arena> Format<'arena> for DocumentString<'arena> {
                     let lines = f.split_lines(content);
 
                     for line in &lines {
-                        let mut line = *line;
+                        let mut current = *line;
                         if own_line {
-                            line = FormatterState::skip_leading_whitespace_up_to(line, indent);
+                            current = FormatterState::skip_leading_whitespace_up_to(current, indent);
                         }
+                        let line = current;
 
                         let mut line_content = vec![in f.arena; Document::String(line)];
                         if !line.is_empty() {
@@ -1211,7 +1428,7 @@ impl<'arena> Format<'arena> for DocumentString<'arena> {
 
                         if tabs > 0 || spaces > 0 {
                             last_part_indentation = if tabs > 0 {
-                                Cow::Owned("\t".repeat(tabs) + &" ".repeat(spaces))
+                                Cow::Owned(format!("{}{}", "\t".repeat(tabs), " ".repeat(spaces)))
                             } else {
                                 Cow::Owned(" ".repeat(spaces))
                             };
@@ -1241,7 +1458,9 @@ impl<'arena> Format<'arena> for DocumentString<'arena> {
                             DocumentIndentation::None => Cow::Borrowed(""),
                             DocumentIndentation::Whitespace(n) => Cow::Owned(" ".repeat(n)),
                             DocumentIndentation::Tab(n) => Cow::Owned("\t".repeat(n)),
-                            DocumentIndentation::Mixed(t, w) => Cow::Owned("\t".repeat(t) + &" ".repeat(w)),
+                            DocumentIndentation::Mixed(t, w) => {
+                                Cow::Owned(format!("{}{}", "\t".repeat(t), " ".repeat(w)))
+                            }
                         };
 
                         (base, last_part_indentation.clone())
@@ -1304,7 +1523,7 @@ impl<'arena> Format<'arena> for InterpolatedString<'arena> {
                             }
                             if tabs > 0 || spaces > 0 {
                                 last_part_indentation = if tabs > 0 {
-                                    Cow::Owned("\t".repeat(tabs) + &" ".repeat(spaces))
+                                    Cow::Owned(format!("{}{}", "\t".repeat(tabs), " ".repeat(spaces)))
                                 } else {
                                     Cow::Owned(" ".repeat(spaces))
                                 };
@@ -1357,7 +1576,7 @@ impl<'arena> Format<'arena> for ShellExecuteString<'arena> {
                             }
                             if tabs > 0 || spaces > 0 {
                                 last_part_indentation = if tabs > 0 {
-                                    Cow::Owned("\t".repeat(tabs) + &" ".repeat(spaces))
+                                    Cow::Owned(format!("{}{}", "\t".repeat(tabs), " ".repeat(spaces)))
                                 } else {
                                     Cow::Owned(" ".repeat(spaces))
                                 };
@@ -1565,6 +1784,10 @@ impl<'arena> Format<'arena> for StaticMethodPartialApplication<'arena> {
 impl<'arena> Format<'arena> for AnonymousClass<'arena> {
     fn format(&'arena self, f: &mut FormatterState<'_, 'arena>) -> Document<'arena> {
         wrap!(f, self, AnonymousClass, {
+            let new_doc = self.new.format(f);
+            let signature_start = self.modifiers.first().map(|m| m.span()).unwrap_or_else(|| self.class.span());
+            let inline_doc = f.collect_inline_block_comments_between(self.new.span(), signature_start);
+
             let mut signature = print_modifiers(f, &self.modifiers);
             if !signature.is_empty() {
                 signature.push(Document::space());
@@ -1593,7 +1816,7 @@ impl<'arena> Format<'arena> for AnonymousClass<'arena> {
             if let Some(attributes) = misc::print_attribute_list_sequence(f, &self.attribute_lists) {
                 Document::Group(Group::new(vec![
                     in f.arena;
-                    self.new.format(f),
+                    new_doc,
                     Document::Indent(vec![
                         in f.arena;
                         Document::Line(Line::hard()),
@@ -1604,13 +1827,13 @@ impl<'arena> Format<'arena> for AnonymousClass<'arena> {
                     ]),
                 ]))
             } else {
-                Document::Group(Group::new(vec![
-                    in f.arena;
-                    self.new.format(f),
-                    Document::space(),
-                    signature,
-                    body,
-                ]))
+                let mut parts = vec![in f.arena; new_doc, Document::space()];
+                if let Some(doc) = inline_doc {
+                    parts.push(doc);
+                }
+                parts.push(signature);
+                parts.push(body);
+                Document::Group(Group::new(parts))
             }
         })
     }

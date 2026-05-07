@@ -91,7 +91,7 @@ impl<'ast, 'arena> From<&'ast ArrayAppend<'arena>> for ArrayTarget<'ast, 'arena>
 
 pub(crate) fn get_array_target_type_given_index<'ctx>(
     context: &mut Context<'ctx, '_>,
-    block_context: &mut BlockContext<'ctx>,
+    block_context: &BlockContext<'ctx>,
     access_span: Span,
     access_array_span: Span,
     access_index_span: Option<Span>,
@@ -119,7 +119,7 @@ pub(crate) fn get_array_target_type_given_index<'ctx>(
             Issue::error(format!(
                 "Cannot use `null` as an array index to access element{}.",
                 match extended_var_id {
-                    Some(var) => "of variable ".to_string() + var.as_str(),
+                    Some(var) => format!("of variable {var}"),
                     None => String::new(),
                 }
             ))
@@ -131,21 +131,21 @@ pub(crate) fn get_array_target_type_given_index<'ctx>(
         );
     }
 
-    if !block_context.flags.inside_isset() && index_type.is_nullable() && !index_type.ignore_nullable_issues() {
+    if index_type.is_nullable() && !index_type.ignore_nullable_issues() {
         context.collector.report_with_code(
-                IssueCode::PossiblyNullArrayIndex,
-                Issue::warning(format!(
-                    "Possibly using `null` as an array index to access element{}.",
-                    match extended_var_id {
-                        Some(var) => "of variable ".to_string() + var.as_str(),
-                        None => String::new(),
-                    }
-                ))
-                .with_annotation(Annotation::primary(access_index_span).with_message("Index might be `null` here."))
-                .with_note("Using `null` as an array key is equivalent to using an empty string `''`.")
-                .with_note("The analysis indicates this index could be `null` at runtime.")
-                .with_help("Ensure the index is always an integer or a string, potentially using checks or assertions before access."),
-            );
+            IssueCode::PossiblyNullArrayIndex,
+            Issue::warning(format!(
+                "Possibly using `null` as an array index to access element{}.",
+                match extended_var_id {
+                    Some(var) => format!("of variable {var}"),
+                    None => String::new(),
+                }
+            ))
+            .with_annotation(Annotation::primary(access_index_span).with_message("Index might be `null` here."))
+            .with_note("Using `null` as an array key is equivalent to using an empty string `''`.")
+            .with_note("The analysis indicates this index could be `null` at runtime.")
+            .with_help("Ensure the index is always an integer or a string, potentially using checks or assertions before access."),
+        );
     }
 
     let mut array_atomic_types = array_like_type.types.iter().collect::<Vec<_>>();
@@ -298,6 +298,10 @@ pub(crate) fn get_array_target_type_given_index<'ctx>(
                 has_valid_expected_index = true;
             }
             TAtomic::Scalar(TScalar::Bool(bool_scalar)) if bool_scalar.is_false() => {
+                if !array_like_type.ignore_falsable_issues() && !in_assignment {
+                    value_type = Some(add_optional_union_type(get_null(), value_type.as_ref(), context.codebase));
+                }
+
                 if !block_context.flags.inside_isset()
                     && !block_context.flags.inside_unset()
                     && !array_like_type.ignore_falsable_issues()
@@ -564,7 +568,7 @@ pub(crate) fn get_array_target_type_given_index<'ctx>(
 
 pub(crate) fn handle_array_access_on_list<'ctx>(
     context: &mut Context<'ctx, '_>,
-    block_context: &mut BlockContext<'ctx>,
+    block_context: &BlockContext<'ctx>,
     span: Option<Span>,
     list: &TAtomic,
     dim_type: &TUnion,
@@ -591,7 +595,22 @@ pub(crate) fn handle_array_access_on_list<'ctx>(
         &mut union_comparison_result,
     );
 
-    if index_type_contained_by_expected {
+    // Accept a wider index type (e.g., `array<1, T>` indexed by `int`) as long as the key type
+    // is contained by the index type; the access is type-valid, even if the specific key may
+    // not be present at runtime.
+    let expected_contained_by_index = !index_type_contained_by_expected
+        && !expected_key_type.is_never()
+        && is_contained_by(
+            context.codebase,
+            &expected_key_type,
+            dim_type,
+            true,
+            false,
+            false,
+            &mut ComparisonResult::new(),
+        );
+
+    if index_type_contained_by_expected || expected_contained_by_index {
         *has_valid_expected_index = true;
     } else {
         expected_index_types.push(expected_key_type);
@@ -689,7 +708,33 @@ pub(crate) fn handle_array_access_on_list<'ctx>(
 
         let mut result = if type_param.is_never() { get_mixed() } else { type_param.into_owned() };
         if !in_assignment {
-            result.set_possibly_undefined(true, None);
+            if context.settings.strict_array_index_existence
+                && *has_valid_expected_index
+                && !block_context.flags.inside_isset()
+                && !block_context.flags.inside_unset()
+                && let Some(span) = span
+            {
+                let key_label = dim_type
+                    .get_single_literal_int_value()
+                    .map(|v| format!("`{v}`"))
+                    .unwrap_or_else(|| "the requested index".to_string());
+                context.collector.report_with_code(
+                    IssueCode::PossiblyUndefinedIntArrayIndex,
+                    Issue::warning(format!("Possibly undefined array index accessed on `{}`.", list.get_id()))
+                        .with_annotation(
+                            Annotation::primary(span).with_message(format!("{key_label} might not exist.")),
+                        )
+                        .with_note(
+                            "The list is not guaranteed to contain this index, so the access may produce `null` at runtime.",
+                        )
+                        .with_help(
+                            "Ensure the index is always present before accessing it, or use `isset()` or the null coalesce operator (`??`) to handle potential missing indices.",
+                        ),
+                );
+                result = result.as_nullable();
+            } else {
+                result.set_possibly_undefined(true, None);
+            }
         }
 
         return result;
@@ -719,19 +764,54 @@ pub(crate) fn handle_array_access_on_list<'ctx>(
 
             let is_definitely_defined = *non_empty && dim_type.get_single_literal_int_value() == Some(0);
             if !is_definitely_defined {
-                elem_type.set_possibly_undefined(true, None);
+                if context.settings.strict_array_index_existence
+                    && *has_valid_expected_index
+                    && !in_assignment
+                    && !block_context.flags.inside_isset()
+                    && !block_context.flags.inside_unset()
+                    && let Some(span) = span
+                {
+                    let key_label = dim_type
+                        .get_single_literal_int_value()
+                        .map(|v| format!("`{v}`"))
+                        .unwrap_or_else(|| "the requested index".to_string());
+                    context.collector.report_with_code(
+                        IssueCode::PossiblyUndefinedIntArrayIndex,
+                        Issue::warning(format!(
+                            "Possibly undefined array index accessed on `{}`.",
+                            list.get_id()
+                        ))
+                        .with_annotation(
+                            Annotation::primary(span)
+                                .with_message(format!("{key_label} might not exist.")),
+                        )
+                        .with_note(
+                            "The list is not guaranteed to contain this index, so the access may produce `null` at runtime.",
+                        )
+                        .with_help(
+                            "Ensure the index is always present before accessing it, or use `isset()` or the null coalesce operator (`??`) to handle potential missing indices.",
+                        ),
+                    );
+
+                    // PHP turns missing list indices into `null` at runtime; surface that
+                    // explicitly so `=== null`, `??`, and `??=` checks behave correctly.
+                    elem_type = elem_type.as_nullable();
+                } else {
+                    elem_type.set_possibly_undefined(true, None);
+                }
             }
 
             elem_type
         };
     }
+    // not a list shape; fall through to the mixed default
 
     get_mixed()
 }
 
 pub(crate) fn handle_array_access_on_keyed_array<'ctx>(
     context: &mut Context<'ctx, '_>,
-    block_context: &mut BlockContext<'ctx>,
+    block_context: &BlockContext<'ctx>,
     span: Span,
     keyed_array: &TAtomic,
     index_type: &TUnion,
@@ -750,10 +830,21 @@ pub(crate) fn handle_array_access_on_keyed_array<'ctx>(
 
     let key_parameter = if in_assignment || block_context.flags.inside_isset() {
         Cow::Owned(get_arraykey())
-    } else if let Some(parameters) = keyed_array.get_generic_parameters() {
-        Cow::Borrowed(parameters.0)
     } else {
-        Cow::Owned(get_never())
+        let mut key_union = None;
+        if let Some(known_items) = keyed_array.get_known_items()
+            && !known_items.is_empty()
+        {
+            for array_key in known_items.keys() {
+                key_union = Some(add_optional_union_type(array_key.to_union(), key_union.as_ref(), context.codebase));
+            }
+        }
+
+        if let Some(parameters) = keyed_array.get_generic_parameters() {
+            key_union = Some(add_optional_union_type(parameters.0.clone(), key_union.as_ref(), context.codebase));
+        }
+
+        Cow::Owned(key_union.unwrap_or(get_never()))
     };
 
     let mut has_value_parameter = false;
@@ -769,7 +860,26 @@ pub(crate) fn handle_array_access_on_keyed_array<'ctx>(
     let index_type_contained_by_expected =
         is_contained_by(context.codebase, index_type, &key_parameter, true, false, false, &mut union_comparison_result);
 
-    if index_type_contained_by_expected {
+    // Also accept when the expected key type is contained by the provided index type, i.e., the
+    // index is a wider superset of the possible keys (e.g., `array<1, T>` indexed by `int`).
+    // Such an access is not a type error; it may simply fail to find the key at runtime, which
+    // is a separate concern (handled via the known-items / undefined-key path below).
+    // Skip the lenient branch when the expected key type is `never` (empty array): `never` is
+    // trivially contained by anything, so allowing it would silently accept indexing an empty
+    // array like `[]` with any key.
+    let expected_contained_by_index = !index_type_contained_by_expected
+        && !key_parameter.is_never()
+        && is_contained_by(
+            context.codebase,
+            &key_parameter,
+            index_type,
+            true,
+            false,
+            false,
+            &mut ComparisonResult::new(),
+        );
+
+    if index_type_contained_by_expected || expected_contained_by_index {
         *has_valid_expected_index = true;
     } else {
         expected_index_types.push(key_parameter.clone().into_owned());
@@ -818,6 +928,33 @@ pub(crate) fn handle_array_access_on_keyed_array<'ctx>(
 
                         expression_type = expression_type.as_nullable();
                     }
+                } else if array_like_type.types.len() > 1 {
+                    let sibling_list_may_lack_key = array_like_type.types.iter().any(|atomic_type| {
+                        if let TAtomic::Array(TArray::List(other_list)) = atomic_type
+                            && let ArrayKey::Integer(k) = &array_key
+                            && *k >= 0
+                        {
+                            let idx = *k as usize;
+                            let known_has_required = other_list
+                                .known_elements
+                                .as_ref()
+                                .and_then(|elems| elems.get(&idx))
+                                .is_some_and(|(optional, _)| !*optional);
+                            let is_index_zero_on_non_empty = idx == 0 && other_list.non_empty;
+
+                            !(known_has_required || is_index_zero_on_non_empty)
+                        } else {
+                            false
+                        }
+                    });
+
+                    if sibling_list_may_lack_key {
+                        *has_possibly_undefined = true;
+                        *key_in_other_variant = true;
+                        expression_type.set_possibly_undefined(true, None);
+                    }
+                } else {
+                    // single-variant array with the key required and non-optional; no extra adjustment needed
                 }
 
                 return expression_type;
@@ -845,8 +982,8 @@ pub(crate) fn handle_array_access_on_keyed_array<'ctx>(
                 let key_may_exist_in_generic_params = has_value_parameter;
                 // Check if we're in a union type and if ANY other member has this key
                 let key_exists_in_other_variant = key_may_exist_in_generic_params || {
-                    array_like_type.types.iter().any(|atomic_type| {
-                        if let TAtomic::Array(TArray::Keyed(other_keyed)) = atomic_type {
+                    array_like_type.types.iter().any(|atomic_type| match atomic_type {
+                        TAtomic::Array(TArray::Keyed(other_keyed)) => {
                             if other_keyed.get_generic_parameters().is_some() {
                                 true
                             } else if let Some(other_known_items) = other_keyed.get_known_items() {
@@ -854,9 +991,21 @@ pub(crate) fn handle_array_access_on_keyed_array<'ctx>(
                             } else {
                                 false
                             }
-                        } else {
-                            false
                         }
+                        TAtomic::Array(TArray::List(other_list)) => {
+                            if let ArrayKey::Integer(k) = &array_key {
+                                if !other_list.element_type.is_never() {
+                                    true
+                                } else if let Some(elems) = other_list.known_elements.as_ref() {
+                                    *k >= 0 && elems.contains_key(&(*k as usize))
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        }
+                        _ => false,
                     })
                 };
 
@@ -870,8 +1019,13 @@ pub(crate) fn handle_array_access_on_keyed_array<'ctx>(
                     if !in_assignment && !*reported_undefined_key {
                         *reported_undefined_key = true;
 
+                        let (issue_code, key_kind) = match &array_key {
+                            ArrayKey::Integer(_) => (IssueCode::UndefinedIntArrayIndex, "integer"),
+                            _ => (IssueCode::UndefinedStringArrayIndex, "string"),
+                        };
+
                         context.collector.report_with_code(
-                            IssueCode::UndefinedStringArrayIndex,
+                            issue_code,
                             Issue::error(format!(
                                 "Undefined array key {} accessed on `{}`.",
                                 array_key,
@@ -881,9 +1035,9 @@ pub(crate) fn handle_array_access_on_keyed_array<'ctx>(
                                 Annotation::primary(span)
                                     .with_message(format!("Key {array_key} does not exist."))
                             )
-                            .with_note(
-                                "Attempting to access a non-existent string key will raise a warning/notice at runtime."
-                            )
+                            .with_note(format!(
+                                "Attempting to access a non-existent {key_kind} key will raise a warning/notice at runtime."
+                            ))
                             .with_help(
                                 format!(
                                     "Ensure the key {array_key} exists before accessing it, or use `isset()` or the null coalesce operator (`??`) to handle potential missing keys."
@@ -1004,6 +1158,46 @@ pub(crate) fn handle_array_access_on_keyed_array<'ctx>(
 
         *has_possibly_undefined = true;
 
+        if context.settings.strict_array_index_existence
+            && !in_assignment
+            && !block_context.flags.inside_isset()
+            && !block_context.flags.inside_unset()
+        {
+            let index_type_str = index_type.get_id();
+            let code = match index_type.get_single_array_key() {
+                Some(ArrayKey::Integer(_)) => IssueCode::PossiblyUndefinedIntArrayIndex,
+                Some(ArrayKey::String(_)) => IssueCode::PossiblyUndefinedStringArrayIndex,
+                Some(ArrayKey::ClassLikeConstant { .. }) => IssueCode::PossiblyUndefinedArrayIndex,
+                None => {
+                    if index_type.types.iter().any(|t| matches!(t, TAtomic::Scalar(TScalar::String(_)))) {
+                        IssueCode::PossiblyUndefinedStringArrayIndex
+                    } else {
+                        IssueCode::PossiblyUndefinedIntArrayIndex
+                    }
+                }
+            };
+
+            context.collector.report_with_code(
+                code,
+                Issue::warning(format!(
+                    "Possibly undefined array key `{index_type_str}` accessed on `{}`.",
+                    keyed_array.get_id()
+                ))
+                .with_annotation(
+                    Annotation::primary(span)
+                        .with_message(format!("Key `{index_type_str}` might not exist.")),
+                )
+                .with_note(
+                    "The analysis indicates this specific key might not be set when this access occurs.",
+                )
+                .with_help(format!(
+                    "Ensure the key {index_type_str} is always set before accessing it, or use `isset()` or the null coalesce operator (`??`) to handle potential missing keys."
+                )),
+            );
+
+            return value_parameter.into_owned().as_nullable();
+        }
+
         value_parameter.into_owned()
     } else {
         // TODO Handle Assignments
@@ -1030,37 +1224,51 @@ pub(crate) fn handle_array_access_on_keyed_array<'ctx>(
             if !in_assignment && !key_is_definitely_defined {
                 *has_possibly_undefined = true;
 
-                if !context.settings.allow_possibly_undefined_array_keys
-                    && !block_context.flags.inside_isset()
-                    && !block_context.flags.inside_unset()
-                    && let Some(single_array_key) = index_type.get_single_array_key()
-                {
-                    let index_type_str = index_type.get_id();
-                    let code = match single_array_key {
-                        ArrayKey::Integer(_) => IssueCode::PossiblyUndefinedIntArrayIndex,
-                        ArrayKey::String(_) => IssueCode::PossiblyUndefinedStringArrayIndex,
-                        ArrayKey::ClassLikeConstant { .. } => IssueCode::PossiblyUndefinedArrayIndex,
-                    };
+                let inside_isset_or_unset = block_context.flags.inside_isset() || block_context.flags.inside_unset();
+                let lax_warn = !context.settings.allow_possibly_undefined_array_keys;
+                let strict = context.settings.strict_array_index_existence;
 
-                    context.collector.report_with_code(
-                        code,
-                        Issue::warning(format!(
-                            "Possibly undefined array key `{index_type_str}` accessed on `{}`.",
-                            keyed_array.get_id()
-                        ))
-                        .with_annotation(
-                            Annotation::primary(span)
-                                .with_message(format!("Key `{index_type_str}` might not exist."))
-                        )
-                        .with_note(
-                            "The analysis indicates this specific key might not be set when this access occurs."
-                        )
-                        .with_help(
-                            format!(
-                                "Ensure the key {index_type_str} is always set before accessing it, or use `isset()` or the null coalesce operator (`??`) to handle potential missing keys."
+                if !inside_isset_or_unset && (lax_warn || strict) {
+                    let single_key = index_type.get_single_array_key();
+                    if strict || single_key.is_some() {
+                        let index_type_str = index_type.get_id();
+                        let code = match &single_key {
+                            Some(ArrayKey::Integer(_)) => IssueCode::PossiblyUndefinedIntArrayIndex,
+                            Some(ArrayKey::String(_)) => IssueCode::PossiblyUndefinedStringArrayIndex,
+                            Some(ArrayKey::ClassLikeConstant { .. }) => IssueCode::PossiblyUndefinedArrayIndex,
+                            None => {
+                                if index_type.types.iter().any(|t| matches!(t, TAtomic::Scalar(TScalar::String(_)))) {
+                                    IssueCode::PossiblyUndefinedStringArrayIndex
+                                } else {
+                                    IssueCode::PossiblyUndefinedIntArrayIndex
+                                }
+                            }
+                        };
+
+                        context.collector.report_with_code(
+                            code,
+                            Issue::warning(format!(
+                                "Possibly undefined array key `{index_type_str}` accessed on `{}`.",
+                                keyed_array.get_id()
+                            ))
+                            .with_annotation(
+                                Annotation::primary(span)
+                                    .with_message(format!("Key `{index_type_str}` might not exist."))
                             )
-                        ),
-                    );
+                            .with_note(
+                                "The analysis indicates this specific key might not be set when this access occurs."
+                            )
+                            .with_help(
+                                format!(
+                                    "Ensure the key {index_type_str} is always set before accessing it, or use `isset()` or the null coalesce operator (`??`) to handle potential missing keys."
+                                )
+                            ),
+                        );
+                    }
+                }
+
+                if strict && !inside_isset_or_unset {
+                    return value_parameter.into_owned().as_nullable();
                 }
             }
 
@@ -1244,7 +1452,7 @@ pub(crate) fn handle_array_access_on_named_object(
 }
 
 pub(crate) fn handle_array_access_on_string(
-    context: &mut Context<'_, '_>,
+    context: &Context<'_, '_>,
     string: TAtomic,
     index_type: &TUnion,
     has_valid_expected_index: &mut bool,
@@ -1292,13 +1500,13 @@ pub(crate) fn handle_array_access_on_string(
 
 pub(crate) fn handle_array_access_on_mixed<'ctx>(
     context: &mut Context<'ctx, '_>,
-    block_context: &mut BlockContext<'ctx>,
+    block_context: &BlockContext<'ctx>,
     span: Span,
     mixed: &TAtomic,
 ) -> TUnion {
     if !block_context.flags.inside_isset() {
         if block_context.flags.inside_assignment() {
-            if let TAtomic::Never = mixed {
+            if matches!(mixed, TAtomic::Never) {
                 context.collector.report_with_code(
                     IssueCode::ImpossibleArrayAssignment,
                     Issue::error(
@@ -1345,7 +1553,7 @@ pub(crate) fn handle_array_access_on_mixed<'ctx>(
         }
     }
 
-    if let TAtomic::Never = mixed {
+    if matches!(mixed, TAtomic::Never) {
         return get_mixed_maybe_from_loop(true);
     }
 

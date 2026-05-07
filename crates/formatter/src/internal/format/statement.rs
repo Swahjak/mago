@@ -173,7 +173,9 @@ fn print_statement_slice<'ctx, 'arena>(
             if let Some(line_start_offset) = f.file.get_line_start_offset(line) {
                 let c = &f.source_text[line_start_offset as usize..offset as usize];
                 let ws = c.chars().take_while(|c| c.is_whitespace()).collect::<String>();
-                if !ws.is_empty() {
+                let should_apply_align =
+                    !ws.is_empty() && (matches!(stmt, Statement::OpeningTag(_)) || c.len() == ws.len());
+                if should_apply_align {
                     if matches!(stmt, Statement::OpeningTag(_)) {
                         let mut j = i + 1;
                         let mut stmts_to_format = vec![in f.arena];
@@ -409,7 +411,7 @@ fn should_add_new_line_or_space_after_stmt<'arena>(
 /// is not counted since the formatter removes it. If any other closing tags exist,
 /// the file is an inline PHP template.
 #[inline]
-#[allow(clippy::if_same_then_else)]
+#[allow(clippy::if_same_then_else, clippy::bool_to_int_with_if)]
 fn is_inline_php_template(stmts: &[&Statement<'_>]) -> bool {
     let trailing_close_tag_count = match stmts.len() {
         0 => 0,
@@ -437,7 +439,7 @@ fn is_inline_php_template(stmts: &[&Statement<'_>]) -> bool {
 fn count_closing_tags(stmts: &[&Statement<'_>]) -> usize {
     struct Counter(usize);
 
-    impl<'ast, 'arena> MutWalker<'ast, 'arena, ()> for Counter {
+    impl<'ast> MutWalker<'ast, '_, ()> for Counter {
         fn walk_in_closing_tag(&mut self, _: &'ast ClosingTag, _: &mut ()) {
             self.0 += 1;
         }

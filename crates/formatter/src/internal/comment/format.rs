@@ -4,6 +4,7 @@ use bumpalo::vec;
 use mago_span::HasSpan;
 use mago_span::Span;
 use mago_syntax::ast::Node;
+use mago_syntax::ast::Statement;
 use mago_syntax::ast::Trivia;
 
 use crate::document::BreakMode;
@@ -151,6 +152,23 @@ impl<'arena> FormatterState<'_, 'arena> {
         false
     }
 
+    /// Returns true if any line comment (not block comment) lies strictly inside the span.
+    #[must_use]
+    #[inline]
+    pub fn has_inner_line_comment_in_range(&self, start: u32, end: u32) -> bool {
+        for comment in self.remaining_comments() {
+            if comment.start > end {
+                break;
+            }
+
+            if comment.start >= start && comment.end <= end && !comment.is_block {
+                return true;
+            }
+        }
+
+        false
+    }
+
     #[must_use]
     pub(crate) fn print_trailing_comments_for_node(&mut self, node: Node<'_, '_>) -> Option<Document<'arena>> {
         self.print_trailing_comments(node.span())
@@ -158,6 +176,30 @@ impl<'arena> FormatterState<'_, 'arena> {
 
     #[must_use]
     pub(crate) fn print_leading_comments(&mut self, range: Span) -> Option<Document<'arena>> {
+        self.print_leading_comments_with(range, false)
+    }
+
+    /// Like [`print_leading_comments`] but forces a hard line break after any
+    /// multi-line block comment (i.e. a docblock). Use this at declaration call
+    /// sites — function-like, class-like, property, constant — so docblocks
+    /// always end up on their own line, regardless of how the user wrote them.
+    pub(crate) fn print_leading_comments_for_declaration(&mut self, range: Span) -> Option<Document<'arena>> {
+        self.print_leading_comments_with(range, true)
+    }
+
+    /// Print leading comments for a node, picking the declaration-aware variant
+    /// when the node is a declaration so that attached docblocks always end up
+    /// on their own line. Other node kinds preserve the user's spacing as-is.
+    #[must_use]
+    pub(crate) fn print_leading_comments_for_node(&mut self, node: Node<'_, '_>) -> Option<Document<'arena>> {
+        if is_declaration_node(node) {
+            self.print_leading_comments_for_declaration(node.span())
+        } else {
+            self.print_leading_comments(node.span())
+        }
+    }
+
+    fn print_leading_comments_with(&mut self, range: Span, force_docblock_break: bool) -> Option<Document<'arena>> {
         let mut parts = vec![in self.arena];
 
         while let Some(trivia) = self.all_comments.get(self.next_comment_index) {
@@ -179,8 +221,9 @@ impl<'arena> FormatterState<'_, 'arena> {
                 if self.get_ignore_region_for(comment.start).is_some() {
                     self.print_preserved_leading_comment(&mut parts, comment);
                 } else {
-                    self.print_leading_comment(&mut parts, comment);
+                    self.print_leading_comment(&mut parts, comment, force_docblock_break);
                 }
+
                 self.placed_comments.mark_consumed(self.next_comment_index);
                 self.next_comment_index += 1;
             } else {
@@ -215,8 +258,14 @@ impl<'arena> FormatterState<'_, 'arena> {
                     self.print_preserved_trailing_comment(&mut parts, comment);
                     previous_comment = Some(comment);
                 } else {
-                    previous_comment =
-                        Some(self.print_trailing_comment(&mut parts, comment, previous_comment, range.end_offset()));
+                    let is_placed_trailing = self.placed_comments.is_placed_trailing(self.next_comment_index);
+                    previous_comment = Some(self.print_trailing_comment(
+                        &mut parts,
+                        comment,
+                        previous_comment,
+                        range.end_offset(),
+                        is_placed_trailing,
+                    ));
                 }
                 self.placed_comments.mark_consumed(self.next_comment_index);
                 self.next_comment_index += 1;
@@ -228,7 +277,12 @@ impl<'arena> FormatterState<'_, 'arena> {
         if parts.is_empty() { None } else { Some(Document::Array(parts)) }
     }
 
-    fn print_leading_comment(&mut self, parts: &mut Vec<'arena, Document<'arena>>, comment: Comment) {
+    fn print_leading_comment(
+        &mut self,
+        parts: &mut Vec<'arena, Document<'arena>>,
+        comment: Comment,
+        force_docblock_break: bool,
+    ) {
         let comment_document = if comment.is_block {
             if self.has_newline(comment.end, /* backwards */ false) {
                 if self.has_newline(comment.start, /* backwards */ true) {
@@ -241,6 +295,13 @@ impl<'arena> FormatterState<'_, 'arena> {
                 } else {
                     Document::Array(vec![in self.arena; self.print_comment(comment), Document::Line(Line::default())])
                 }
+            } else if force_docblock_break && !comment.is_single_line {
+                Document::Array(vec![
+                    in self.arena;
+                    self.print_comment(comment),
+                    Document::BreakParent,
+                    Document::Line(Line::hard()),
+                ])
             } else {
                 Document::Array(vec![in self.arena; self.print_comment(comment), Document::Space(Space::soft())])
             }
@@ -275,6 +336,7 @@ impl<'arena> FormatterState<'_, 'arena> {
         comment: Comment,
         previous: Option<Comment>,
         token_end_offset: u32,
+        is_placed_trailing: bool,
     ) -> Comment {
         let printed = self.print_comment(comment);
 
@@ -299,7 +361,7 @@ impl<'arena> FormatterState<'_, 'arena> {
 
         if !comment.is_block || previous.is_some_and(|c| c.has_line_suffix) {
             parts.push(Document::LineSuffix(vec![in self.arena; Document::Space(Space::soft()), printed]));
-
+            let _ = is_placed_trailing;
             return comment.with_line_suffix(true);
         }
 
@@ -575,8 +637,14 @@ impl<'arena> FormatterState<'_, 'arena> {
                 after.end_offset() == comment.start || self.is_insignificant(after.end_offset(), comment.start);
 
             if is_between && gap_is_ok {
-                previous_comment =
-                    Some(self.print_trailing_comment(&mut parts, comment, previous_comment, after.end_offset()));
+                let is_placed_trailing = self.placed_comments.is_placed_trailing(self.next_comment_index);
+                previous_comment = Some(self.print_trailing_comment(
+                    &mut parts,
+                    comment,
+                    previous_comment,
+                    after.end_offset(),
+                    is_placed_trailing,
+                ));
                 self.placed_comments.mark_consumed(self.next_comment_index);
                 self.next_comment_index += 1;
             } else {
@@ -585,6 +653,76 @@ impl<'arena> FormatterState<'_, 'arena> {
         }
 
         if parts.is_empty() { None } else { Some(Document::Array(parts)) }
+    }
+
+    /// Collect inline block comments between two spans. Returns `None` if no comments
+    /// are present OR if any comment is not a block comment (line comments force a break).
+    #[must_use]
+    pub(crate) fn collect_inline_block_comments_between(
+        &mut self,
+        after: Span,
+        before: Span,
+    ) -> Option<Document<'arena>> {
+        let mut collected: std::vec::Vec<usize> = std::vec::Vec::new();
+
+        let is_ws = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r');
+        let mut gap_end = after.end_offset() as usize;
+
+        for (offset, trivia) in self.all_comments[self.next_comment_index..].iter().enumerate() {
+            let index = self.next_comment_index + offset;
+            let comment = Comment::from_trivia(self.file, trivia);
+
+            if comment.start < after.end_offset() {
+                continue;
+            }
+
+            if comment.end > before.start_offset() {
+                break;
+            }
+
+            let pre_gap = &self.source_text[gap_end..(comment.start as usize)];
+            if !pre_gap.bytes().all(is_ws) {
+                return None;
+            }
+
+            if self.placed_comments.is_consumed(index) {
+                gap_end = comment.end as usize;
+                continue;
+            }
+
+            if !comment.is_block {
+                return None;
+            }
+
+            collected.push(index);
+            gap_end = comment.end as usize;
+        }
+
+        let tail = &self.source_text[gap_end..(before.start_offset() as usize)];
+        if !tail.bytes().all(is_ws) {
+            return None;
+        }
+
+        if collected.is_empty() {
+            return None;
+        }
+
+        let mut parts = vec![in self.arena];
+        for index in &collected {
+            self.placed_comments.mark_consumed(*index);
+            let trivia = &self.all_comments[*index];
+            let comment = Comment::from_trivia(self.file, trivia);
+            parts.push(self.print_comment(comment));
+            parts.push(Document::Space(Space::soft()));
+        }
+
+        if let Some(last) = collected.last().copied()
+            && self.next_comment_index <= last
+        {
+            self.next_comment_index = last + 1;
+        }
+
+        Some(Document::Array(parts))
     }
 
     #[must_use]
@@ -659,6 +797,7 @@ impl<'arena> FormatterState<'_, 'arena> {
                 let mut buf = Vec::with_capacity_in(trimmed_line.len() + 1, self.arena);
                 buf.push(b' ');
                 buf.extend_from_slice(trimmed_line.trim_end().as_bytes());
+                // SAFETY: ASCII byte plus bytes from a valid UTF-8 `&str` is valid UTF-8.
                 unsafe { std::str::from_utf8_unchecked(buf.into_bump_slice()) }
             } else if trimmed_line.is_empty() {
                 " *"
@@ -666,11 +805,13 @@ impl<'arena> FormatterState<'_, 'arena> {
                 let mut buf = Vec::with_capacity_in(trimmed_line.len() + 1, self.arena);
                 buf.push(b' ');
                 buf.extend_from_slice(trimmed_line.trim_end().as_bytes());
+                // SAFETY: ASCII byte plus bytes from a valid UTF-8 `&str` is valid UTF-8.
                 unsafe { std::str::from_utf8_unchecked(buf.into_bump_slice()) }
             } else {
                 let mut buf = Vec::with_capacity_in(trimmed_line.len() + 3, self.arena);
                 buf.extend_from_slice(b" * ");
                 buf.extend_from_slice(trimmed_line.trim_end().as_bytes());
+                // SAFETY: ASCII bytes plus bytes from a valid UTF-8 `&str` is valid UTF-8.
                 unsafe { std::str::from_utf8_unchecked(buf.into_bump_slice()) }
             };
 
@@ -801,4 +942,48 @@ impl<'arena> FormatterState<'_, 'arena> {
             None => document,
         }
     }
+}
+
+/// Returns `true` for AST nodes that represent declarations whose attached
+/// docblocks should always live on their own line. Listed conservatively:
+/// expression-shaped wrappers around declarations (closures, anonymous
+/// classes) are deliberately excluded because they appear in expression
+/// contexts where forcing a line break would split arguments or operands.
+///
+/// `Statement` and `ClassLikeMember` are the wrapper enums that actually
+/// consume leading comments via `wrap!` at the top level and inside class
+/// bodies respectively, so we look through them to their declaration variants.
+#[inline]
+const fn is_declaration_node(node: Node<'_, '_>) -> bool {
+    if let Node::Statement(stmt) = node {
+        return matches!(
+            stmt,
+            Statement::Class(_)
+                | Statement::Interface(_)
+                | Statement::Trait(_)
+                | Statement::Enum(_)
+                | Statement::Function(_)
+                | Statement::Constant(_)
+        );
+    }
+
+    if let Node::ClassLikeMember(_) = node {
+        return true;
+    }
+
+    matches!(
+        node,
+        Node::Function(_)
+            | Node::Method(_)
+            | Node::Class(_)
+            | Node::Interface(_)
+            | Node::Trait(_)
+            | Node::Enum(_)
+            | Node::Property(_)
+            | Node::PlainProperty(_)
+            | Node::HookedProperty(_)
+            | Node::ClassLikeConstant(_)
+            | Node::Constant(_)
+            | Node::EnumCase(_)
+    )
 }

@@ -1,12 +1,12 @@
 use std::rc::Rc;
 
 use foldhash::HashSet;
-use mago_atom::AtomMap;
 
 use mago_algebra::find_satisfying_assignments;
 use mago_algebra::saturate_clauses;
 use mago_atom::AtomSet;
 use mago_codex::ttype::combine_union_types;
+use mago_codex::ttype::combine_union_types_rc;
 use mago_codex::ttype::get_bool;
 use mago_codex::ttype::get_false;
 use mago_codex::ttype::get_mixed;
@@ -45,8 +45,10 @@ pub fn analyze_logical_and_operation<'ctx, 'arena>(
     let mut left_block_context = block_context.clone();
     let pre_referenced_var_ids = left_block_context.conditionally_referenced_variable_ids.clone();
     let pre_assigned_var_ids = left_block_context.assigned_variable_ids.clone();
+    let pre_conflicting_clause_vars = left_block_context.parent_conflicting_clause_variables.clone();
     left_block_context.conditionally_referenced_variable_ids.clear();
     left_block_context.assigned_variable_ids.clear();
+    left_block_context.parent_conflicting_clause_variables.clear();
     left_block_context.reconciled_expression_clauses = Vec::new();
 
     let left_was_inside_general_use = left_block_context.flags.inside_general_use();
@@ -78,7 +80,7 @@ pub fn analyze_logical_and_operation<'ctx, 'arena>(
 
     for (var_id, var_type) in &left_block_context.locals {
         if left_block_context.assigned_variable_ids.contains_key(var_id) {
-            block_context.locals.insert(*var_id, var_type.clone());
+            block_context.locals.insert(*var_id, Rc::clone(var_type));
         }
     }
 
@@ -101,11 +103,15 @@ pub fn analyze_logical_and_operation<'ctx, 'arena>(
     }
 
     let simplified_clauses = saturate_clauses(context_clauses, &context.settings.algebra_thresholds());
-    let (left_assertions, active_left_assertions) = find_satisfying_assignments(
+    let (mut left_assertions, active_left_assertions) = find_satisfying_assignments(
         simplified_clauses.as_slice(),
         Some(binary.lhs.span()),
         &mut left_referenced_var_ids,
     );
+
+    if !left_block_context.parent_conflicting_clause_variables.is_empty() {
+        left_assertions.retain(|var_id, _| !left_block_context.parent_conflicting_clause_variables.contains(var_id));
+    }
 
     let mut changed_var_ids = AtomSet::default();
     let mut right_block_context;
@@ -207,10 +213,22 @@ pub fn analyze_logical_and_operation<'ctx, 'arena>(
         .conditionally_referenced_variable_ids
         .extend(right_block_context.conditionally_referenced_variable_ids);
 
+    let left_assigned_var_ids = left_block_context.assigned_variable_ids.clone();
+    let right_assigned_var_ids = right_block_context.assigned_variable_ids.clone();
     if block_context.flags.inside_conditional() {
         block_context.assigned_variable_ids = left_block_context.assigned_variable_ids;
         block_context.assigned_variable_ids.extend(right_block_context.assigned_variable_ids);
     }
+
+    // Propagate clause invalidations from both sides, plus restore pre-existing
+    // ones, so parent expressions know which variables had their narrowing voided.
+    block_context.parent_conflicting_clause_variables.extend(pre_conflicting_clause_vars);
+    block_context
+        .parent_conflicting_clause_variables
+        .extend(left_block_context.parent_conflicting_clause_variables.iter().copied());
+    block_context
+        .parent_conflicting_clause_variables
+        .extend(right_block_context.parent_conflicting_clause_variables.iter().copied());
 
     if let Some(if_body_context) = &block_context.if_body_context {
         let mut if_body_context_inner = if_body_context.borrow_mut();
@@ -220,7 +238,7 @@ pub fn analyze_logical_and_operation<'ctx, 'arena>(
         } else {
             block_context.locals = right_block_context.locals;
 
-            if_body_context_inner.locals.extend(block_context.locals.iter().map(|(k, v)| (*k, v.clone())));
+            if_body_context_inner.locals.extend(block_context.locals.iter().map(|(k, v)| (*k, Rc::clone(v))));
             if_body_context_inner
                 .conditionally_referenced_variable_ids
                 .extend(block_context.conditionally_referenced_variable_ids.iter().copied());
@@ -230,7 +248,17 @@ pub fn analyze_logical_and_operation<'ctx, 'arena>(
             if_body_context_inner.reconciled_expression_clauses.extend(partitioned_clauses.1);
         }
     } else {
-        block_context.locals = left_block_context.locals;
+        let left_locals = left_block_context.locals;
+        for (var_id, var_type) in &right_block_context.locals {
+            if right_assigned_var_ids.contains_key(var_id)
+                && !left_assigned_var_ids.contains_key(var_id)
+                && !left_locals.contains_key(var_id)
+            {
+                block_context.locals.insert(*var_id, Rc::clone(var_type));
+            }
+        }
+
+        block_context.locals.extend(left_locals);
     }
 
     Ok(())
@@ -249,12 +277,12 @@ pub fn analyze_logical_or_operation<'ctx, 'arena>(
 
     if is_logical_or_operation(binary.lhs, 3) {
         let pre_referenced_var_ids = block_context.conditionally_referenced_variable_ids.clone();
-        block_context.conditionally_referenced_variable_ids = AtomSet::default();
+        block_context.conditionally_referenced_variable_ids.clear();
 
         let pre_assigned_var_ids = block_context.assigned_variable_ids.clone();
 
         left_block_context = block_context.clone();
-        left_block_context.assigned_variable_ids = AtomMap::default();
+        left_block_context.assigned_variable_ids.clear();
 
         let tmp_if_body_block_context = left_block_context.if_body_context;
         left_block_context.if_body_context = None;
@@ -280,7 +308,9 @@ pub fn analyze_logical_or_operation<'ctx, 'arena>(
                     )),
                 );
             } else if left_block_context.assigned_variable_ids.contains_key(var_id) {
-                block_context.locals.insert(*var_id, left_type.clone());
+                block_context.locals.insert(*var_id, Rc::clone(left_type));
+            } else {
+                // variable wasn't assigned in the left branch and isn't in the parent; drop it
             }
         }
 
@@ -392,10 +422,10 @@ pub fn analyze_logical_or_operation<'ctx, 'arena>(
         }
 
         let pre_referenced_var_ids = right_block_context.conditionally_referenced_variable_ids.clone();
-        right_block_context.conditionally_referenced_variable_ids = AtomSet::default();
+        right_block_context.conditionally_referenced_variable_ids.clear();
 
         let pre_assigned_var_ids = right_block_context.assigned_variable_ids.clone();
-        right_block_context.assigned_variable_ids = AtomMap::default();
+        right_block_context.assigned_variable_ids.clear();
 
         let tmp_if_body_context = right_block_context.if_body_context;
         right_block_context.if_body_context = None;
@@ -520,23 +550,20 @@ pub fn analyze_logical_or_operation<'ctx, 'arena>(
             if let Some(if_type) = if_vars.get(&var_id) {
                 if_body_context_inner.locals.insert(
                     var_id,
-                    Rc::new(combine_union_types(
-                        &right_type,
-                        if_type,
-                        context.codebase,
-                        context.settings.combiner_options(),
-                    )),
+                    combine_union_types_rc(&right_type, if_type, context.codebase, context.settings.combiner_options()),
                 );
             } else if let Some(left_type) = left_vars.get(&var_id) {
                 if_body_context_inner.locals.insert(
                     var_id,
-                    Rc::new(combine_union_types(
+                    combine_union_types_rc(
                         &right_type,
                         left_type,
                         context.codebase,
                         context.settings.combiner_options(),
-                    )),
+                    ),
                 );
+            } else {
+                // variable doesn't appear in the if body or left branch; nothing to merge in
             }
         }
 
@@ -642,15 +669,17 @@ fn check_logical_operand<'arena>(
             .with_help("Explicitly check for `null` or cast to `bool` if this coercion is not intended."),
         );
     } else if operand_type.is_array() {
-        context.collector.report_with_code(
-            IssueCode::InvalidOperand,
-            Issue::warning(format!("{side} operand in `{operator_name}` operation is an `array`."))
-                .with_annotation(Annotation::primary(operand.span()).with_message("This is an `array`"))
-                .with_note(
-                    "Arrays coerce to `false` if empty, `true` if non-empty. This implicit conversion can be unclear.",
-                )
-                .with_help("Consider using `empty()` or `count()` for explicit checks, or cast to `bool`."),
-        );
+        if !context.settings.allow_array_truthy_operand {
+            context.collector.report_with_code(
+                IssueCode::InvalidOperand,
+                Issue::warning(format!("{side} operand in `{operator_name}` operation is an `array`."))
+                    .with_annotation(Annotation::primary(operand.span()).with_message("This is an `array`"))
+                    .with_note(
+                        "Arrays coerce to `false` if empty, `true` if non-empty. This implicit conversion can be unclear.",
+                    )
+                    .with_help("Consider using `empty()` or `count()` for explicit checks, or cast to `bool`."),
+            );
+        }
     } else if operand_type.is_objecty() {
         context.collector.report_with_code(
             IssueCode::InvalidOperand,
@@ -669,6 +698,8 @@ fn check_logical_operand<'arena>(
                 .with_note("Resources generally coerce to `true`. This implicit conversion can be unclear.")
                 .with_help("Explicitly check the state of the resource or cast to `bool` if necessary."),
         );
+    } else {
+        // operand has a clean boolean coercion; no diagnostic needed
     }
 }
 

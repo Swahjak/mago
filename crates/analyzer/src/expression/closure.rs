@@ -135,7 +135,7 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Closure<'arena> {
                     inner_block_context.references_to_external_scope.insert(variable_atom);
                 }
 
-                inner_block_context.locals.insert(variable_atom, variable_type.clone());
+                inner_block_context.locals.insert(variable_atom, Rc::clone(&variable_type));
                 inner_block_context.variables_possibly_in_scope.insert(variable_atom);
 
                 for (variable_id, variable_type) in &block_context.locals {
@@ -144,31 +144,32 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Closure<'arena> {
                     };
 
                     if stripped_variable_id.starts_with('[') || stripped_variable_id.starts_with('-') {
-                        inner_block_context.locals.insert(*variable_id, variable_type.clone());
+                        inner_block_context.locals.insert(*variable_id, Rc::clone(variable_type));
                         inner_block_context.variables_possibly_in_scope.insert(*variable_id);
                     }
                 }
             }
         }
 
-        // Check for missing type hints
-        for parameter in &self.parameter_list.parameters {
-            crate::utils::missing_type_hints::check_parameter_type_hint(
+        if !context.settings.allow_implicit_pipe_callable_types || !block_context.flags.inside_pipe_callable() {
+            for parameter in &self.parameter_list.parameters {
+                crate::utils::missing_type_hints::check_parameter_type_hint(
+                    context,
+                    block_context.scope.get_class_like(),
+                    function_metadata,
+                    parameter,
+                );
+            }
+
+            crate::utils::missing_type_hints::check_return_type_hint(
                 context,
                 block_context.scope.get_class_like(),
                 function_metadata,
-                parameter,
+                "closure",
+                self.return_type_hint.as_ref(),
+                self.span(),
             );
         }
-
-        crate::utils::missing_type_hints::check_return_type_hint(
-            context,
-            block_context.scope.get_class_like(),
-            function_metadata,
-            "closure",
-            self.return_type_hint.as_ref(),
-            self.span(),
-        );
 
         // Check for imprecise type hints (bare `array` or `iterable`)
         for (i, parameter) in self.parameter_list.parameters.iter().enumerate() {
@@ -270,6 +271,8 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Closure<'arena> {
                 } else {
                     signature.return_type = Some(Arc::new(get_void()));
                 }
+            } else {
+                // generator-yielding closure; return type already set above
             }
         }
 
@@ -299,7 +302,7 @@ mod tests {
 
     test_analysis! {
         name = inferred_closure_return_type,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /**
@@ -317,7 +320,7 @@ mod tests {
 
     test_analysis! {
         name = closure_use,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /**
@@ -383,7 +386,7 @@ mod tests {
 
     test_analysis! {
         name = get_current_closure,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             class Closure {
@@ -410,7 +413,7 @@ mod tests {
 
     test_analysis! {
         name = get_current_closure_inside_function,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             class Closure {
@@ -441,7 +444,7 @@ mod tests {
 
     test_analysis! {
         name = get_current_closure_inside_method,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             class Closure {
@@ -474,7 +477,7 @@ mod tests {
 
     test_analysis! {
         name = get_current_closure_in_global_scope,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             class Closure {
@@ -494,7 +497,7 @@ mod tests {
 
     test_analysis! {
         name = undefined_reference_capture,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             $fn = function () use (&$value) { $value = 1; };
@@ -505,7 +508,7 @@ mod tests {
 
     test_analysis! {
         name = undefined_value_capture,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             $fn = function () use ($value) { $value = 1; };

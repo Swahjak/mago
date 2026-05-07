@@ -6,6 +6,16 @@ use mago_php_version::PHPVersion;
 /// Default maximum logical formula size during conditional analysis.
 pub const DEFAULT_FORMULA_SIZE_THRESHOLD: u16 = 512;
 
+/// Default cap on the loop assignment-graph depth that the analyzer will
+/// explore when running fixed-point iteration over loop bodies.
+///
+/// The default of `1` means each loop body is re-analyzed at most once after
+/// the initial pass, which is sufficient to stabilise the vast majority of
+/// real-world code and keeps per-file cost bounded. Projects that care about
+/// maximally precise narrowing of long loop-carried dependency chains can
+/// raise this in their config at the cost of analysis time.
+pub const DEFAULT_LOOP_ASSIGNMENT_DEPTH_THRESHOLD: u8 = 1;
+
 /// Configuration settings that control the behavior of the Mago analyzer.
 ///
 /// This struct allows you to enable/disable specific checks, suppress categories of issues,
@@ -20,6 +30,10 @@ pub struct Settings {
 
     /// Find and report unused definitions (e.g., private methods that are never called). Defaults to `false`.
     pub find_unused_definitions: bool,
+
+    /// Warn when a function's declared return type contains a branch the body never actually returns
+    /// (e.g. `: string|false` on a function that always returns a string). Defaults to `false`.
+    pub find_overly_wide_return_types: bool,
 
     /// Analyze code that appears to be unreachable. Defaults to `false`.
     pub analyze_dead_code: bool,
@@ -80,6 +94,34 @@ pub struct Settings {
     /// more flexibility at the cost of type safety.
     pub strict_list_index_checks: bool,
 
+    /// Treat array/list indices that are not provably present as `T|null` and warn on access.
+    ///
+    /// When `true`, reading a key from any array-like type whose presence is not
+    /// guaranteed emits `possibly-undefined-int-array-index` /
+    /// `possibly-undefined-string-array-index` and the resulting type is widened to
+    /// `T|null`. This applies to `list<T>` (non-zero indices), non-required entries of
+    /// `array{...}` shapes, and `array<K, V>` lookups with arbitrary keys. It lets
+    /// `=== null`, `??`, and `??=` checks behave correctly against PHP's runtime
+    /// semantics — PHP turns missing reads into `null` with an `Undefined array key`
+    /// warning.
+    ///
+    /// When `false` (the default), the analyzer keeps the looser behavior: the value is
+    /// flagged as possibly-undefined internally but is not unioned with `null` and no
+    /// warning is emitted. This is friendlier for typical PHP code that destructures or
+    /// reads from arrays/lists by index without first asserting existence.
+    pub strict_array_index_existence: bool,
+
+    /// Allow arrays as operands of logical operators (`&&`, `||`, `xor`).
+    ///
+    /// When `true`, the analyzer accepts an array on either side of a logical operator
+    /// without emitting `invalid-operand`. PHP coerces empty arrays to `false` and
+    /// non-empty arrays to `true`, mirroring the truthiness used by `if ($array)`.
+    ///
+    /// When `false` (the default), the analyzer flags array operands of `&&`/`||`/`xor`
+    /// to call out the implicit `bool` coercion. This matches the long-standing default
+    /// behavior; standalone `if ($array)` is still accepted and never produces this warning.
+    pub allow_array_truthy_operand: bool,
+
     /// Disable comparisons to boolean literals (`true`/`false`).
     ///
     /// When enabled, comparisons to boolean literals will not be reported as issues.
@@ -130,6 +172,19 @@ pub struct Settings {
     ///
     /// Defaults to `false`.
     pub check_arrow_function_missing_type_hints: bool,
+
+    /// Skip the missing-type-hint checks for closures and arrow functions used
+    /// directly as the right-hand side of the pipe operator (`|>`).
+    ///
+    /// When `true`, an inline pipe callable like
+    /// `$x |> fn($p) => strtoupper($p)` will not warn about its parameter or
+    /// return type being missing, even when `check-closure-missing-type-hints`
+    /// or `check-arrow-function-missing-type-hints` is on. The pipe operand's
+    /// type is enough to derive the parameter type, so requiring a hint here
+    /// is mostly noise.
+    ///
+    /// Defaults to `false`.
+    pub allow_implicit_pipe_callable_types: bool,
 
     /// Register superglobals (e.g., `$_GET`, `$_POST`, `$_SERVER`) in the analysis context.
     ///
@@ -210,6 +265,17 @@ pub struct Settings {
     /// Defaults to `false`.
     pub check_name_casing: bool,
 
+    /// Whether to allow calls to impure functions inside conditions.
+    ///
+    /// When set to `false`, any call to a function not marked `@pure` or
+    /// `@mutation-free` inside an `if`, `while`, `for`, ternary, or `match`
+    /// condition is reported. This helps catch surprising evaluation-order
+    /// bugs where a side effect in one part of a condition silently alters
+    /// a variable used in another part.
+    ///
+    /// Defaults to `true` (impure calls in conditions are allowed).
+    pub allow_side_effects_in_conditions: bool,
+
     // Performance tuning thresholds
     // Higher values allow deeper analysis at the cost of performance.
     // Lower values improve speed but may reduce precision on complex code.
@@ -280,6 +346,30 @@ pub struct Settings {
     ///
     /// Defaults to `128`.
     pub array_combination_threshold: u16,
+
+    /// Maximum depth of the loop assignment dependency graph that the fixed-point
+    /// analyzer will explore when re-analysing loop bodies.
+    ///
+    /// The analyzer uses fixed-point iteration to propagate widened types along
+    /// loop-carried dependency chains. A chain of length `N` can require up to
+    /// `N` extra passes for the type at the end of the chain to fully stabilise,
+    /// and each pass re-analyses the entire loop body. On large, complex loops
+    /// (think thousand-line procedural functions with deeply nested conditionals)
+    /// the per-pass cost dominates file analysis time.
+    ///
+    /// The default of `1` means each loop body is re-analysed at most once after
+    /// the initial pass; enough to stabilise virtually all real-world code while
+    /// keeping analysis cost bounded. Projects that require maximally precise
+    /// narrowing of long loop-carried chains can raise this value (typically to
+    /// `2` or `3`) at the cost of significantly slower analysis on complex files.
+    ///
+    /// Setting this to `0` disables fixed-point iteration entirely and analyses
+    /// each loop body exactly once. This is the fastest option but may produce
+    /// less precise types for variables that depend on themselves across
+    /// iterations.
+    ///
+    /// Defaults to `1`.
+    pub loop_assignment_depth_threshold: u8,
 }
 
 impl Default for Settings {
@@ -298,6 +388,7 @@ impl Settings {
             version,
             find_unused_expressions: true,
             find_unused_definitions: true,
+            find_overly_wide_return_types: false,
             analyze_dead_code: false,
             memoize_properties: true,
             allow_possibly_undefined_array_keys: true,
@@ -308,12 +399,15 @@ impl Settings {
             check_missing_override: false,
             find_unused_parameters: false,
             strict_list_index_checks: false,
+            strict_array_index_existence: false,
+            allow_array_truthy_operand: false,
             no_boolean_literal_comparison: false,
             enforce_class_finality: false,
             require_api_or_internal: false,
             check_missing_type_hints: false,
             check_closure_missing_type_hints: false,
             check_arrow_function_missing_type_hints: false,
+            allow_implicit_pipe_callable_types: false,
             register_super_globals: true,
             diff: false,
             trust_existence_checks: true,
@@ -322,6 +416,7 @@ impl Settings {
             check_use_statements: false,
             check_experimental: false,
             check_name_casing: false,
+            allow_side_effects_in_conditions: true,
             saturation_complexity_threshold: default_thresholds.saturation_complexity,
             disjunction_complexity_threshold: default_thresholds.disjunction_complexity,
             negation_complexity_threshold: default_thresholds.negation_complexity,
@@ -330,6 +425,7 @@ impl Settings {
             string_combination_threshold: default_combiner_options.string_combination_threshold,
             integer_combination_threshold: default_combiner_options.integer_combination_threshold,
             array_combination_threshold: default_combiner_options.array_combination_threshold,
+            loop_assignment_depth_threshold: DEFAULT_LOOP_ASSIGNMENT_DEPTH_THRESHOLD,
         }
     }
 

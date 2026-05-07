@@ -115,6 +115,15 @@ pub struct WasmRuleInfo {
     pub name: String,
     pub description: String,
     pub category: String,
+    pub default_enabled: bool,
+    pub requires_integration: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WasmIntegrationInfo {
+    pub id: String,
+    pub name: String,
 }
 
 /// WASM-safe plugin info for exposing available plugins to the frontend.
@@ -147,6 +156,8 @@ pub struct WasmAnalyzerSettings {
     pub check_missing_override: bool,
     pub find_unused_parameters: bool,
     pub strict_list_index_checks: bool,
+    pub strict_array_index_existence: bool,
+    pub allow_array_truthy_operand: bool,
     pub no_boolean_literal_comparison: bool,
     pub enforce_class_finality: bool,
     pub check_missing_type_hints: bool,
@@ -180,6 +191,8 @@ impl Default for WasmAnalyzerSettings {
             check_missing_override: false,
             find_unused_parameters: false,
             strict_list_index_checks: false,
+            strict_array_index_existence: false,
+            allow_array_truthy_operand: false,
             no_boolean_literal_comparison: false,
             enforce_class_finality: false,
             check_missing_type_hints: false,
@@ -203,6 +216,7 @@ impl Default for WasmAnalyzerSettings {
 #[serde(rename_all = "camelCase", default)]
 pub struct WasmLinterSettings {
     pub disabled_rules: Vec<String>,
+    pub integrations: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]

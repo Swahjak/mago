@@ -1,5 +1,10 @@
-#![doc = include_str!("./../README.md")]
+#![cfg_attr(doc, doc = include_str!("./../README.md"))]
+#![allow(clippy::pub_use)]
+#![allow(clippy::exhaustive_enums)]
 
+use bumpalo::Bump;
+
+use mago_span::Position;
 use mago_span::Span;
 use mago_syntax_core::input::Input;
 
@@ -13,32 +18,66 @@ pub mod lexer;
 pub mod parser;
 pub mod token;
 
-/// Parses a string representation of a `PHPDoc` type into an Abstract Syntax Tree (AST).
+/// Parses a string representation of a PHPDoc type into an arena-allocated
+/// Abstract Syntax Tree.
 ///
-/// This is the main entry point for the type parser. It takes the type string
-/// and its original `Span` (representing its location within the source file)
-/// and returns the parsed `Type` AST or a `ParseError`.
+/// All AST nodes are allocated in the caller-supplied [`bumpalo::Bump`], so
+/// no per-node heap allocation happens during parsing. The resulting
+/// [`Type`] borrows from `input` (for textual slices) and from `arena`
+/// (for nested sub-trees) for the duration of `'arena`.
 ///
 /// # Arguments
 ///
-/// * `span` - The original `Span` of the `input` string slice within its source file.
-///   This is crucial for ensuring all AST nodes have correct, absolute positioning.
-/// * `input` - The `&str` containing the type string to parse (e.g., `"int|string"`, `"array<int, MyClass>"`).
+/// * `arena` - The arena that will own every AST node.
+/// * `span` - The original `Span` of the `input` string slice within its
+///   source file; used to anchor every produced span.
+/// * `input` - The type string to parse (e.g. `"int|string"`,
+///   `"array<int, MyClass>"`).
 ///
 /// # Errors
 ///
 /// Returns a [`ParseError`] if any lexing or parsing error occurs.
-pub fn parse_str(span: Span, input: &str) -> Result<Type<'_>, ParseError> {
-    // Create an Input anchored at the type string's original starting position.
+pub fn parse_str<'arena>(arena: &'arena Bump, span: Span, input: &'arena str) -> Result<Type<'arena>, ParseError> {
     let input = Input::anchored_at(span.file_id, input.as_bytes(), span.start);
-    // Create the type-specific lexer.
     let lexer = TypeLexer::new(input);
-    // Construct the type AST using the lexer.
-    parser::construct(lexer)
+    parser::construct(arena, lexer)
+}
+
+/// Parses the **longest valid type prefix** of `input` and reports the
+/// absolute position just past the consumed bytes.
+///
+/// Unlike [`parse_str`], this does not require the entire input to be a
+/// single type. It is the handoff point for embedding callers (e.g. the
+/// phpdoc-syntax parser): they parse one type, fast-forward their own
+/// scanner to the returned position, and keep going with their own
+/// tokens from there.
+///
+/// # Arguments
+///
+/// * `arena` - The arena that will own every AST node.
+/// * `span` - The absolute span covering `input` within its source file.
+/// * `input` - The slice to parse; only the prefix that forms a complete
+///   type expression is consumed.
+///
+/// # Errors
+///
+/// Returns a [`ParseError`] if the prefix does not start with a valid
+/// type.
+pub fn parse_prefix<'arena>(
+    arena: &'arena Bump,
+    span: Span,
+    input: &'arena str,
+) -> Result<(Type<'arena>, Position), ParseError> {
+    let input_obj = Input::anchored_at(span.file_id, input.as_bytes(), span.start);
+    let lexer = TypeLexer::new(input_obj);
+    parser::construct_prefix(arena, lexer)
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use bumpalo::Bump;
+
     use mago_database::file::FileId;
     use mago_span::HasSpan;
     use mago_span::Position;
@@ -48,8 +87,16 @@ mod tests {
 
     use super::*;
 
-    fn do_parse(input: &str) -> Result<Type<'_>, ParseError> {
-        parse_str(Span::new(FileId::zero(), Position::new(0), Position::new(input.len() as u32)), input)
+    /// Test helper: parses `input` against a fresh leaked arena so the
+    /// resulting `Type<'static>` can be freely inspected without plumbing
+    /// lifetimes through every test. The arena is intentionally leaked;
+    /// tests run once and exit, so the cost is bounded and the ergonomics
+    /// match the pre-arena API.
+    fn do_parse(input: &str) -> Result<Type<'static>, ParseError> {
+        let arena: &'static Bump = Box::leak(Box::new(Bump::new()));
+        let owned: &'static str = arena.alloc_str(input);
+        let span = Span::new(FileId::zero(), Position::new(0), Position::new(owned.len() as u32));
+        parse_str(arena, span, owned)
     }
 
     #[test]
@@ -121,12 +168,26 @@ mod tests {
     }
 
     #[test]
+    fn test_float_with_dangling_exponent_does_not_panic() {
+        match do_parse("3.") {
+            Ok(Type::LiteralFloat(LiteralFloatType { value, raw, .. })) => {
+                assert_eq!(*value, 3.0);
+                assert_eq!(raw, "3.");
+            }
+            other => panic!("expected `3.` to parse as LiteralFloat 3.0, got: {other:?}"),
+        }
+
+        let _ = do_parse("3.eint");
+        let _ = do_parse("3.e");
+    }
+
+    #[test]
     fn test_parse_simple_union() {
         match do_parse("int|string") {
             Ok(ty) => match ty {
                 Type::Union(u) => {
-                    assert!(matches!(*u.left, Type::Int(_)));
-                    assert!(matches!(*u.right, Type::String(_)));
+                    assert!(matches!(u.left, Type::Int(_)));
+                    assert!(matches!(u.right, Type::String(_)));
                 }
                 _ => panic!("Expected Type::Union"),
             },
@@ -141,8 +202,8 @@ mod tests {
         match do_parse("$a|$b") {
             Ok(ty) => match ty {
                 Type::Union(u) => {
-                    assert!(matches!(*u.left, Type::Variable(_)));
-                    assert!(matches!(*u.right, Type::Variable(_)));
+                    assert!(matches!(u.left, Type::Variable(_)));
+                    assert!(matches!(u.right, Type::Variable(_)));
                 }
                 _ => panic!("Expected Type::Union"),
             },
@@ -158,7 +219,7 @@ mod tests {
         assert!(result.is_ok());
         match result.unwrap() {
             Type::Nullable(n) => {
-                assert!(matches!(*n.inner, Type::String(_)));
+                assert!(matches!(n.inner, Type::String(_)));
             }
             _ => panic!("Expected Type::Nullable"),
         }
@@ -252,7 +313,7 @@ mod tests {
 
         let field = &shape.fields[0];
         assert!(matches!(field.key.as_ref().map(|k| &k.key), Some(ShapeKey::String { value: "name", .. })));
-        assert!(matches!(field.value.as_ref(), Type::String(_)));
+        assert!(matches!(field.value, Type::String(_)));
     }
 
     #[test]
@@ -262,10 +323,10 @@ mod tests {
                 assert_eq!(shape.fields.len(), 2);
                 let first_field = &shape.fields[0];
                 assert!(matches!(first_field.key.as_ref().map(|k| &k.key), Some(ShapeKey::Integer { value: 0, .. })));
-                assert!(matches!(first_field.value.as_ref(), Type::String(_)));
+                assert!(matches!(first_field.value, Type::String(_)));
                 let second_field = &shape.fields[1];
                 assert!(matches!(second_field.key.as_ref().map(|k| &k.key), Some(ShapeKey::Integer { value: 1, .. })));
-                assert!(matches!(second_field.value.as_ref(), Type::Bool(_)));
+                assert!(matches!(second_field.value, Type::Bool(_)));
             }
             res => panic!("Expected Ok(Type::Shape), got {res:?}"),
         }
@@ -346,6 +407,101 @@ mod tests {
                     assert_eq!(*s, "bool");
                 } else {
                     panic!("Expected key to be a ShapeKey::String");
+                }
+            }
+            res => panic!("Expected Ok(Type::Shape), got {res:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_shape_keyless_entry_with_commas_inside_generics() {
+        // Regression: the shape-field-key scan used to bail on any top-level
+        // comma without tracking bracket depth. A `,` inside `<...>` must
+        // be skipped over, not mistaken for the field terminator.
+        match do_parse("array{array<int, string>}") {
+            Ok(Type::Shape(shape)) => {
+                assert_eq!(shape.fields.len(), 1);
+                assert!(shape.fields[0].key.is_none(), "expected a keyless (positional) field");
+                match shape.fields[0].value {
+                    Type::Array(_) => {}
+                    v => panic!("expected value to be a generic array type, got {v:?}"),
+                }
+            }
+            res => panic!("Expected Ok(Type::Shape), got {res:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_shape_keyed_entry_with_commas_inside_value_generics() {
+        // `foo: array<int, string>` must be recognized as a keyed field.
+        // The scan has to see the `:` at top level despite the `,` nested
+        // inside `<...>` in the value.
+        match do_parse("array{foo: array<int, string>}") {
+            Ok(Type::Shape(shape)) => {
+                assert_eq!(shape.fields.len(), 1);
+                let key = shape.fields[0].key.as_ref().expect("expected a keyed field");
+                match &key.key {
+                    ShapeKey::String { value, .. } => assert_eq!(*value, "foo"),
+                    other => panic!("expected identifier key, got {other:?}"),
+                }
+                match shape.fields[0].value {
+                    Type::Array(_) => {}
+                    v => panic!("expected value to be a generic array type, got {v:?}"),
+                }
+            }
+            res => panic!("Expected Ok(Type::Shape), got {res:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_shape_with_large_union_value_does_not_overflow() {
+        // Regression: a single keyless field whose value is a long union
+        // containing nested generics used to scan past the stream's
+        // lookahead capacity (16 slots previously, now 64) looking for a
+        // phantom `:`. With bracket-depth tracking and the
+        // SHAPE_KEY_SCAN_LIMIT cap the scan stays bounded.
+        let input = "array{\
+            int | string | float | bool | null | \
+            array<int, string> | array<string, int> | \
+            callable(int, string): bool | \
+            list<int> | iterable<string, mixed>\
+        }";
+        match do_parse(input) {
+            Ok(Type::Shape(shape)) => {
+                assert_eq!(shape.fields.len(), 1, "expected a single keyless field");
+                assert!(shape.fields[0].key.is_none(), "value is a union, not a keyed field");
+                match shape.fields[0].value {
+                    Type::Union(_) => {}
+                    v => panic!("expected a union value type, got {v:?}"),
+                }
+            }
+            res => panic!("Expected Ok(Type::Shape), got {res:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_shape_many_fields_with_nested_generics() {
+        // Stress test: many fields, each with a value containing top-level
+        // commas inside `<>`. Previously the scan would overflow the fixed
+        // lookahead buffer on some fields because it couldn't distinguish
+        // `,` inside a generic from the field separator.
+        let input = "array{\
+            a: list<int, string>, \
+            b: array<int, string>, \
+            c: iterable<int, string>, \
+            d: callable(int, string): void, \
+            e: array<string, array<int, string>>, \
+            f: string\
+        }";
+        match do_parse(input) {
+            Ok(Type::Shape(shape)) => {
+                assert_eq!(shape.fields.len(), 6);
+                for (i, expected_key) in ["a", "b", "c", "d", "e", "f"].iter().enumerate() {
+                    let key = shape.fields[i].key.as_ref().expect("expected a keyed field");
+                    match &key.key {
+                        ShapeKey::String { value, .. } => assert_eq!(value, expected_key),
+                        other => panic!("field {i}: expected identifier key, got {other:?}"),
+                    }
                 }
             }
             res => panic!("Expected Ok(Type::Shape), got {res:?}"),
@@ -450,16 +606,16 @@ mod tests {
     fn test_parse_intersection() {
         match do_parse("Countable&Traversable") {
             Ok(Type::Intersection(i)) => {
-                assert!(matches!(*i.left, Type::Reference(_)));
-                assert!(matches!(*i.right, Type::Reference(_)));
+                assert!(matches!(i.left, Type::Reference(_)));
+                assert!(matches!(i.right, Type::Reference(_)));
 
-                if let Type::Reference(r) = *i.left {
+                if let Type::Reference(r) = i.left {
                     assert_eq!(r.identifier.value, "Countable");
                 } else {
                     panic!();
                 }
 
-                if let Type::Reference(r) = *i.right {
+                if let Type::Reference(r) = i.right {
                     assert_eq!(r.identifier.value, "Traversable");
                 } else {
                     panic!();
@@ -485,6 +641,99 @@ mod tests {
                 assert_eq!(m.member.to_string(), "class");
             }
             res => panic!("Expected Ok(Type::MemberReference), got {res:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_member_ref_named_new() {
+        match do_parse("Action::NEW") {
+            Ok(Type::MemberReference(m)) => {
+                assert_eq!(m.class.value, "Action");
+                assert_eq!(m.member.to_string(), "NEW");
+            }
+            res => panic!("Expected Ok(Type::MemberReference) for Action::NEW, got {res:?}"),
+        }
+
+        match do_parse("Action::new") {
+            Ok(Type::MemberReference(m)) => {
+                assert_eq!(m.class.value, "Action");
+                assert_eq!(m.member.to_string(), "new");
+            }
+            res => panic!("Expected Ok(Type::MemberReference) for Action::new, got {res:?}"),
+        }
+
+        match do_parse("Action::DELETE|Action::NEW") {
+            Ok(Type::Union(u)) => match (&u.left, &u.right) {
+                (Type::MemberReference(lhs), Type::MemberReference(rhs)) => {
+                    assert_eq!(lhs.member.to_string(), "DELETE");
+                    assert_eq!(rhs.member.to_string(), "NEW");
+                }
+                other => panic!("Expected two member references, got {other:?}"),
+            },
+            res => panic!("Expected Ok(Type::Union), got {res:?}"),
+        }
+
+        match do_parse("\\App\\Action::NEW") {
+            Ok(Type::MemberReference(m)) => {
+                assert_eq!(m.member.to_string(), "NEW");
+            }
+            res => panic!("Expected Ok(Type::MemberReference), got {res:?}"),
+        }
+
+        match do_parse("App\\Action::NEW") {
+            Ok(Type::MemberReference(m)) => {
+                assert_eq!(m.member.to_string(), "NEW");
+            }
+            res => panic!("Expected Ok(Type::MemberReference), got {res:?}"),
+        }
+
+        match do_parse("Action::new*") {
+            Ok(Type::MemberReference(m)) => {
+                assert_eq!(m.class.value, "Action");
+                assert!(matches!(m.member, MemberReferenceSelector::StartsWith(..)));
+            }
+            res => panic!("Expected Ok(Type::MemberReference) for Action::new*, got {res:?}"),
+        }
+
+        match do_parse("Action::*new") {
+            Ok(Type::MemberReference(m)) => {
+                assert_eq!(m.class.value, "Action");
+                assert!(matches!(m.member, MemberReferenceSelector::EndsWith(..)));
+            }
+            res => panic!("Expected Ok(Type::MemberReference) for Action::*new, got {res:?}"),
+        }
+
+        match do_parse("new<Foo>") {
+            Ok(Type::New(_)) => {}
+            res => panic!("Expected Ok(Type::New), got {res:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_new_in_other_identifier_contexts() {
+        match do_parse("array{new: int}") {
+            Ok(Type::Shape(_)) => {}
+            res => panic!("Expected Ok(Type::Shape) for array{{new: int}}, got {res:?}"),
+        }
+
+        match do_parse("array{new?: int}") {
+            Ok(Type::Shape(_)) => {}
+            res => panic!("Expected Ok(Type::Shape) for array{{new?: int}}, got {res:?}"),
+        }
+
+        match do_parse("array{Foo::NEW: int}") {
+            Ok(Type::Shape(_)) => {}
+            res => panic!("Expected Ok(Type::Shape) for array{{Foo::NEW: int}}, got {res:?}"),
+        }
+
+        match do_parse("object{new: int}") {
+            Ok(Type::Object(_)) => {}
+            res => panic!("Expected Ok(Type::Object) for object{{new: int}}, got {res:?}"),
+        }
+
+        match do_parse("!Foo::new") {
+            Ok(Type::AliasReference(_)) => {}
+            res => panic!("Expected Ok(Type::AliasReference) for !Foo::new, got {res:?}"),
         }
     }
 
@@ -575,10 +824,10 @@ mod tests {
     fn test_parse_negated_union() {
         match do_parse("-1|-2.0|string") {
             Ok(Type::Union(n)) => {
-                assert!(matches!(*n.left, Type::Negated(_)));
-                assert!(matches!(*n.right, Type::Union(_)));
+                assert!(matches!(n.left, Type::Negated(_)));
+                assert!(matches!(n.right, Type::Union(_)));
 
-                if let Type::Negated(neg) = *n.left {
+                if let Type::Negated(neg) = n.left {
                     assert!(matches!(neg.number, LiteralIntOrFloatType::Int(_)));
                     if let LiteralIntOrFloatType::Int(lit) = neg.number {
                         assert_eq!(lit.value, 1);
@@ -589,11 +838,11 @@ mod tests {
                     panic!("Expected left side to be Type::Negated");
                 }
 
-                if let Type::Union(inner_union) = *n.right {
-                    assert!(matches!(*inner_union.left, Type::Negated(_)));
-                    assert!(matches!(*inner_union.right, Type::String(_)));
+                if let Type::Union(inner_union) = n.right {
+                    assert!(matches!(inner_union.left, Type::Negated(_)));
+                    assert!(matches!(inner_union.right, Type::String(_)));
 
-                    if let Type::Negated(neg) = *inner_union.left {
+                    if let Type::Negated(neg) = inner_union.left {
                         assert!(matches!(neg.number, LiteralIntOrFloatType::Float(_)));
                         if let LiteralIntOrFloatType::Float(lit) = neg.number {
                             assert_eq!(lit.value, 2.0);
@@ -604,7 +853,7 @@ mod tests {
                         panic!("Expected left side of inner union to be Type::Negated");
                     }
 
-                    if let Type::String(s) = *inner_union.right {
+                    if let Type::String(s) = inner_union.right {
                         assert_eq!(s.value, "string");
                     } else {
                         panic!("Expected right side of inner union to be Type::String");
@@ -651,7 +900,7 @@ mod tests {
                 let spec = c.specification.expect("Expected callable specification");
                 assert!(spec.parameters.entries.is_empty());
                 assert!(spec.return_type.is_some());
-                assert!(matches!(*spec.return_type.unwrap().return_type, Type::Void(_)));
+                assert!(matches!(spec.return_type.unwrap().return_type, Type::Void(_)));
             }
             res => panic!("Expected Ok(Type::Callable), got {res:?}"),
         }
@@ -666,7 +915,7 @@ mod tests {
                 assert_eq!(spec.parameters.entries.len(), 1);
                 assert!(matches!(spec.parameters.entries[0].parameter_type, Some(Type::Bool(_))));
                 assert!(spec.return_type.is_some());
-                assert!(matches!(*spec.return_type.unwrap().return_type, Type::Int(_)));
+                assert!(matches!(spec.return_type.unwrap().return_type, Type::Int(_)));
             }
             res => panic!("Expected Ok(Type::Callable), got {res:?}"),
         }
@@ -682,7 +931,7 @@ mod tests {
                 assert_eq!(spec.parameters.entries.len(), 1);
                 assert!(matches!(spec.parameters.entries[0].parameter_type, Some(Type::String(_))));
                 assert!(spec.return_type.is_some());
-                assert!(matches!(*spec.return_type.unwrap().return_type, Type::Bool(_)));
+                assert!(matches!(spec.return_type.unwrap().return_type, Type::Bool(_)));
             }
             res => panic!("Expected Ok(Type::Callable) for Closure, got {res:?}"),
         }
@@ -712,11 +961,11 @@ mod tests {
                 assert!(third_param.ellipsis.is_some());
                 assert!(third_param.equals.is_none());
 
-                if let Type::Parenthesized(p) = *spec.return_type.unwrap().return_type {
-                    assert!(matches!(*p.inner, Type::Union(_)));
-                    if let Type::Union(u) = *p.inner {
-                        assert!(matches!(u.left.as_ref(), Type::Parenthesized(_)));
-                        assert!(matches!(u.right.as_ref(), Type::Null(_)));
+                if let Type::Parenthesized(p) = spec.return_type.unwrap().return_type {
+                    assert!(matches!(p.inner, Type::Union(_)));
+                    if let Type::Union(u) = p.inner {
+                        assert!(matches!(u.left, Type::Parenthesized(_)));
+                        assert!(matches!(u.right, Type::Null(_)));
                     }
                 } else {
                     panic!("Expected Type::CallableReturnType");
@@ -727,46 +976,90 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_callable_by_reference_parameter() {
+        match do_parse("callable(bool &$ret): void") {
+            Ok(Type::Callable(c)) => {
+                let spec = c.specification.expect("Expected callable specification");
+                assert_eq!(spec.parameters.entries.len(), 1);
+
+                let param = &spec.parameters.entries[0];
+                assert!(matches!(param.parameter_type, Some(Type::Bool(_))));
+                assert!(param.is_by_reference(), "expected `&` to be parsed as by-reference marker");
+                assert!(!param.is_variadic());
+                assert!(!param.is_optional());
+                assert!(param.variable.is_some());
+            }
+            res => panic!("Expected Ok(Type::Callable), got {res:?}"),
+        }
+
+        match do_parse("callable(string &...$rest): int") {
+            Ok(Type::Callable(c)) => {
+                let spec = c.specification.expect("Expected callable specification");
+                assert_eq!(spec.parameters.entries.len(), 1);
+
+                let param = &spec.parameters.entries[0];
+                assert!(matches!(param.parameter_type, Some(Type::String(_))));
+                assert!(param.is_by_reference());
+                assert!(param.is_variadic());
+            }
+            res => panic!("Expected Ok(Type::Callable), got {res:?}"),
+        }
+
+        match do_parse("callable(Foo&Bar $x): void") {
+            Ok(Type::Callable(c)) => {
+                let spec = c.specification.expect("Expected callable specification");
+                assert_eq!(spec.parameters.entries.len(), 1);
+
+                let param = &spec.parameters.entries[0];
+                assert!(matches!(param.parameter_type, Some(Type::Intersection(_))));
+                assert!(!param.is_by_reference());
+                assert!(param.variable.is_some());
+            }
+            res => panic!("Expected Ok(Type::Callable), got {res:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_conditional_type() {
         match do_parse("int is not string ? array : int") {
             Ok(Type::Conditional(c)) => {
-                assert!(matches!(*c.subject, Type::Int(_)));
+                assert!(matches!(c.subject, Type::Int(_)));
                 assert!(c.not.is_some());
-                assert!(matches!(*c.target, Type::String(_)));
-                assert!(matches!(*c.then, Type::Array(_)));
-                assert!(matches!(*c.otherwise, Type::Int(_)));
+                assert!(matches!(c.target, Type::String(_)));
+                assert!(matches!(c.then, Type::Array(_)));
+                assert!(matches!(c.otherwise, Type::Int(_)));
             }
             res => panic!("Expected Ok(Type::Conditional), got {res:?}"),
         }
 
         match do_parse("$input is string ? array : int") {
             Ok(Type::Conditional(c)) => {
-                assert!(matches!(*c.subject, Type::Variable(_)));
+                assert!(matches!(c.subject, Type::Variable(_)));
                 assert!(c.not.is_none());
-                assert!(matches!(*c.target, Type::String(_)));
-                assert!(matches!(*c.then, Type::Array(_)));
-                assert!(matches!(*c.otherwise, Type::Int(_)));
+                assert!(matches!(c.target, Type::String(_)));
+                assert!(matches!(c.then, Type::Array(_)));
+                assert!(matches!(c.otherwise, Type::Int(_)));
             }
             res => panic!("Expected Ok(Type::Conditional), got {res:?}"),
         }
 
         match do_parse("int is string ? array : (int is not $bar ? string : $baz)") {
             Ok(Type::Conditional(c)) => {
-                assert!(matches!(*c.subject, Type::Int(_)));
+                assert!(matches!(c.subject, Type::Int(_)));
                 assert!(c.not.is_none());
-                assert!(matches!(*c.target, Type::String(_)));
-                assert!(matches!(*c.then, Type::Array(_)));
+                assert!(matches!(c.target, Type::String(_)));
+                assert!(matches!(c.then, Type::Array(_)));
 
-                let Type::Parenthesized(p) = *c.otherwise else {
+                let Type::Parenthesized(p) = c.otherwise else {
                     panic!("Expected Type::Parenthesized");
                 };
 
-                if let Type::Conditional(inner_conditional) = *p.inner {
-                    assert!(matches!(*inner_conditional.subject, Type::Int(_)));
+                if let Type::Conditional(inner_conditional) = p.inner {
+                    assert!(matches!(inner_conditional.subject, Type::Int(_)));
                     assert!(inner_conditional.not.is_some());
-                    assert!(matches!(*inner_conditional.target, Type::Variable(_)));
-                    assert!(matches!(*inner_conditional.then, Type::String(_)));
-                    assert!(matches!(*inner_conditional.otherwise, Type::Variable(_)));
+                    assert!(matches!(inner_conditional.target, Type::Variable(_)));
+                    assert!(matches!(inner_conditional.then, Type::String(_)));
+                    assert!(matches!(inner_conditional.otherwise, Type::Variable(_)));
                 } else {
                     panic!("Expected Type::Conditional");
                 }
@@ -807,11 +1100,11 @@ mod tests {
     fn test_indexed_access() {
         match do_parse("MyArray[MyKey]") {
             Ok(Type::IndexAccess(i)) => {
-                match *i.target {
+                match i.target {
                     Type::Reference(r) => assert_eq!(r.identifier.value, "MyArray"),
                     _ => panic!("Expected Type::Reference"),
                 }
-                match *i.index {
+                match i.index {
                     Type::Reference(r) => assert_eq!(r.identifier.value, "MyKey"),
                     _ => panic!("Expected Type::Reference"),
                 }
@@ -824,7 +1117,7 @@ mod tests {
     fn test_slice_type() {
         match do_parse("string[]") {
             Ok(Type::Slice(s)) => {
-                assert!(matches!(*s.inner, Type::String(_)));
+                assert!(matches!(s.inner, Type::String(_)));
             }
             res => panic!("Expected Ok(Type::Slice), got {res:?}"),
         }
@@ -834,11 +1127,11 @@ mod tests {
     fn test_slice_of_slice_of_slice_type() {
         match do_parse("string[][][]") {
             Ok(Type::Slice(s)) => {
-                assert!(matches!(*s.inner, Type::Slice(_)));
-                if let Type::Slice(inner_slice) = *s.inner {
-                    assert!(matches!(*inner_slice.inner, Type::Slice(_)));
-                    if let Type::Slice(inner_inner_slice) = *inner_slice.inner {
-                        assert!(matches!(*inner_inner_slice.inner, Type::String(_)));
+                assert!(matches!(s.inner, Type::Slice(_)));
+                if let Type::Slice(inner_slice) = s.inner {
+                    assert!(matches!(inner_slice.inner, Type::Slice(_)));
+                    if let Type::Slice(inner_inner_slice) = inner_slice.inner {
+                        assert!(matches!(inner_inner_slice.inner, Type::String(_)));
                     } else {
                         panic!("Expected inner slice to be a Slice");
                     }
@@ -990,10 +1283,10 @@ mod tests {
         // Nullable applies only to the rightmost element of an intersection before parens
         match do_parse("Countable&?Traversable") {
             Ok(Type::Intersection(i)) => {
-                assert!(matches!(*i.left, Type::Reference(r) if r.identifier.value == "Countable"));
-                assert!(matches!(*i.right, Type::Nullable(_)));
-                if let Type::Nullable(n) = *i.right {
-                    assert!(matches!(*n.inner, Type::Reference(r) if r.identifier.value == "Traversable"));
+                assert!(matches!(i.left, Type::Reference(r) if r.identifier.value == "Countable"));
+                assert!(matches!(i.right, Type::Nullable(_)));
+                if let Type::Nullable(n) = i.right {
+                    assert!(matches!(n.inner, Type::Reference(r) if r.identifier.value == "Traversable"));
                 } else {
                     panic!();
                 }
@@ -1006,9 +1299,9 @@ mod tests {
     fn test_parenthesized_nullable() {
         match do_parse("?(Countable&Traversable)") {
             Ok(Type::Nullable(n)) => {
-                assert!(matches!(*n.inner, Type::Parenthesized(_)));
-                if let Type::Parenthesized(p) = *n.inner {
-                    assert!(matches!(*p.inner, Type::Intersection(_)));
+                assert!(matches!(n.inner, Type::Parenthesized(_)));
+                if let Type::Parenthesized(p) = n.inner {
+                    assert!(matches!(p.inner, Type::Intersection(_)));
                 } else {
                     panic!()
                 }
@@ -1021,8 +1314,8 @@ mod tests {
     fn test_positive_negative_int() {
         match do_parse("positive-int|negative-int") {
             Ok(Type::Union(u)) => {
-                assert!(matches!(*u.left, Type::PositiveInt(_)));
-                assert!(matches!(*u.right, Type::NegativeInt(_)));
+                assert!(matches!(u.left, Type::PositiveInt(_)));
+                assert!(matches!(u.right, Type::NegativeInt(_)));
             }
             res => panic!("Expected Ok(Type::Union), got {res:?}"),
         }
@@ -1113,8 +1406,8 @@ mod tests {
     fn test_parse_string_or_lowercase_string_union() {
         match do_parse("string|lowercase-string") {
             Ok(Type::Union(u)) => {
-                assert!(matches!(*u.left, Type::String(_)));
-                assert!(matches!(*u.right, Type::LowercaseString(_)));
+                assert!(matches!(u.left, Type::String(_)));
+                assert!(matches!(u.right, Type::LowercaseString(_)));
             }
             res => panic!("Expected Ok(Type::Union), got {res:?}"),
         }
@@ -1133,7 +1426,7 @@ mod tests {
                     first_field.key.as_ref().map(|k| &k.key),
                     Some(ShapeKey::String { value: "salt", .. })
                 ));
-                assert!(matches!(first_field.value.as_ref(), Type::Int(_)));
+                assert!(matches!(first_field.value, Type::Int(_)));
 
                 let second_field = &shape.fields[1];
                 assert!(second_field.is_optional());
@@ -1141,7 +1434,7 @@ mod tests {
                     second_field.key.as_ref().map(|k| &k.key),
                     Some(ShapeKey::String { value: "cost", .. })
                 ));
-                assert!(matches!(second_field.value.as_ref(), Type::Int(_)));
+                assert!(matches!(second_field.value, Type::Int(_)));
             }
             res => panic!("Expected Ok(Type::Shape), got {res:?}"),
         }
@@ -1525,5 +1818,208 @@ mod tests {
     fn test_parse_wildcard_display() {
         assert_eq!(do_parse("*").unwrap().to_string(), "*");
         assert_eq!(do_parse("_").unwrap().to_string(), "_");
+    }
+
+    #[test]
+    fn test_parse_non_zero_int() {
+        match do_parse("non-zero-int") {
+            Ok(Type::NonZeroInt(k)) => assert_eq!(k.value, "non-zero-int"),
+            other => panic!("Expected Type::NonZeroInt, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_int_range_int_keyword_max() {
+        match do_parse("int<0, int>") {
+            Ok(Type::IntRange(range)) => {
+                assert!(matches!(range.min, IntOrKeyword::Int(LiteralIntType { value: 0, .. })));
+                match range.max {
+                    IntOrKeyword::Keyword(keyword) => assert!(keyword.value.eq_ignore_ascii_case("int")),
+                    other => panic!("Expected IntOrKeyword::Keyword, got: {other:?}"),
+                }
+            }
+            other => panic!("Expected Type::IntRange, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_int_range_int_keyword_min() {
+        match do_parse("int<int, 0>") {
+            Ok(Type::IntRange(range)) => {
+                match range.min {
+                    IntOrKeyword::Keyword(keyword) => assert!(keyword.value.eq_ignore_ascii_case("int")),
+                    other => panic!("Expected IntOrKeyword::Keyword, got: {other:?}"),
+                }
+                assert!(matches!(range.max, IntOrKeyword::Int(LiteralIntType { value: 0, .. })));
+            }
+            other => panic!("Expected Type::IntRange, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_member_reference_reserved_keywords() {
+        for name in [
+            "NULL", "ARRAY", "INT", "STRING", "FLOAT", "TRUE", "FALSE", "MIXED", "CALLABLE", "ITERABLE", "RESOURCE",
+            "BOOL", "OBJECT", "NEVER", "VOID", "NUMERIC", "SCALAR",
+        ] {
+            let input = format!("TypeIdentifier::{name}");
+            match do_parse(&input) {
+                Ok(Type::MemberReference(r)) => match r.member {
+                    MemberReferenceSelector::Identifier(ident) => {
+                        assert!(
+                            ident.value.eq_ignore_ascii_case(name),
+                            "Expected member name {name}, got {}",
+                            ident.value,
+                        );
+                    }
+                    other => panic!("Expected Identifier selector for {input}, got {other:?}"),
+                },
+                other => panic!("Expected Type::MemberReference for {input}, got: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_member_reference_reserved_prefix_wildcard() {
+        match do_parse("Foo::INT*") {
+            Ok(Type::MemberReference(r)) => match r.member {
+                MemberReferenceSelector::StartsWith(ident, _) => {
+                    assert!(ident.value.eq_ignore_ascii_case("INT"), "expected INT prefix, got {}", ident.value);
+                }
+                other => panic!("Expected StartsWith selector, got {other:?}"),
+            },
+            other => panic!("Expected Type::MemberReference, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_nested_generic_with_reserved_const() {
+        match do_parse("UnionType<T|Foo::NULL>") {
+            Ok(Type::Reference(r)) => {
+                let params = r.parameters.expect("Expected generic parameters");
+                assert_eq!(params.entries.len(), 1);
+                match &params.entries[0].inner {
+                    Type::Union(u) => {
+                        assert!(matches!(u.left, Type::Reference(_)));
+                        assert!(matches!(u.right, Type::MemberReference(_)));
+                    }
+                    other => panic!("Expected inner Union, got {other:?}"),
+                }
+            }
+            other => panic!("Expected Type::Reference, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_builtin_type_identifier_union() {
+        let input = "BuiltinType<TypeIdentifier::ARRAY>|BuiltinType<TypeIdentifier::ITERABLE>|ObjectType|GenericType";
+        assert!(do_parse(input).is_ok(), "expected successful parse for {input}");
+    }
+
+    #[test]
+    fn test_parse_collection_type_with_reserved_identifier() {
+        let input = "CollectionType<BuiltinType<TypeIdentifier::ITERABLE>>";
+        assert!(do_parse(input).is_ok(), "expected successful parse for {input}");
+    }
+
+    #[test]
+    fn test_parse_trailing_pipe() {
+        match do_parse("int|string|") {
+            Ok(Type::TrailingPipe(trailing)) => assert!(matches!(trailing.inner, Type::Union(_))),
+            other => panic!("Expected Type::TrailingPipe, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_trailing_pipe_single() {
+        match do_parse("int|") {
+            Ok(Type::TrailingPipe(trailing)) => assert!(matches!(trailing.inner, Type::Int(_))),
+            other => panic!("Expected Type::TrailingPipe, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_trailing_pipe_in_shape_value() {
+        match do_parse("array{0: int|string|}") {
+            Ok(Type::Shape(shape)) => {
+                assert_eq!(shape.fields.len(), 1);
+                assert!(matches!(shape.fields[0].value, Type::TrailingPipe(_)));
+            }
+            other => panic!("Expected Type::Shape, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_trailing_pipe_in_generic_shape_value() {
+        let input = "iterable<array{0: int|array<string, mixed>|}>";
+        match do_parse(input) {
+            Ok(Type::Iterable(iter)) => {
+                let params = iter.parameters.expect("expected generic parameters");
+                assert_eq!(params.entries.len(), 1);
+                match &params.entries[0].inner {
+                    Type::Shape(shape) => {
+                        assert_eq!(shape.fields.len(), 1);
+                        assert!(matches!(shape.fields[0].value, Type::TrailingPipe(_)));
+                    }
+                    other => panic!("Expected Type::Shape, got {other:?}"),
+                }
+            }
+            other => panic!("Expected Type::Iterable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_global_wildcard_starts_with() {
+        match do_parse("FILTER_FLAG_*") {
+            Ok(Type::GlobalWildcardReference(g)) => match g.selector {
+                GlobalWildcardSelector::StartsWith(identifier, _) => {
+                    assert_eq!(identifier.value, "FILTER_FLAG_");
+                }
+                other @ GlobalWildcardSelector::EndsWith(..) => {
+                    panic!("Expected StartsWith selector, got {other:?}")
+                }
+            },
+            other => panic!("Expected Type::GlobalWildcardReference, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_global_wildcard_ends_with() {
+        match do_parse("*_SUFFIX") {
+            Ok(Type::GlobalWildcardReference(g)) => match g.selector {
+                GlobalWildcardSelector::EndsWith(_, identifier) => {
+                    assert_eq!(identifier.value, "_SUFFIX");
+                }
+                other @ GlobalWildcardSelector::StartsWith(..) => {
+                    panic!("Expected EndsWith selector, got {other:?}")
+                }
+            },
+            other => panic!("Expected Type::GlobalWildcardReference, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_global_wildcard_in_int_mask_of() {
+        let input = "int-mask-of<FILTER_FLAG_*>";
+        match do_parse(input) {
+            Ok(Type::IntMaskOf(mask)) => {
+                assert!(matches!(mask.parameter.entry.inner, Type::GlobalWildcardReference(_)));
+            }
+            other => panic!("Expected Type::IntMaskOf, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_int_mask_of_class_wildcard_regression() {
+        let input = "int-mask-of<Ulid::FORMAT_*>";
+        match do_parse(input) {
+            Ok(Type::IntMaskOf(mask)) => match &mask.parameter.entry.inner {
+                Type::MemberReference(r) => {
+                    assert!(matches!(r.member, MemberReferenceSelector::StartsWith(_, _)));
+                }
+                other => panic!("Expected MemberReference, got {other:?}"),
+            },
+            other => panic!("Expected Type::IntMaskOf, got: {other:?}"),
+        }
     }
 }

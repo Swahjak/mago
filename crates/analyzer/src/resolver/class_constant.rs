@@ -32,6 +32,7 @@ use crate::resolver::class_name::ResolvedClassname;
 use crate::resolver::class_name::resolve_classnames_from_expression;
 use crate::resolver::selector::ResolvedSelector;
 use crate::resolver::selector::resolve_constant_selector;
+use crate::utils::names::display_class_like_name;
 
 /// Represents a successfully resolved class constant or enum case.
 #[derive(Debug)]
@@ -151,7 +152,7 @@ pub fn resolve_class_constants<'ctx, 'ast, 'arena>(
 /// Specific handler for the `::class` magic constant.
 fn handle_class_magic_constant<'ctx, 'ast, 'arena>(
     context: &mut Context<'ctx, 'arena>,
-    block_context: &mut BlockContext<'ctx>,
+    block_context: &BlockContext<'ctx>,
     artifacts: &mut AnalysisArtifacts,
     class_resolution: &ResolvedClassname,
     class_expr: &'ast Expression<'arena>,
@@ -173,6 +174,12 @@ fn handle_class_magic_constant<'ctx, 'ast, 'arena>(
 
     let class_string = match class_resolution.fqcn {
         Some(fq_class_id) => {
+            if matches!(class_resolution.origin, ResolutionOrigin::Named { is_self: false, is_parent: false })
+                && context.codebase.get_class_like(&fq_class_id).is_none()
+            {
+                report_non_existent_class(context, fq_class_id, class_expr.span());
+            }
+
             artifacts.symbol_references.add_reference_to_symbol(&block_context.scope, fq_class_id, false);
 
             if class_resolution.is_final
@@ -350,6 +357,8 @@ fn find_constant_in_class<'ctx>(
 
 /// Reports an error for a class-like that cannot be found in the codebase.
 fn report_non_existent_class(context: &mut Context<'_, '_>, classname: Atom, class_span: Span) {
+    let classname = display_class_like_name(context, classname);
+
     context.collector.report_with_code(
         IssueCode::NonExistentClassLike,
         Issue::error(format!("Class, interface, enum, or trait `{classname}` not found."))

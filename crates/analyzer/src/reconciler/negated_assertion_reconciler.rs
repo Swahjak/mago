@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use mago_atom::Atom;
 use mago_atom::AtomSet;
@@ -6,16 +7,20 @@ use mago_codex::assertion::Assertion;
 use mago_codex::consts::MAX_ENUM_CASES_FOR_ANALYSIS;
 
 use mago_codex::ttype::atomic::TAtomic;
+use mago_codex::ttype::atomic::array::TArray;
+use mago_codex::ttype::atomic::array::keyed::TKeyedArray;
 use mago_codex::ttype::atomic::object::TObject;
 use mago_codex::ttype::atomic::object::r#enum::TEnum;
 use mago_codex::ttype::atomic::object::named::TNamedObject;
 use mago_codex::ttype::atomic::scalar::TScalar;
+use mago_codex::ttype::atomic::scalar::bool::TBool;
 use mago_codex::ttype::atomic::scalar::string::TString;
 use mago_codex::ttype::combiner;
 use mago_codex::ttype::combiner::CombinerOptions;
 use mago_codex::ttype::comparator::ComparisonResult;
 use mago_codex::ttype::comparator::atomic_comparator;
 use mago_codex::ttype::comparator::union_comparator;
+use mago_codex::ttype::get_arraykey;
 use mago_codex::ttype::get_never;
 use mago_codex::ttype::get_placeholder;
 use mago_codex::ttype::union::TUnion;
@@ -94,6 +99,8 @@ pub(crate) fn reconcile(
             )
         {
             trigger_issue_for_impossible(context, old_var_type_atom, key, assertion, false, negated, pos);
+        } else {
+            // equality assertion with no key/span or types still possibly identical; no impossibility to report
         }
     }
 
@@ -238,6 +245,22 @@ fn subtract_complex_type(
                 *can_be_disjunct = true;
                 acceptable_types.push(existing_atomic);
             }
+            (TAtomic::Iterable(iterable), TAtomic::Object(TObject::Named(assertion_named)))
+                if assertion_named.name.eq_ignore_ascii_case("Traversable") =>
+            {
+                *can_be_disjunct = true;
+
+                let key_type = if iterable.key_type.is_always_array_key(false) {
+                    Arc::clone(&iterable.key_type)
+                } else {
+                    Arc::new(get_arraykey())
+                };
+
+                acceptable_types.push(TAtomic::Array(TArray::Keyed(TKeyedArray::new_with_parameters(
+                    key_type,
+                    Arc::clone(&iterable.value_type),
+                ))));
+            }
             _ => {
                 acceptable_types.push(existing_atomic);
             }
@@ -248,6 +271,8 @@ fn subtract_complex_type(
         acceptable_types.push(TAtomic::Never);
     } else if acceptable_types.len() > 1 && *can_be_disjunct {
         acceptable_types = combiner::combine(acceptable_types, context.codebase, CombinerOptions::default());
+    } else {
+        // single acceptable type or no disjunction needed; keep the list as-is
     }
 
     existing_var_type.types = Cow::Owned(acceptable_types);
@@ -296,11 +321,21 @@ fn handle_literal_negated_equality(
         return get_never();
     };
 
+    let assertion_is_falsy = matches!(assertion, Assertion::IsNotEqual(_)) && assertion_type.is_falsy();
+
     let mut did_remove_type = false;
     let mut new_var_type = existing_var_type.clone();
     let mut acceptable_types = vec![];
 
     for existing_atomic_type in new_var_type.types.to_mut().drain(..) {
+        if assertion_is_falsy
+            && existing_atomic_type.is_falsy()
+            && falsy_atomics_loose_equal(assertion_type, &existing_atomic_type)
+        {
+            did_remove_type = true;
+            continue;
+        }
+
         match &existing_atomic_type {
             TAtomic::Scalar(TScalar::String(existing_string)) => {
                 let existing_literal_string = existing_atomic_type.get_literal_string_value();
@@ -418,4 +453,44 @@ fn handle_literal_negated_equality(
 
     new_var_type.types = Cow::Owned(acceptable_types);
     new_var_type
+}
+
+/// Returns `true` when two PHP-falsy atomics are equal under PHP 8's loose `==` semantics.
+///
+/// Both inputs must already satisfy [`TAtomic::is_falsy`]. `null` and `false` are loose-equal to
+/// every other falsy value. Numeric falsies (`0`, `0.0`) loose-equal each other but not `""`;
+/// the empty string falsy class doesn't loose-equal numeric falsies. Other falsy shapes (empty
+/// arrays, closed resources, …) only loose-equal `null`/`false`.
+const fn falsy_atomics_loose_equal(left: &TAtomic, right: &TAtomic) -> bool {
+    if is_null_or_literal_false(left) || is_null_or_literal_false(right) {
+        return true;
+    }
+
+    match (falsy_class(left), falsy_class(right)) {
+        (Some(left_class), Some(right_class)) => {
+            matches!(
+                (left_class, right_class),
+                (FalsyClass::Numeric, FalsyClass::Numeric) | (FalsyClass::EmptyString, FalsyClass::EmptyString)
+            )
+        }
+        _ => false,
+    }
+}
+
+const fn is_null_or_literal_false(atomic: &TAtomic) -> bool {
+    matches!(atomic, TAtomic::Null) || matches!(atomic, TAtomic::Scalar(TScalar::Bool(TBool { value: Some(false) })))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FalsyClass {
+    Numeric,
+    EmptyString,
+}
+
+const fn falsy_class(atomic: &TAtomic) -> Option<FalsyClass> {
+    match atomic {
+        TAtomic::Scalar(TScalar::Integer(_) | TScalar::Float(_)) => Some(FalsyClass::Numeric),
+        TAtomic::Scalar(TScalar::String(_)) => Some(FalsyClass::EmptyString),
+        _ => None,
+    }
 }

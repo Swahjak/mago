@@ -206,8 +206,13 @@ function date_timestamp_get(DateTimeInterface $object): int {}
 
 function timezone_open(string $timezone): DateTimeZone|false {}
 
+/** @return non-empty-string */
 function timezone_name_get(DateTimeZone $object): string {}
 
+/**
+ * @param non-empty-string $abbr
+ * @return non-empty-string|false
+ */
 function timezone_name_from_abbr(string $abbr, int $utcOffset = -1, int $isDST = -1): string|false {}
 
 function timezone_offset_get(DateTimeZone $object, DateTimeInterface $datetime): int {}
@@ -318,7 +323,7 @@ interface DateTimeInterface
 
     public function format(string $format): string;
 
-    public function getTimezone(): DateTimeZone|false;
+    public function getTimezone(): DateTimeZone;
 
     public function getOffset(): int;
 
@@ -361,7 +366,12 @@ class DateTime implements DateTimeInterface
     public static function createFromTimestamp(int|float $timestamp): static {}
 
     /**
-     * @return array<string, int|array>|false
+     * @return array{
+     *     warning_count: non-negative-int,
+     *     warnings: array<non-negative-int, non-empty-string>,
+     *     error_count: non-negative-int,
+     *     errors: array<non-negative-int, non-empty-string>,
+     * }|false
      */
     public static function getLastErrors(): array|false {}
 
@@ -373,7 +383,7 @@ class DateTime implements DateTimeInterface
 
     public function sub(DateInterval $interval): DateTime {}
 
-    public function getTimezone(): DateTimeZone|false {}
+    public function getTimezone(): DateTimeZone {}
 
     public function setTimezone(DateTimeZone $timezone): DateTime {}
 
@@ -422,7 +432,12 @@ class DateTimeImmutable implements DateTimeInterface
     public static function createFromTimestamp(int|float $timestamp): static {}
 
     /**
-     * @return array<string, int|array>|false
+     * @return array{
+     *     warning_count: non-negative-int,
+     *     warnings: array<non-negative-int, non-empty-string>,
+     *     error_count: non-negative-int,
+     *     errors: array<non-negative-int, non-empty-string>,
+     * }|false
      */
     public static function getLastErrors(): array|false {}
 
@@ -440,7 +455,7 @@ class DateTimeImmutable implements DateTimeInterface
      *
      * @psalm-ignore-falsable-return
      */
-    public function getTimezone(): DateTimeZone|false {}
+    public function getTimezone(): DateTimeZone {}
 
     /**
      * @psalm-mutation-free
@@ -552,26 +567,29 @@ class DateTimeImmutable implements DateTimeInterface
 
 class DateTimeZone
 {
-    public const int AFRICA = UNKNOWN;
-    public const int AMERICA = UNKNOWN;
-    public const int ANTARCTICA = UNKNOWN;
-    public const int ARCTIC = UNKNOWN;
-    public const int ASIA = UNKNOWN;
-    public const int ATLANTIC = UNKNOWN;
-    public const int AUSTRALIA = UNKNOWN;
-    public const int EUROPE = UNKNOWN;
-    public const int INDIAN = UNKNOWN;
-    public const int PACIFIC = UNKNOWN;
-    public const int UTC = UNKNOWN;
-    public const int ALL = UNKNOWN;
-    public const int ALL_WITH_BC = UNKNOWN;
-    public const int PER_COUNTRY = UNKNOWN;
+    public const int AFRICA = 1;
+    public const int AMERICA = 2;
+    public const int ANTARCTICA = 4;
+    public const int ARCTIC = 8;
+    public const int ASIA = 16;
+    public const int ATLANTIC = 32;
+    public const int AUSTRALIA = 64;
+    public const int EUROPE = 128;
+    public const int INDIAN = 256;
+    public const int PACIFIC = 512;
+    public const int UTC = 1024;
+    public const int ALL = 2047;
+    public const int ALL_WITH_BC = 4095;
+    public const int PER_COUNTRY = 4096;
 
     /**
      * @psalm-external-mutation-free
+     *
+     * @throws DateInvalidTimeZoneException
      */
     public function __construct(string $timezone) {}
 
+    /** @return non-empty-string */
     public function getName(): string {}
 
     /**
@@ -580,22 +598,39 @@ class DateTimeZone
     public function getOffset(DateTimeInterface $datetime): int {}
 
     /**
-     * @return array<int, array>|false
+     * @return list<array{
+     *     ts: int,
+     *     time: non-empty-string,
+     *     offset: int,
+     *     isdst: bool,
+     *     abbr: string,
+     * }>|false
      */
     public function getTransitions(int $timestampBegin = PHP_INT_MIN, int $timestampEnd = 2147483647): array|false {}
 
     /**
-     * @return array<string, float|string>|false
+     * @return array{
+     *     country_code: non-empty-string,
+     *     latitude: float,
+     *     longitude: float,
+     *     comments: string,
+     * }|false
      */
     public function getLocation(): array|false {}
 
     /**
-     * @return array<string, array>
+     * @return array<string, list<array{
+     *     dst: bool,
+     *     offset: int,
+     *     timezone_id: non-empty-string,
+     * }>>
      */
     public static function listAbbreviations(): array {}
 
     /**
-     * @return array<int, string>
+     * @param non-empty-string|null $countryCode
+     *
+     * @return list<non-empty-string>
      */
     public static function listIdentifiers(
         int $timezoneGroup = DateTimeZone::ALL,

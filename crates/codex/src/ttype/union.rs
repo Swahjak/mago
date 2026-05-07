@@ -29,8 +29,10 @@ use crate::ttype::atomic::populate_atomic_type;
 use crate::ttype::atomic::scalar::TScalar;
 use crate::ttype::atomic::scalar::bool::TBool;
 use crate::ttype::atomic::scalar::class_like_string::TClassLikeString;
+use crate::ttype::atomic::scalar::float::TFloat;
 use crate::ttype::atomic::scalar::int::TInteger;
 use crate::ttype::atomic::scalar::string::TString;
+use crate::ttype::atomic::scalar::string::TStringCasing;
 use crate::ttype::atomic::scalar::string::TStringLiteral;
 use crate::ttype::flags::UnionFlags;
 use crate::ttype::get_arraykey;
@@ -66,6 +68,11 @@ impl TUnion {
     /// This preserves the original logic for cleaning up dynamically created unions,
     /// such as removing redundant `never` types.
     ///
+    /// Atoms are additionally sorted into canonical order so that two unions
+    /// built from the same set of atoms compare equal via the ordered
+    /// slice-equality fast path in [`PartialEq::eq`], without triggering the
+    /// fallback O(N^2) subset check.
+    ///
     /// # Panics
     ///
     /// In debug builds, panics if:
@@ -94,6 +101,10 @@ impl TUnion {
         // which were removed, ensure the final union is `never`.
         if types.is_empty() {
             types.push(TAtomic::Never);
+        }
+
+        if types.len() > 1 {
+            types.sort_unstable();
         }
 
         Self::new(Cow::Owned(types))
@@ -236,17 +247,20 @@ impl TUnion {
     /// Creates a new `TUnion` with the same properties as the original, but with a new set of types.
     #[must_use]
     pub fn clone_with_types(&self, types: Vec<TAtomic>) -> TUnion {
-        TUnion { types: Cow::Owned(types), flags: self.flags }
+        TUnion { types: Cow::Owned(ensure_non_empty_types(types)), flags: self.flags }
     }
 
     #[must_use]
     pub fn to_non_nullable(&self) -> TUnion {
-        TUnion { types: Cow::Owned(self.get_non_nullable_types()), flags: self.flags & !UnionFlags::NULLSAFE_NULL }
+        TUnion {
+            types: Cow::Owned(ensure_non_empty_types(self.get_non_nullable_types())),
+            flags: self.flags & !UnionFlags::NULLSAFE_NULL,
+        }
     }
 
     #[must_use]
     pub fn to_truthy(&self) -> TUnion {
-        TUnion { types: Cow::Owned(self.get_truthy_types()), flags: self.flags }
+        TUnion { types: Cow::Owned(ensure_non_empty_types(self.get_truthy_types())), flags: self.flags }
     }
 
     #[must_use]
@@ -288,6 +302,32 @@ impl TUnion {
                 }
             })
             .collect()
+    }
+
+    /// Recursively replaces every narrowed scalar atom in this union with its
+    /// general form: any string narrowing -> `string`, any integer narrowing
+    /// (literal, range, non-negative-int, ...) -> `int`, any float narrowing
+    /// -> `float`, `true`/`false` -> `bool`.
+    ///
+    /// Descends into nested type holders (array elements, object type
+    /// parameters, iterable key/value, generic parameter constraints,
+    /// conditional branches, intersection types, ...) so a narrowing nested
+    /// arbitrarily deep in a callee-mutable structure is also widened.
+    pub fn widen_scalars(&mut self) {
+        for atomic in self.types.to_mut() {
+            widen_atomic_scalars(atomic);
+        }
+    }
+
+    /// Recursively replaces only *literal* scalar atoms in this union with
+    /// their general form: literal strings -> `string`, literal ints -> `int`,
+    /// literal floats -> `float`, `true`/`false` -> `bool`. Unlike
+    /// [`Self::widen_scalars`], user-declared narrowings such as
+    /// `non-negative-int`, `non-empty-string`, or `int<1, max>` are preserved.
+    pub fn widen_literals(&mut self) {
+        for atomic in self.types.to_mut() {
+            widen_atomic_literals(atomic);
+        }
     }
 
     /// Adds `null` to the union type, making it nullable.
@@ -523,17 +563,15 @@ impl TUnion {
     pub fn effective_int_or_float(&self) -> Option<bool> {
         let mut result: Option<bool> = None;
         for atomic in self.types.as_ref() {
-            match atomic.effective_int_or_float() {
-                Some(is_int) => {
-                    if let Some(prev) = result {
-                        if prev != is_int {
-                            return None;
-                        }
-                    } else {
-                        result = Some(is_int);
+            {
+                let is_int = atomic.effective_int_or_float()?;
+                if let Some(prev) = result {
+                    if prev != is_int {
+                        return None;
                     }
+                } else {
+                    result = Some(is_int);
                 }
-                None => return None,
             }
         }
 
@@ -1442,6 +1480,16 @@ impl PartialEq for TUnion {
     }
 }
 
+/// Coerces an atomic Vec to be non-empty by inserting `Never` when empty.
+#[inline]
+fn ensure_non_empty_types(mut types: Vec<TAtomic>) -> Vec<TAtomic> {
+    if types.is_empty() {
+        types.push(TAtomic::Never);
+    }
+
+    types
+}
+
 pub fn populate_union_type(
     unpopulated_union: &mut TUnion,
     codebase_symbols: &Symbols,
@@ -1476,5 +1524,307 @@ pub fn populate_union_type(
                 populate_atomic_type(unpopulated_atomic, codebase_symbols, reference_source, symbol_references, force);
             }
         }
+    }
+}
+
+/// Recursively generalises every narrowed scalar (string, int, float, bool) to
+/// its general form within the given atomic type.  Descends into every
+/// nested `TUnion` so a narrowing buried in an array element, object type
+/// parameter, generic constraint, conditional branch, etc., is also widened.
+fn widen_atomic_scalars(atomic: &mut TAtomic) {
+    match atomic {
+        TAtomic::Scalar(scalar) => widen_scalar(scalar),
+        TAtomic::Array(array) => match array {
+            TArray::List(list) => {
+                widen_arc_union_scalars(&mut list.element_type);
+                if let Some(known) = list.known_elements.as_mut() {
+                    for (_, ty) in known.values_mut() {
+                        ty.widen_scalars();
+                    }
+                }
+            }
+            TArray::Keyed(keyed) => {
+                if let Some((key, value)) = keyed.parameters.as_mut() {
+                    widen_arc_union_scalars(key);
+                    widen_arc_union_scalars(value);
+                }
+                if let Some(known) = keyed.known_items.as_mut() {
+                    for (_, ty) in known.values_mut() {
+                        ty.widen_scalars();
+                    }
+                }
+            }
+        },
+        TAtomic::Iterable(iterable) => {
+            widen_arc_union_scalars(&mut iterable.key_type);
+            widen_arc_union_scalars(&mut iterable.value_type);
+            if let Some(intersections) = iterable.intersection_types.as_mut() {
+                for inner in intersections.iter_mut() {
+                    widen_atomic_scalars(inner);
+                }
+            }
+        }
+        TAtomic::Object(TObject::Named(named)) => {
+            if let Some(params) = named.type_parameters.as_mut() {
+                for ty in params.iter_mut() {
+                    ty.widen_scalars();
+                }
+            }
+        }
+        TAtomic::Object(TObject::WithProperties(with_props)) => {
+            for (_, ty) in with_props.known_properties.values_mut() {
+                ty.widen_scalars();
+            }
+        }
+        TAtomic::GenericParameter(generic) => {
+            widen_arc_union_scalars(&mut generic.constraint);
+            if let Some(intersections) = generic.intersection_types.as_mut() {
+                for inner in intersections.iter_mut() {
+                    widen_atomic_scalars(inner);
+                }
+            }
+        }
+        TAtomic::Conditional(conditional) => {
+            widen_arc_union_scalars(&mut conditional.subject);
+            widen_arc_union_scalars(&mut conditional.target);
+            widen_arc_union_scalars(&mut conditional.then);
+            widen_arc_union_scalars(&mut conditional.otherwise);
+        }
+        _ => {}
+    }
+}
+
+#[inline]
+fn widen_arc_union_scalars(union: &mut Arc<TUnion>) {
+    if union_has_widenable_nested_scalar(union) {
+        Arc::make_mut(union).widen_scalars();
+    }
+}
+
+fn widen_scalar(scalar: &mut TScalar) {
+    match scalar {
+        TScalar::String(string) if !is_string_fully_general(string) => {
+            *string = TString::general();
+        }
+        TScalar::Integer(integer) if !matches!(integer, TInteger::Unspecified) => {
+            *integer = TInteger::Unspecified;
+        }
+        TScalar::Float(float) if !matches!(float, TFloat::Float) => {
+            *float = TFloat::Float;
+        }
+        TScalar::Bool(b) if !b.is_general() => {
+            *b = TBool::general();
+        }
+        _ => {}
+    }
+}
+
+#[inline]
+fn is_string_fully_general(string: &TString) -> bool {
+    string.literal.is_none()
+        && !string.is_numeric
+        && !string.is_truthy
+        && !string.is_non_empty
+        && !string.is_callable
+        && matches!(string.casing, TStringCasing::Unspecified)
+}
+
+/// Like `widen_atomic_scalars`, but only widens *literal* scalars (e.g.
+/// `int(42)`, `'foo'`, `true`/`false`) - preserves user-declared narrowings
+/// such as `non-negative-int`, `non-empty-string`, or `int<1, max>`. Used when
+/// the surrounding context (e.g. `@param-out` on a generic function) commits
+/// to maintaining narrow types through the call.
+fn widen_atomic_literals(atomic: &mut TAtomic) {
+    match atomic {
+        TAtomic::Scalar(scalar) => widen_scalar_literal(scalar),
+        TAtomic::Array(array) => match array {
+            TArray::List(list) => {
+                widen_arc_union_literals(&mut list.element_type);
+                if let Some(known) = list.known_elements.as_mut() {
+                    for (_, ty) in known.values_mut() {
+                        ty.widen_literals();
+                    }
+                }
+            }
+            TArray::Keyed(keyed) => {
+                if let Some((key, value)) = keyed.parameters.as_mut() {
+                    widen_arc_union_literals(key);
+                    widen_arc_union_literals(value);
+                }
+                if let Some(known) = keyed.known_items.as_mut() {
+                    for (_, ty) in known.values_mut() {
+                        ty.widen_literals();
+                    }
+                }
+            }
+        },
+        TAtomic::Iterable(iterable) => {
+            widen_arc_union_literals(&mut iterable.key_type);
+            widen_arc_union_literals(&mut iterable.value_type);
+            if let Some(intersections) = iterable.intersection_types.as_mut() {
+                for inner in intersections.iter_mut() {
+                    widen_atomic_literals(inner);
+                }
+            }
+        }
+        TAtomic::Object(TObject::Named(named)) => {
+            if let Some(params) = named.type_parameters.as_mut() {
+                for ty in params.iter_mut() {
+                    ty.widen_literals();
+                }
+            }
+        }
+        TAtomic::Object(TObject::WithProperties(with_props)) => {
+            for (_, ty) in with_props.known_properties.values_mut() {
+                ty.widen_literals();
+            }
+        }
+        TAtomic::GenericParameter(generic) => {
+            widen_arc_union_literals(&mut generic.constraint);
+            if let Some(intersections) = generic.intersection_types.as_mut() {
+                for inner in intersections.iter_mut() {
+                    widen_atomic_literals(inner);
+                }
+            }
+        }
+        TAtomic::Conditional(conditional) => {
+            widen_arc_union_literals(&mut conditional.subject);
+            widen_arc_union_literals(&mut conditional.target);
+            widen_arc_union_literals(&mut conditional.then);
+            widen_arc_union_literals(&mut conditional.otherwise);
+        }
+        _ => {}
+    }
+}
+
+#[inline]
+fn widen_arc_union_literals(union: &mut Arc<TUnion>) {
+    if union_has_widenable_nested_literal(union) {
+        Arc::make_mut(union).widen_literals();
+    }
+}
+
+fn widen_scalar_literal(scalar: &mut TScalar) {
+    match scalar {
+        TScalar::String(string) if string.literal.is_some() => {
+            *string = string.without_literal();
+        }
+        TScalar::Integer(integer) if matches!(integer, TInteger::Literal(_) | TInteger::UnspecifiedLiteral) => {
+            *integer = TInteger::Unspecified;
+        }
+        TScalar::Float(float) if matches!(float, TFloat::Literal(_) | TFloat::UnspecifiedLiteral) => {
+            *float = TFloat::Float;
+        }
+        TScalar::Bool(b) if !b.is_general() => {
+            *b = TBool::general();
+        }
+        _ => {}
+    }
+}
+
+fn union_has_widenable_nested_literal(union: &TUnion) -> bool {
+    union.types.iter().any(atomic_has_widenable_literal)
+}
+
+fn atomic_has_widenable_literal(atomic: &TAtomic) -> bool {
+    match atomic {
+        TAtomic::Scalar(TScalar::String(s)) => s.literal.is_some(),
+        TAtomic::Scalar(TScalar::Integer(i)) => matches!(i, TInteger::Literal(_) | TInteger::UnspecifiedLiteral),
+        TAtomic::Scalar(TScalar::Float(f)) => matches!(f, TFloat::Literal(_) | TFloat::UnspecifiedLiteral),
+        TAtomic::Scalar(TScalar::Bool(b)) => !b.is_general(),
+        TAtomic::Array(TArray::List(list)) => {
+            union_has_widenable_nested_literal(&list.element_type)
+                || list
+                    .known_elements
+                    .as_ref()
+                    .is_some_and(|m| m.values().any(|(_, t)| union_has_widenable_nested_literal(t)))
+        }
+        TAtomic::Array(TArray::Keyed(keyed)) => {
+            keyed
+                .parameters
+                .as_ref()
+                .is_some_and(|(k, v)| union_has_widenable_nested_literal(k) || union_has_widenable_nested_literal(v))
+                || keyed
+                    .known_items
+                    .as_ref()
+                    .is_some_and(|m| m.values().any(|(_, t)| union_has_widenable_nested_literal(t)))
+        }
+        TAtomic::Iterable(iterable) => {
+            union_has_widenable_nested_literal(&iterable.key_type)
+                || union_has_widenable_nested_literal(&iterable.value_type)
+                || iterable.intersection_types.as_ref().is_some_and(|v| v.iter().any(atomic_has_widenable_literal))
+        }
+        TAtomic::Object(TObject::Named(named)) => {
+            named.type_parameters.as_ref().is_some_and(|p| p.iter().any(union_has_widenable_nested_literal))
+        }
+        TAtomic::Object(TObject::WithProperties(with_props)) => {
+            with_props.known_properties.values().any(|(_, t)| union_has_widenable_nested_literal(t))
+        }
+        TAtomic::GenericParameter(generic) => {
+            union_has_widenable_nested_literal(&generic.constraint)
+                || generic.intersection_types.as_ref().is_some_and(|v| v.iter().any(atomic_has_widenable_literal))
+        }
+        TAtomic::Conditional(conditional) => {
+            union_has_widenable_nested_literal(&conditional.subject)
+                || union_has_widenable_nested_literal(&conditional.target)
+                || union_has_widenable_nested_literal(&conditional.then)
+                || union_has_widenable_nested_literal(&conditional.otherwise)
+        }
+        _ => false,
+    }
+}
+
+/// Returns `true` if any atom in the union holds (somewhere recursively) a
+/// type that `widen_atomic_scalars` would mutate.  Used as a cheap pre-check
+/// to avoid `Arc::make_mut` on shared unions that don't need widening.
+fn union_has_widenable_nested_scalar(union: &TUnion) -> bool {
+    union.types.iter().any(atomic_has_widenable_scalar)
+}
+
+fn atomic_has_widenable_scalar(atomic: &TAtomic) -> bool {
+    match atomic {
+        TAtomic::Scalar(TScalar::String(s)) => !is_string_fully_general(s),
+        TAtomic::Scalar(TScalar::Integer(i)) => !matches!(i, TInteger::Unspecified),
+        TAtomic::Scalar(TScalar::Float(f)) => !matches!(f, TFloat::Float),
+        TAtomic::Scalar(TScalar::Bool(b)) => !b.is_general(),
+        TAtomic::Array(TArray::List(list)) => {
+            union_has_widenable_nested_scalar(&list.element_type)
+                || list
+                    .known_elements
+                    .as_ref()
+                    .is_some_and(|m| m.values().any(|(_, t)| union_has_widenable_nested_scalar(t)))
+        }
+        TAtomic::Array(TArray::Keyed(keyed)) => {
+            keyed
+                .parameters
+                .as_ref()
+                .is_some_and(|(k, v)| union_has_widenable_nested_scalar(k) || union_has_widenable_nested_scalar(v))
+                || keyed
+                    .known_items
+                    .as_ref()
+                    .is_some_and(|m| m.values().any(|(_, t)| union_has_widenable_nested_scalar(t)))
+        }
+        TAtomic::Iterable(iterable) => {
+            union_has_widenable_nested_scalar(&iterable.key_type)
+                || union_has_widenable_nested_scalar(&iterable.value_type)
+                || iterable.intersection_types.as_ref().is_some_and(|v| v.iter().any(atomic_has_widenable_scalar))
+        }
+        TAtomic::Object(TObject::Named(named)) => {
+            named.type_parameters.as_ref().is_some_and(|p| p.iter().any(union_has_widenable_nested_scalar))
+        }
+        TAtomic::Object(TObject::WithProperties(with_props)) => {
+            with_props.known_properties.values().any(|(_, t)| union_has_widenable_nested_scalar(t))
+        }
+        TAtomic::GenericParameter(generic) => {
+            union_has_widenable_nested_scalar(&generic.constraint)
+                || generic.intersection_types.as_ref().is_some_and(|v| v.iter().any(atomic_has_widenable_scalar))
+        }
+        TAtomic::Conditional(conditional) => {
+            union_has_widenable_nested_scalar(&conditional.subject)
+                || union_has_widenable_nested_scalar(&conditional.target)
+                || union_has_widenable_nested_scalar(&conditional.then)
+                || union_has_widenable_nested_scalar(&conditional.otherwise)
+        }
+        _ => false,
     }
 }

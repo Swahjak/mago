@@ -1,3 +1,4 @@
+use bumpalo::Bump;
 use mago_atom::Atom;
 use mago_atom::atom;
 use mago_names::scope::NamespaceScope;
@@ -5,16 +6,7 @@ use mago_reporting::Annotation;
 use mago_reporting::Issue;
 use mago_span::HasSpan;
 use mago_span::Span;
-use mago_syntax::ast::ClassLikeMemberSelector;
-use mago_syntax::ast::Expression;
-use mago_syntax::ast::FunctionLikeParameter;
-use mago_syntax::ast::NullSafePropertyAccess;
-use mago_syntax::ast::Property;
-use mago_syntax::ast::PropertyAccess;
-use mago_syntax::ast::PropertyHook;
-use mago_syntax::ast::PropertyHookBody;
-use mago_syntax::ast::PropertyItem;
-use mago_syntax::ast::Variable;
+use mago_syntax::ast::*;
 use mago_syntax::walker::MutWalker;
 
 use crate::issue::ScanningIssueKind;
@@ -52,11 +44,7 @@ pub fn scan_promoted_property<'arena>(
     let name_span = parameter_metadata.get_name_span();
 
     let mut flags = MetadataFlags::PROMOTED_PROPERTY;
-    if context.file.file_type.is_host() {
-        flags |= MetadataFlags::USER_DEFINED;
-    } else if context.file.file_type.is_builtin() {
-        flags |= MetadataFlags::BUILTIN;
-    }
+    flags |= MetadataFlags::origin_flags(context.file.file_type);
 
     if parameter_metadata.flags.has_default() {
         flags |= MetadataFlags::HAS_DEFAULT;
@@ -125,6 +113,7 @@ pub fn scan_promoted_property<'arena>(
     match PropertyDocblockComment::create(context, parameter) {
         Ok(Some(docblock)) => {
             update_property_metadata_from_docblock(
+                context.arena,
                 &mut property_metadata,
                 &docblock,
                 classname,
@@ -181,40 +170,35 @@ pub fn scan_properties<'arena>(
         }
     };
 
-    let mut flags = MetadataFlags::empty();
-    if context.file.file_type.is_host() {
-        flags |= MetadataFlags::USER_DEFINED;
-    } else if context.file.file_type.is_builtin() {
-        flags |= MetadataFlags::BUILTIN;
-    }
+    let mut flags = MetadataFlags::origin_flags(context.file.file_type);
 
     match property {
         Property::Plain(plain_property) => plain_property
             .items
             .iter()
             .map(|item| {
-                let (name, name_span, has_default, default_type) = scan_property_item(item, context, scope);
+                let (name, name_span, has_default, default_type) = scan_property_item(item, classname, context, scope);
 
-                let mut flags = flags;
+                let mut item_flags = flags;
 
                 if has_default {
-                    flags |= MetadataFlags::HAS_DEFAULT;
+                    item_flags |= MetadataFlags::HAS_DEFAULT;
                 }
 
                 if plain_property.modifiers.contains_readonly() {
-                    flags |= MetadataFlags::READONLY;
+                    item_flags |= MetadataFlags::READONLY;
                 }
 
                 if plain_property.modifiers.contains_abstract() {
-                    flags |= MetadataFlags::ABSTRACT;
+                    item_flags |= MetadataFlags::ABSTRACT;
                 }
 
                 if plain_property.modifiers.contains_static() {
-                    flags |= MetadataFlags::STATIC;
+                    item_flags |= MetadataFlags::STATIC;
                 }
 
                 if plain_property.modifiers.contains_final() {
-                    flags |= MetadataFlags::FINAL;
+                    item_flags |= MetadataFlags::FINAL;
                 }
 
                 let read_visibility = match plain_property.modifiers.get_first_read_visibility() {
@@ -233,7 +217,7 @@ pub fn scan_properties<'arena>(
                     }
                 };
 
-                let mut metadata = PropertyMetadata::new(name, flags);
+                let mut metadata = PropertyMetadata::new(name, item_flags);
 
                 metadata.set_name_span(Some(name_span));
                 metadata.set_default_type_metadata(default_type);
@@ -247,6 +231,7 @@ pub fn scan_properties<'arena>(
 
                 if let Some(docblock) = docblock.as_ref() {
                     update_property_metadata_from_docblock(
+                        context.arena,
                         &mut metadata,
                         docblock,
                         classname,
@@ -263,7 +248,7 @@ pub fn scan_properties<'arena>(
             .collect(),
         Property::Hooked(hooked_property) => {
             let (name, name_span, has_default, default_type) =
-                scan_property_item(&hooked_property.item, context, scope);
+                scan_property_item(&hooked_property.item, classname, context, scope);
 
             let read_visibility = match hooked_property.modifiers.get_first_read_visibility() {
                 Some(visibility) => Visibility::try_from(visibility).unwrap_or(Visibility::Public),
@@ -302,6 +287,7 @@ pub fn scan_properties<'arena>(
 
             if let Some(docblock) = docblock.as_ref() {
                 update_property_metadata_from_docblock(
+                    context.arena,
                     &mut metadata,
                     docblock,
                     classname,
@@ -381,7 +367,7 @@ fn scan_property_hook<'arena>(
                     && let Some(type_string) = &param_tag.type_string
                 {
                     let type_context = TypeResolutionContext::new();
-                    match get_type_metadata_from_type_string(type_string, None, &type_context, scope) {
+                    match get_type_metadata_from_type_string(context.arena, type_string, None, &type_context, scope) {
                         Ok(docblock_type) => {
                             let native_type = param.type_declaration_metadata.as_ref();
                             let merged = merge_type_preserving_nullability(docblock_type, native_type);
@@ -406,7 +392,8 @@ fn scan_property_hook<'arena>(
                 && is_get
             {
                 let type_context = TypeResolutionContext::new();
-                match get_type_metadata_from_type_string(return_type_string, None, &type_context, scope) {
+                match get_type_metadata_from_type_string(context.arena, return_type_string, None, &type_context, scope)
+                {
                     Ok(docblock_type) => {
                         return_type_metadata = Some(docblock_type);
                     }
@@ -485,7 +472,8 @@ fn create_implicit_value_parameter(property_metadata: &PropertyMetadata, span: S
 #[inline]
 pub fn scan_property_item<'arena>(
     property_item: &'arena PropertyItem<'arena>,
-    context: &mut Context<'_, 'arena>,
+    classname: Atom,
+    context: &Context<'_, 'arena>,
     scope: &NamespaceScope,
 ) -> (VariableIdentifier, Span, bool, Option<TypeMetadata>) {
     match property_item {
@@ -501,7 +489,7 @@ pub fn scan_property_item<'arena>(
             let name = VariableIdentifier(atom(property_concrete_item.variable.name));
             let name_span = property_concrete_item.variable.span;
             let has_default = true;
-            let default_type = infer(context, scope, property_concrete_item.value).map(|u| {
+            let default_type = infer(context, scope, property_concrete_item.value, Some(classname)).map(|u| {
                 let mut type_metadata = TypeMetadata::new(u, property_concrete_item.value.span());
                 type_metadata.inferred = true;
                 type_metadata
@@ -513,6 +501,7 @@ pub fn scan_property_item<'arena>(
 }
 
 fn update_property_metadata_from_docblock(
+    arena: &Bump,
     property_metadata: &mut PropertyMetadata,
     docblock: &PropertyDocblockComment,
     classname: Atom,
@@ -537,7 +526,7 @@ fn update_property_metadata_from_docblock(
     }
 
     if let Some(type_string) = &docblock.type_string {
-        match get_type_metadata_from_type_string(type_string, Some(classname), type_context, scope) {
+        match get_type_metadata_from_type_string(arena, type_string, Some(classname), type_context, scope) {
             Ok(property_type_metadata) => {
                 let real_type = property_metadata.type_declaration_metadata.as_ref();
                 let property_type_metadata = merge_type_preserving_nullability(property_type_metadata, real_type);
@@ -555,7 +544,10 @@ fn update_property_metadata_from_docblock(
     }
 }
 
-/// Checks if any hook references `$this->propertyName` (indicating a backed property).
+/// Checks if any hook references the property's backing store, either by
+/// explicitly writing or reading `$this->propertyName`, or implicitly via the
+/// `set => expr` shorthand desugaring (which expands to `set { $this->propertyName = expr; }`
+/// when the shorthand body does not itself contain any assignment).
 fn hooks_reference_backing_store<'arena>(
     hooks: impl IntoIterator<Item = &'arena PropertyHook<'arena>>,
     property_name: &str,
@@ -563,11 +555,12 @@ fn hooks_reference_backing_store<'arena>(
     struct Walker<'arena> {
         property_name: &'arena str,
         found: bool,
+        assignment_seen: bool,
     }
 
     impl<'arena> Walker<'arena> {
         fn new(property_name: &'arena str) -> Self {
-            Self { property_name, found: false }
+            Self { property_name, found: false, assignment_seen: false }
         }
 
         fn check_access<'ast>(
@@ -605,12 +598,25 @@ fn hooks_reference_backing_store<'arena>(
         fn walk_in_null_safe_property_access(&mut self, access: &'ast NullSafePropertyAccess<'arena>, _: &mut ()) {
             self.check_access(access.object, &access.property);
         }
+
+        fn walk_in_assignment(&mut self, _: &'ast Assignment<'arena>, _: &mut ()) {
+            self.assignment_seen = true;
+        }
     }
 
     let mut walker = Walker::new(property_name);
     for hook in hooks {
+        walker.assignment_seen = false;
+
         walker.walk_property_hook_body(&hook.body, &mut ());
         if walker.found {
+            return true;
+        }
+
+        if hook.name.value == "set"
+            && matches!(hook.body, PropertyHookBody::Concrete(PropertyHookConcreteBody::Expression(_)))
+            && !walker.assignment_seen
+        {
             return true;
         }
     }

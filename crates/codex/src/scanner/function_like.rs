@@ -1,5 +1,7 @@
+use bumpalo::Bump;
 use mago_atom::Atom;
 use mago_atom::AtomMap;
+use mago_atom::AtomSet;
 use mago_atom::ascii_lowercase_atom;
 use mago_atom::atom;
 use mago_docblock::tag::TypeString;
@@ -9,10 +11,20 @@ use mago_reporting::Issue;
 use mago_span::HasSpan;
 use mago_span::Span;
 use mago_syntax::ast::ArrowFunction;
+use mago_syntax::ast::Block;
 use mago_syntax::ast::Closure;
+use mago_syntax::ast::ForBody;
+use mago_syntax::ast::ForeachBody;
 use mago_syntax::ast::Function;
+use mago_syntax::ast::IfBody;
 use mago_syntax::ast::Method;
 use mago_syntax::ast::MethodBody;
+use mago_syntax::ast::ModifierSequenceExt;
+use mago_syntax::ast::Statement;
+use mago_syntax::ast::SwitchBody;
+use mago_syntax::ast::SwitchCase;
+use mago_syntax::ast::Variable;
+use mago_syntax::ast::WhileBody;
 use mago_syntax::utils;
 
 use crate::assertion::Assertion;
@@ -25,6 +37,8 @@ use crate::metadata::function_like::FunctionLikeMetadata;
 use crate::metadata::function_like::MethodMetadata;
 use crate::misc::GenericParent;
 use crate::scanner::Context;
+use crate::scanner::assertion_inference::infer_assertions_from_block_body;
+use crate::scanner::assertion_inference::infer_assertions_from_expression_body;
 use crate::scanner::attribute::scan_attribute_lists;
 use crate::scanner::docblock::FunctionLikeDocblockComment;
 use crate::scanner::parameter::scan_function_like_parameter;
@@ -49,12 +63,7 @@ pub fn scan_method<'arena>(
 ) -> FunctionLikeMetadata {
     let span = method.span();
 
-    let mut flags = MetadataFlags::empty();
-    if context.file.file_type.is_host() {
-        flags |= MetadataFlags::USER_DEFINED;
-    } else if context.file.file_type.is_builtin() {
-        flags |= MetadataFlags::BUILTIN;
-    }
+    let mut flags = MetadataFlags::origin_flags(context.file.file_type);
 
     if method.ampersand.is_some() {
         flags |= MetadataFlags::BY_REFERENCE;
@@ -94,7 +103,7 @@ pub fn scan_method<'arena>(
         } else {
             Visibility::Public
         },
-        where_constraints: Default::default(),
+        where_constraints: AtomMap::default(),
     };
 
     if let MethodBody::Concrete(block) = &method.body {
@@ -105,6 +114,8 @@ pub fn scan_method<'arena>(
         if utils::block_has_throws(block) {
             metadata.flags |= MetadataFlags::HAS_THROW;
         }
+
+        collect_globals_into(block, &mut metadata.globals_accessed);
     } else {
         method_metadata.is_abstract = true;
     }
@@ -112,6 +123,10 @@ pub fn scan_method<'arena>(
     metadata.method_metadata = Some(method_metadata);
 
     scan_function_like_docblock(span, functionlike_id, &mut metadata, Some(class_like_metadata.name), context, scope);
+
+    if let MethodBody::Concrete(block) = &method.body {
+        infer_assertions_from_block_body(block, &mut metadata, context.resolved_names);
+    }
 
     if metadata.attributes.iter().any(|attr| attr.name.eq_ignore_ascii_case("Deprecated")) {
         metadata.flags |= MetadataFlags::DEPRECATED;
@@ -137,12 +152,7 @@ pub fn scan_function<'arena>(
     type_resolution_context: TypeResolutionContext,
     constants: Option<&AtomMap<ConstantMetadata>>,
 ) -> FunctionLikeMetadata {
-    let mut flags = MetadataFlags::empty();
-    if context.file.file_type.is_host() {
-        flags |= MetadataFlags::USER_DEFINED;
-    } else if context.file.file_type.is_builtin() {
-        flags |= MetadataFlags::BUILTIN;
-    }
+    let mut flags = MetadataFlags::origin_flags(context.file.file_type);
 
     if utils::block_has_yield(&function.body) {
         flags |= MetadataFlags::HAS_YIELD;
@@ -159,6 +169,7 @@ pub fn scan_function<'arena>(
     let name = context.resolved_names.get(&function.name);
 
     let mut metadata = FunctionLikeMetadata::new(FunctionLikeKind::Function, function.span(), flags);
+    collect_globals_into(&function.body, &mut metadata.globals_accessed);
 
     metadata.name = Some(ascii_lowercase_atom(name));
     metadata.original_name = Some(atom(name));
@@ -184,6 +195,8 @@ pub fn scan_function<'arena>(
 
     scan_function_like_docblock(function.span(), functionlike_id, &mut metadata, classname, context, scope);
 
+    infer_assertions_from_block_body(&function.body, &mut metadata, context.resolved_names);
+
     if metadata.attributes.iter().any(|attr| attr.name.eq_ignore_ascii_case("Deprecated")) {
         metadata.flags |= MetadataFlags::DEPRECATED;
     }
@@ -202,12 +215,7 @@ pub fn scan_closure<'arena>(
 ) -> FunctionLikeMetadata {
     let span = closure.span();
 
-    let mut flags = MetadataFlags::empty();
-    if context.file.file_type.is_host() {
-        flags |= MetadataFlags::USER_DEFINED;
-    } else if context.file.file_type.is_builtin() {
-        flags |= MetadataFlags::BUILTIN;
-    }
+    let mut flags = MetadataFlags::origin_flags(context.file.file_type);
 
     if utils::block_has_yield(&closure.body) {
         flags |= MetadataFlags::HAS_YIELD;
@@ -224,6 +232,7 @@ pub fn scan_closure<'arena>(
     let mut metadata = FunctionLikeMetadata::new(FunctionLikeKind::Closure, span, flags).with_parameters(
         closure.parameter_list.parameters.iter().map(|p| scan_function_like_parameter(p, classname, context, scope)),
     );
+    collect_globals_into(&closure.body, &mut metadata.globals_accessed);
 
     metadata.attributes = scan_attribute_lists(&closure.attribute_lists, context);
     metadata.type_resolution_context =
@@ -239,6 +248,8 @@ pub fn scan_closure<'arena>(
 
     scan_function_like_docblock(span, functionlike_id, &mut metadata, classname, context, scope);
 
+    infer_assertions_from_block_body(&closure.body, &mut metadata, context.resolved_names);
+
     metadata
 }
 
@@ -253,12 +264,7 @@ pub fn scan_arrow_function<'arena>(
 ) -> FunctionLikeMetadata {
     let span = arrow_function.span();
 
-    let mut flags = MetadataFlags::empty();
-    if context.file.file_type.is_host() {
-        flags |= MetadataFlags::USER_DEFINED;
-    } else if context.file.file_type.is_builtin() {
-        flags |= MetadataFlags::BUILTIN;
-    }
+    let mut flags = MetadataFlags::origin_flags(context.file.file_type);
 
     if utils::expression_has_yield(arrow_function.expression) {
         flags |= MetadataFlags::HAS_YIELD;
@@ -294,6 +300,8 @@ pub fn scan_arrow_function<'arena>(
 
     scan_function_like_docblock(span, functionlike_id, &mut metadata, classname, context, scope);
 
+    infer_assertions_from_expression_body(arrow_function.expression, &mut metadata, context.resolved_names);
+
     metadata
 }
 
@@ -302,7 +310,7 @@ fn scan_function_like_docblock(
     functionlike_id: (Atom, Atom),
     metadata: &mut FunctionLikeMetadata,
     classname: Option<Atom>,
-    context: &mut Context<'_, '_>,
+    context: &Context<'_, '_>,
     scope: &mut NamespaceScope,
 ) {
     let docblock = match FunctionLikeDocblockComment::create(context, span, scope) {
@@ -382,7 +390,14 @@ fn scan_function_like_docblock(
     for template in &docblock.templates {
         let template_name = atom(&template.name);
         let template_as_type = if let Some(type_string) = &template.type_string {
-            match builder::get_type_from_string(&type_string.value, type_string.span, scope, &type_context, classname) {
+            match builder::get_type_from_string(
+                context.arena,
+                &type_string.value,
+                type_string.span,
+                scope,
+                &type_context,
+                classname,
+            ) {
                 Ok(tunion) => tunion,
                 Err(typing_error) => {
                     metadata.issues.push(
@@ -402,7 +417,36 @@ fn scan_function_like_docblock(
             get_mixed()
         };
 
-        let definition = GenericTemplate::new(GenericParent::FunctionLike(functionlike_id), template_as_type);
+        let template_default = if let Some(type_string) = &template.default {
+            match builder::get_type_from_string(
+                context.arena,
+                &type_string.value,
+                type_string.span,
+                scope,
+                &type_context,
+                classname,
+            ) {
+                Ok(tunion) => Some(tunion),
+                Err(typing_error) => {
+                    metadata.issues.push(
+                        Issue::error("Invalid `@template` default type string.")
+                            .with_code(ScanningIssueKind::InvalidTemplateTag)
+                            .with_annotation(
+                                Annotation::primary(typing_error.span()).with_message(typing_error.to_string()),
+                            )
+                            .with_note(typing_error.note())
+                            .with_help(typing_error.help()),
+                    );
+
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let definition = GenericTemplate::new(GenericParent::FunctionLike(functionlike_id), template_as_type)
+            .with_default(template_default);
 
         metadata.add_template_type(template_name, definition.clone());
         type_context = type_context.with_template_definition(template_name, vec![definition]);
@@ -454,7 +498,7 @@ fn scan_function_like_docblock(
             );
         }
 
-        match get_type_metadata_from_type_string(param_type_string, classname, &type_context, scope) {
+        match get_type_metadata_from_type_string(context.arena, param_type_string, classname, &type_context, scope) {
             Ok(mut provided_type) => {
                 let resulting_type = if !is_variadic
                     && parameter_metadata.flags.is_variadic()
@@ -522,7 +566,8 @@ fn scan_function_like_docblock(
             continue;
         }
 
-        match get_type_metadata_from_type_string(&param_out.type_string, classname, &type_context, scope) {
+        match get_type_metadata_from_type_string(context.arena, &param_out.type_string, classname, &type_context, scope)
+        {
             Ok(parameter_out_type) => {
                 parameter_metadata.out_type = Some(parameter_out_type);
             }
@@ -541,7 +586,13 @@ fn scan_function_like_docblock(
     }
 
     if let Some(return_type) = docblock.return_type.as_ref() {
-        match get_type_metadata_from_type_string(&return_type.type_string, classname, &type_context, scope) {
+        match get_type_metadata_from_type_string(
+            context.arena,
+            &return_type.type_string,
+            classname,
+            &type_context,
+            scope,
+        ) {
             Ok(return_type_signature) => {
                 let real_return_type = metadata.return_type_declaration_metadata.as_ref();
                 let return_type_signature = merge_type_preserving_nullability(return_type_signature, real_return_type);
@@ -593,7 +644,8 @@ fn scan_function_like_docblock(
             continue;
         }
 
-        match get_type_metadata_from_type_string(&where_tag.type_string, classname, &type_context, scope) {
+        match get_type_metadata_from_type_string(context.arena, &where_tag.type_string, classname, &type_context, scope)
+        {
             Ok(constraint_type) => {
                 let template_name = atom(&where_tag.name);
 
@@ -610,7 +662,7 @@ fn scan_function_like_docblock(
     }
 
     for thrown in docblock.throws {
-        match get_type_metadata_from_type_string(&thrown.type_string, classname, &type_context, scope) {
+        match get_type_metadata_from_type_string(context.arena, &thrown.type_string, classname, &type_context, scope) {
             Ok(thrown_type) => {
                 metadata.thrown_types.push(thrown_type);
             }
@@ -631,7 +683,8 @@ fn scan_function_like_docblock(
     for assertion_tag in docblock.assertions {
         let assertion_param_name = atom(&assertion_tag.variable.name);
 
-        let assertions = parse_assertion_string(assertion_tag.type_string, classname, &type_context, scope, metadata);
+        let assertions =
+            parse_assertion_string(context.arena, assertion_tag.type_string, classname, &type_context, scope, metadata);
 
         for assertion in assertions {
             metadata.assertions.entry(assertion_param_name).or_default().push(assertion);
@@ -641,7 +694,8 @@ fn scan_function_like_docblock(
     for assertion_tag in docblock.if_true_assertions {
         let assertion_param_name = atom(&assertion_tag.variable.name);
 
-        let assertions = parse_assertion_string(assertion_tag.type_string, classname, &type_context, scope, metadata);
+        let assertions =
+            parse_assertion_string(context.arena, assertion_tag.type_string, classname, &type_context, scope, metadata);
 
         for assertion in assertions {
             metadata.if_true_assertions.entry(assertion_param_name).or_default().push(assertion);
@@ -651,7 +705,8 @@ fn scan_function_like_docblock(
     for assertion_tag in docblock.if_false_assertions {
         let assertion_param_name = atom(&assertion_tag.variable.name);
 
-        let assertions = parse_assertion_string(assertion_tag.type_string, classname, &type_context, scope, metadata);
+        let assertions =
+            parse_assertion_string(context.arena, assertion_tag.type_string, classname, &type_context, scope, metadata);
 
         for assertion in assertions {
             metadata.if_false_assertions.entry(assertion_param_name).or_default().push(assertion);
@@ -674,6 +729,7 @@ fn scan_function_like_docblock(
 }
 
 fn parse_assertion_string(
+    arena: &Bump,
     mut type_string: TypeString,
     classname: Option<Atom>,
     type_context: &TypeResolutionContext,
@@ -719,7 +775,7 @@ fn parse_assertion_string(
         type_string.span = type_string.span.from_start(type_string.span.start + 1);
     }
 
-    match get_type_metadata_from_type_string(&type_string, classname, type_context, scope) {
+    match get_type_metadata_from_type_string(arena, &type_string, classname, type_context, scope) {
         Ok(type_metadata) => match (is_equal, is_negation) {
             (true, true) => {
                 for atomic in type_metadata.type_union.types.into_owned() {
@@ -754,4 +810,118 @@ fn parse_assertion_string(
     }
 
     assertions
+}
+
+/// Collects every variable imported via `global $x;` anywhere in `block`, without
+/// descending into nested function/closure/arrow-function definitions (those are
+/// separate scopes).
+pub fn collect_globals_into(block: &Block, globals: &mut AtomSet) {
+    for statement in &block.statements {
+        collect_globals_from_statement(statement, globals);
+    }
+}
+
+fn collect_globals_from_statement(statement: &Statement, globals: &mut AtomSet) {
+    match statement {
+        Statement::Global(global) => {
+            for variable in &global.variables {
+                if let Variable::Direct(direct) = variable {
+                    globals.insert(atom(direct.name));
+                }
+            }
+        }
+        Statement::Block(block) => collect_globals_into(block, globals),
+        Statement::Namespace(namespace) => {
+            for statement in namespace.statements() {
+                collect_globals_from_statement(statement, globals);
+            }
+        }
+        Statement::If(r#if) => match &r#if.body {
+            IfBody::Statement(body) => {
+                collect_globals_from_statement(body.statement, globals);
+                for else_if in &body.else_if_clauses {
+                    collect_globals_from_statement(else_if.statement, globals);
+                }
+                if let Some(else_clause) = &body.else_clause {
+                    collect_globals_from_statement(else_clause.statement, globals);
+                }
+            }
+            IfBody::ColonDelimited(body) => {
+                for statement in &body.statements {
+                    collect_globals_from_statement(statement, globals);
+                }
+                for else_if in &body.else_if_clauses {
+                    for statement in &else_if.statements {
+                        collect_globals_from_statement(statement, globals);
+                    }
+                }
+                if let Some(else_clause) = &body.else_clause {
+                    for statement in &else_clause.statements {
+                        collect_globals_from_statement(statement, globals);
+                    }
+                }
+            }
+        },
+        Statement::For(r#for) => match &r#for.body {
+            ForBody::Statement(statement) => collect_globals_from_statement(statement, globals),
+            ForBody::ColonDelimited(body) => {
+                for statement in &body.statements {
+                    collect_globals_from_statement(statement, globals);
+                }
+            }
+        },
+        Statement::Foreach(foreach) => match &foreach.body {
+            ForeachBody::Statement(statement) => collect_globals_from_statement(statement, globals),
+            ForeachBody::ColonDelimited(body) => {
+                for statement in &body.statements {
+                    collect_globals_from_statement(statement, globals);
+                }
+            }
+        },
+        Statement::While(r#while) => match &r#while.body {
+            WhileBody::Statement(statement) => collect_globals_from_statement(statement, globals),
+            WhileBody::ColonDelimited(body) => {
+                for statement in &body.statements {
+                    collect_globals_from_statement(statement, globals);
+                }
+            }
+        },
+        Statement::DoWhile(do_while) => collect_globals_from_statement(do_while.statement, globals),
+        Statement::Switch(switch) => {
+            let cases = match &switch.body {
+                SwitchBody::BraceDelimited(body) => &body.cases,
+                SwitchBody::ColonDelimited(body) => &body.cases,
+            };
+            for case in cases {
+                match case {
+                    SwitchCase::Expression(case) => {
+                        for statement in &case.statements {
+                            collect_globals_from_statement(statement, globals);
+                        }
+                    }
+                    SwitchCase::Default(case) => {
+                        for statement in &case.statements {
+                            collect_globals_from_statement(statement, globals);
+                        }
+                    }
+                }
+            }
+        }
+        Statement::Try(r#try) => {
+            for statement in &r#try.block.statements {
+                collect_globals_from_statement(statement, globals);
+            }
+            for catch in &r#try.catch_clauses {
+                for statement in &catch.block.statements {
+                    collect_globals_from_statement(statement, globals);
+                }
+            }
+            if let Some(finally) = &r#try.finally_clause {
+                for statement in &finally.block.statements {
+                    collect_globals_from_statement(statement, globals);
+                }
+            }
+        }
+        _ => {}
+    }
 }

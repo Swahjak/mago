@@ -58,7 +58,7 @@ use crate::utils::str_is_numeric;
 /// are accumulated for later comparison. If the number of sealed arrays exceeds
 /// this threshold, they are immediately generalized to prevent O(n²) complexity
 /// in `finalize_sealed_arrays` and excessive memory usage.
-pub const DEFAULT_ARRAY_COMBINATION_THRESHOLD: u16 = 128;
+pub const DEFAULT_ARRAY_COMBINATION_THRESHOLD: u16 = 32;
 
 /// Default maximum number of literal strings to track before generalizing to string.
 ///
@@ -133,6 +133,12 @@ impl CombinerOptions {
 }
 
 pub fn combine(types: Vec<TAtomic>, codebase: &CodebaseMetadata, options: CombinerOptions) -> Vec<TAtomic> {
+    if types.is_empty() {
+        debug_assert!(false, "combine() received an empty Vec; this is a caller bug");
+
+        return vec![TAtomic::Never];
+    }
+
     if types.len() == 1 {
         return types;
     }
@@ -189,7 +195,7 @@ pub fn combine(types: Vec<TAtomic>, codebase: &CodebaseMetadata, options: Combin
         return combination.value_types.into_values().collect();
     }
 
-    if combination.value_types.remove(&*ATOM_VOID).is_some() && combination.value_types.contains_key(&*ATOM_NULL) {
+    if combination.value_types.remove(&*ATOM_VOID).is_some() {
         combination.value_types.insert(*ATOM_NULL, TAtomic::Null);
     }
 
@@ -340,9 +346,7 @@ pub fn combine(types: Vec<TAtomic>, codebase: &CodebaseMetadata, options: Combin
     }
 
     if new_types.is_empty() {
-        if !has_never {
-            unreachable!("No types to return, but no 'never' type found in combination.");
-        }
+        debug_assert!(has_never, "combine(): empty result without a `never` atomic in the combination");
 
         return vec![TAtomic::Never];
     }
@@ -543,7 +547,7 @@ fn scrape_type_properties(
     }
 
     if combination.flags.nonnull_mixed().unwrap_or(false) {
-        if let TAtomic::Null = atomic {
+        if atomic == TAtomic::Null {
             combination.flags.set_nonnull_mixed(Some(false));
             combination.flags.insert(CombinationFlags::GENERIC_MIXED);
         }
@@ -686,24 +690,36 @@ fn scrape_type_properties(
                         }
                     }
 
-                    combination.list_array_parameter = if let Some(ref existing_type) = combination.list_array_parameter
-                    {
-                        Some(combine_union_types(existing_type, &element_type, codebase, options))
-                    } else {
-                        Some((*element_type).clone())
-                    };
+                    combination.list_array_parameter =
+                        if let Some(existing_type) = combination.list_array_parameter.as_ref() {
+                            Some(combine_union_types(existing_type, &element_type, codebase, options))
+                        } else {
+                            Some((*element_type).clone())
+                        };
                 }
-                TArray::Keyed(TKeyedArray { parameters, known_items, non_empty, .. }) => {
+                TArray::Keyed(TKeyedArray { parameters, known_items, non_empty }) => {
                     let mut had_previous_keyed_array = combination.flags.contains(CombinationFlags::HAS_KEYED_ARRAY);
+                    let sealed_budget_available = !combination.sealed_keyed_budget_exhausted
+                        && combination.sealed_arrays.len() < options.array_combination_threshold as usize;
 
-                    if had_previous_keyed_array {
+                    if !sealed_budget_available
+                        && !combination.sealed_keyed_budget_exhausted
+                        && !combination.sealed_arrays.is_empty()
+                    {
+                        flush_sealed_keyed_arrays_into_combination(combination, codebase, options);
+                        combination.sealed_keyed_budget_exhausted = true;
+                        had_previous_keyed_array = combination.flags.contains(CombinationFlags::HAS_KEYED_ARRAY);
+                    }
+
+                    if had_previous_keyed_array && sealed_budget_available {
                         let incoming_is_sealed = parameters.is_none();
                         let existing_is_sealed = combination.keyed_array_parameters.is_none();
 
                         if incoming_is_sealed && !existing_is_sealed && known_items.is_some() {
                             let known_items = widen_known_items_with_params(
                                 known_items,
-                                &combination.keyed_array_parameters,
+                                combination.keyed_array_parameters.as_ref(),
+                                &combination.keyed_array_entries,
                                 codebase,
                                 options,
                             );
@@ -719,8 +735,18 @@ fn scrape_type_properties(
 
                         if !incoming_is_sealed && existing_is_sealed && !combination.keyed_array_entries.is_empty() {
                             let mut frozen_entries = std::mem::take(&mut combination.keyed_array_entries);
-                            if let Some((ref key_param, ref value_param)) = parameters {
+                            if let Some((key_param, value_param)) = parameters.as_ref() {
                                 for (key, (_, entry_type)) in frozen_entries.iter_mut() {
+                                    // If the incoming unsealed array also declares this key as a
+                                    // known item, the caller is saying this key is exactly the
+                                    // declared type - the generic value_param catch-all covers
+                                    // *other* keys only. Widening here would turn e.g.
+                                    // `array{count: int, id: int}` + `array{count: int, ...<string, mixed>}`
+                                    // into `array{count: mixed, id: mixed}`, which is a false loss.
+                                    if known_items.as_ref().is_some_and(|ki| ki.contains_key(key)) {
+                                        continue;
+                                    }
+
                                     let key_type = TUnion::from_atomic(key.to_atomic());
 
                                     if union_comparator::can_expression_types_be_identical(
@@ -747,7 +773,13 @@ fn scrape_type_properties(
                             && existing_is_sealed
                             && !combination.keyed_array_entries.is_empty()
                             && let Some(known_items_inner) = known_items.as_ref()
-                            && !known_items_inner.keys().any(|k| combination.keyed_array_entries.contains_key(k))
+                            && combination.sealed_arrays.len() + 1 < options.array_combination_threshold as usize
+                            && (!known_items_inner.keys().any(|k| combination.keyed_array_entries.contains_key(k))
+                                || shapes_are_discriminated(
+                                    known_items_inner,
+                                    &combination.keyed_array_entries,
+                                    codebase,
+                                ))
                         {
                             let frozen = TArray::Keyed(TKeyedArray {
                                 known_items: Some(std::mem::take(&mut combination.keyed_array_entries)),
@@ -774,6 +806,17 @@ fn scrape_type_properties(
                         combination.flags.insert(CombinationFlags::KEYED_ARRAY_SOMETIMES_FILLED);
                     } else {
                         combination.flags.remove(CombinationFlags::KEYED_ARRAY_ALWAYS_FILLED);
+
+                        if parameters.is_none()
+                            && known_items.as_ref().is_none_or(|items| items.is_empty())
+                            && combination.list_array_parameter.is_some()
+                        {
+                            combination.flags.remove(CombinationFlags::LIST_ARRAY_ALWAYS_FILLED);
+                            had_previous_keyed_array = false;
+                            combination.flags.remove(CombinationFlags::HAS_KEYED_ARRAY);
+
+                            continue;
+                        }
                     }
 
                     if let Some(known_items) = known_items {
@@ -882,7 +925,7 @@ fn scrape_type_properties(
 
     // this probably won't ever happen, but the object top type
     // can eliminate variants
-    if let TAtomic::Object(TObject::Any) = atomic {
+    if atomic == TAtomic::Object(TObject::Any) {
         combination.flags.insert(CombinationFlags::HAS_OBJECT_TOP_TYPE);
         combination.value_types.retain(|_, t| !matches!(t, TAtomic::Object(TObject::Named(_))));
         combination.value_types.insert(atomic.get_id(), atomic);
@@ -1031,7 +1074,7 @@ fn scrape_type_properties(
         return;
     }
 
-    if let TAtomic::Scalar(TScalar::Generic) = atomic {
+    if atomic == TAtomic::Scalar(TScalar::Generic) {
         combination.literal_strings.clear();
         combination.integers.clear();
         combination.literal_floats.clear();
@@ -1049,7 +1092,7 @@ fn scrape_type_properties(
         return;
     }
 
-    if let TAtomic::Scalar(TScalar::ArrayKey) = atomic {
+    if atomic == TAtomic::Scalar(TScalar::ArrayKey) {
         if combination.value_types.contains_key(&*ATOM_SCALAR) {
             return;
         }
@@ -1111,10 +1154,10 @@ fn scrape_type_properties(
                 combination.literal_strings.insert(atom);
             }
         } else {
-            // When we have a constrained string type (like numeric-string) and literals,
-            // we need to decide whether to merge them or keep them separate.
-            // If the non-literal is numeric-string, keep non-numeric literals separate.
             let mut literals_to_keep = AtomSet::default();
+            if !combination.literal_strings.is_empty() {
+                string_scalar.is_callable = false;
+            }
 
             if string_scalar.is_truthy
                 || string_scalar.is_non_empty
@@ -1131,7 +1174,6 @@ fn scrape_type_properties(
                         string_scalar.is_truthy = false;
                     }
 
-                    // If the string is numeric but the literal is not, keep the literal separate
                     if string_scalar.is_numeric && !str_is_numeric(value) {
                         literals_to_keep.insert(*value);
                     } else {
@@ -1174,14 +1216,21 @@ fn scrape_type_properties(
     }
 
     if let TAtomic::Scalar(TScalar::Float(float_scalar)) = &atomic {
-        if combination.value_types.contains_key(&*ATOM_FLOAT) {
+        if let Some(stored) = combination.value_types.get(&*ATOM_FLOAT) {
+            if matches!(stored, TAtomic::Scalar(TScalar::Float(TFloat::Float))) {
+                return;
+            }
+
+            if matches!(float_scalar, TFloat::Float) {
+                combination.literal_floats.clear();
+                combination.value_types.insert(*ATOM_FLOAT, atomic);
+            }
+
             return;
         }
 
         if let TFloat::Literal(literal_value) = float_scalar {
-            // Check if adding this float would exceed the threshold (using string threshold for floats)
             if combination.literal_floats.len() >= options.string_combination_threshold as usize {
-                // Exceeded threshold - generalize to base float type
                 combination.literal_floats.clear();
                 combination.value_types.insert(*ATOM_FLOAT, TAtomic::Scalar(TScalar::float()));
                 return;
@@ -1198,23 +1247,121 @@ fn scrape_type_properties(
     combination.value_types.insert(atomic.get_id(), atomic);
 }
 
+fn shapes_are_discriminated(
+    incoming: &BTreeMap<ArrayKey, (bool, TUnion)>,
+    existing: &BTreeMap<ArrayKey, (bool, TUnion)>,
+    codebase: &CodebaseMetadata,
+) -> bool {
+    let mut has_asymmetric_keys = false;
+    for key in incoming.keys() {
+        if !existing.contains_key(key) {
+            has_asymmetric_keys = true;
+            break;
+        }
+    }
+
+    if !has_asymmetric_keys {
+        for key in existing.keys() {
+            if !incoming.contains_key(key) {
+                has_asymmetric_keys = true;
+                break;
+            }
+        }
+    }
+
+    if !has_asymmetric_keys {
+        return false;
+    }
+
+    for (key, (incoming_optional, incoming_type)) in incoming {
+        if *incoming_optional {
+            continue;
+        }
+
+        let Some((existing_optional, existing_type)) = existing.get(key) else {
+            continue;
+        };
+
+        if *existing_optional {
+            continue;
+        }
+
+        if !union_comparator::can_expression_types_be_identical(codebase, incoming_type, existing_type, false, false) {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Widens known items in a sealed array with the generic value type from parameters.
 /// This is needed when combining a sealed array with a parametric one, the parametric
 /// array's generic string keys could overwrite any of the sealed array's known keys.
 fn widen_known_items_with_params(
     known_items: Option<BTreeMap<ArrayKey, (bool, TUnion)>>,
-    params: &Option<(TUnion, TUnion)>,
+    params: Option<&(TUnion, TUnion)>,
+    other_known_items: &BTreeMap<ArrayKey, (bool, TUnion)>,
     codebase: &CodebaseMetadata,
     options: CombinerOptions,
 ) -> Option<BTreeMap<ArrayKey, (bool, TUnion)>> {
     let mut items = known_items?;
 
     if let Some((key_param, value_param)) = params {
-        for (key, (_, entry_type)) in items.iter_mut() {
-            let key_type = TUnion::from_atomic(key.to_atomic());
-            if union_comparator::can_expression_types_be_identical(codebase, &key_type, key_param, false, false) {
-                *entry_type = combine_union_types(entry_type, value_param, codebase, options);
+        let key_param_accepts_int;
+        let key_param_accepts_string;
+        if key_param.has_mixed() || key_param.has_mixed_template() {
+            key_param_accepts_int = true;
+            key_param_accepts_string = true;
+        } else {
+            let mut accepts_int = false;
+            let mut accepts_string = false;
+            for part in key_param.types.as_ref() {
+                if accepts_int && accepts_string {
+                    break;
+                }
+
+                match part {
+                    TAtomic::Scalar(TScalar::ArrayKey) => {
+                        accepts_int = true;
+                        accepts_string = true;
+                    }
+                    TAtomic::Scalar(TScalar::Integer(_)) => accepts_int = true,
+                    TAtomic::Scalar(TScalar::String(_)) => accepts_string = true,
+                    _ => {
+                        accepts_int = true;
+                        accepts_string = true;
+                    }
+                }
             }
+
+            key_param_accepts_int = accepts_int;
+            key_param_accepts_string = accepts_string;
+        }
+
+        if !key_param_accepts_int && !key_param_accepts_string {
+            return Some(items);
+        }
+
+        for (key, (_, entry_type)) in items.iter_mut() {
+            if entry_type == value_param {
+                continue;
+            }
+
+            if other_known_items.contains_key(key) {
+                continue;
+            }
+
+            let key_compatible = match key {
+                ArrayKey::Integer(_) => key_param_accepts_int,
+                ArrayKey::String(_) => key_param_accepts_string,
+                ArrayKey::ClassLikeConstant { .. } => key_param_accepts_int || key_param_accepts_string,
+            };
+
+            if !key_compatible {
+                continue;
+            }
+
+            *entry_type = combine_union_types(entry_type, value_param, codebase, options);
         }
     }
 
@@ -1234,6 +1381,83 @@ fn adjust_keyed_array_parameters(
     *existing_key_param = combine_union_types(existing_key_param, &new_key_type, codebase, options);
 }
 
+fn flush_sealed_keyed_arrays_into_combination(
+    combination: &mut TypeCombination,
+    codebase: &CodebaseMetadata,
+    options: CombinerOptions,
+) {
+    let sealed = std::mem::take(&mut combination.sealed_arrays);
+    let mut any_keyed = false;
+    let mut put_back = Vec::new();
+
+    for array in sealed {
+        let TArray::Keyed(keyed) = array else {
+            put_back.push(array);
+            continue;
+        };
+
+        any_keyed = true;
+        let TKeyedArray { known_items, parameters, non_empty } = keyed;
+
+        if non_empty {
+            combination.flags.insert(CombinationFlags::KEYED_ARRAY_SOMETIMES_FILLED);
+        } else {
+            combination.flags.remove(CombinationFlags::KEYED_ARRAY_ALWAYS_FILLED);
+        }
+
+        if let Some(known_items) = known_items {
+            for (candidate_item_name, (candidate_optional, candidate_item_type)) in known_items {
+                if let Some((existing_optional, existing_type)) =
+                    combination.keyed_array_entries.get_mut(&candidate_item_name)
+                {
+                    if candidate_optional {
+                        *existing_optional = true;
+                    }
+                    if &candidate_item_type != existing_type {
+                        *existing_type = combine_union_types(existing_type, &candidate_item_type, codebase, options);
+                    }
+                } else {
+                    let inserted = if let Some((ref mut existing_key_param, ref mut existing_value_param)) =
+                        combination.keyed_array_parameters
+                    {
+                        adjust_keyed_array_parameters(
+                            existing_value_param,
+                            &candidate_item_type,
+                            codebase,
+                            options,
+                            &candidate_item_name,
+                            existing_key_param,
+                        );
+                        None
+                    } else {
+                        Some((true, candidate_item_type.clone()))
+                    };
+
+                    if let Some(entry) = inserted {
+                        combination.keyed_array_entries.insert(candidate_item_name, entry);
+                    }
+                }
+            }
+        }
+
+        combination.keyed_array_parameters = match (combination.keyed_array_parameters.take(), parameters) {
+            (None, None) => None,
+            (Some(existing_types), None) => Some(existing_types),
+            (None, Some(params)) => Some(((*params.0).clone(), (*params.1).clone())),
+            (Some(existing_types), Some(params)) => Some((
+                combine_union_types(&existing_types.0, &params.0, codebase, options),
+                combine_union_types(&existing_types.1, &params.1, codebase, options),
+            )),
+        };
+    }
+
+    if any_keyed {
+        combination.flags.insert(CombinationFlags::HAS_KEYED_ARRAY);
+    }
+
+    combination.sealed_arrays = put_back;
+}
+
 const COMBINER_KEY_STACK_BUF: usize = 256;
 
 fn get_combiner_key(name: Atom, type_params: &[TUnion], codebase: &CodebaseMetadata) -> Atom {
@@ -1250,7 +1474,7 @@ fn get_combiner_key(name: Atom, type_params: &[TUnion], codebase: &CodebaseMetad
             estimated_len += 2; // ", "
         }
 
-        if covariants.get(&i) == Some(&Variance::Covariant) {
+        if covariants.get(i) == Some(&Variance::Covariant) {
             estimated_len += 1; // "*"
         } else {
             estimated_len += tunion.get_id().len();
@@ -1273,7 +1497,7 @@ fn get_combiner_key(name: Atom, type_params: &[TUnion], codebase: &CodebaseMetad
                 pos += 2;
             }
             let param_str =
-                if covariants.get(&i) == Some(&Variance::Covariant) { "*" } else { tunion.get_id().as_str() };
+                if covariants.get(i) == Some(&Variance::Covariant) { "*" } else { tunion.get_id().as_str() };
             buffer[pos..pos + param_str.len()].copy_from_slice(param_str.as_bytes());
             pos += param_str.len();
         }
@@ -1292,7 +1516,7 @@ fn get_combiner_key(name: Atom, type_params: &[TUnion], codebase: &CodebaseMetad
         if i > 0 {
             result.push_str(", ");
         }
-        if covariants.get(&i) == Some(&Variance::Covariant) {
+        if covariants.get(i) == Some(&Variance::Covariant) {
             result.push('*');
         } else {
             result.push_str(tunion.get_id().as_str());

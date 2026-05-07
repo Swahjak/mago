@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 mod runner {
     use std::borrow::Cow;
 
@@ -14,6 +16,15 @@ mod runner {
         let program = parse_file(&arena, &file);
         if !program.errors.is_empty() {
             panic!("Test case '{name}' failed to parse. Errors: {:?}", program.errors);
+        }
+    }
+
+    pub fn parse_error_test(name: &'static str, code: &'static str) {
+        let arena = Bump::new();
+        let file = File::ephemeral(Cow::Borrowed(name), Cow::Borrowed(code));
+        let program = parse_file(&arena, &file);
+        if program.errors.is_empty() {
+            panic!("Test case '{name}' parsed without errors, but a parse error was expected.");
         }
     }
 
@@ -240,6 +251,44 @@ mod parser {
             }
         };
     }
+
+    macro_rules! parse_error_test {
+        ($name:ident, $code:expr) => {
+            #[test]
+            fn $name() {
+                crate::runner::parse_error_test(stringify!($name), $code);
+            }
+        };
+    }
+
+    // Reference `&` is only valid in specific positions (assignment RHS after `=`,
+    // array element value, yield value, `foreach ... as &$v`). It must be rejected
+    // elsewhere, matching PHP's parser.
+    parse_error_test!(reference_after_int_cast, "<?php $x = (int) &$b;");
+    parse_error_test!(reference_after_string_cast, "<?php $x = (string) &$b;");
+    parse_error_test!(reference_after_unary_minus, "<?php $x = -&$b;");
+    parse_error_test!(reference_after_error_control, "<?php $x = @&$b;");
+    parse_error_test!(reference_after_not, "<?php $x = !&$b;");
+    parse_error_test!(reference_after_binary_plus, "<?php $x = $a + &$b;");
+    parse_error_test!(reference_after_binary_mul, "<?php $x = $a * &$b;");
+    parse_error_test!(reference_after_echo, "<?php echo &$b;");
+    parse_error_test!(reference_after_print, "<?php print &$b;");
+    parse_error_test!(reference_after_return, "<?php function f() { return &$b; }");
+    parse_error_test!(reference_in_compound_assign_add, "<?php $a += &$b;");
+    parse_error_test!(reference_in_function_call_arg, "<?php f(&$b);");
+    parse_error_test!(reference_in_array_index, "<?php $x = $a[&$b];");
+    parse_error_test!(reference_in_yield_pair_value_after_key, "<?php function f() { yield $k => &$v; }");
+
+    // Positive cases — these positions ARE valid and must continue to parse.
+    smoke_test!(reference_in_assignment_rhs, "<?php $a = &$b;");
+    smoke_test!(reference_in_array_literal, "<?php $x = [&$b];");
+    smoke_test!(reference_in_array_value_after_key, "<?php $x = ['k' => &$b];");
+    smoke_test!(reference_in_foreach_value, "<?php foreach ($a as &$v) {}");
+    smoke_test!(reference_in_foreach_key_value, "<?php foreach ($a as $k => &$v) {}");
+    smoke_test!(reference_in_yield_value, "<?php function f() { yield &$b; }");
+    smoke_test!(reference_in_list_destructuring, "<?php list(&$a) = $b;");
+    smoke_test!(reference_in_short_list_destructuring, "<?php [&$a] = $b;");
+    smoke_test!(reference_in_array_append, "<?php $a[] = &$b;");
 
     test_expression!(assign_ref_static_call, "$a = &B::c()", "($a = (& (B::c())))");
     test_expression!(assign_ref_func_call, "$a = &b()", "($a = (& (b())))");
@@ -1248,4 +1297,12 @@ mod parser {
     smoke_test!(binary_prefix_nowdoc, "<?php echo b<<<'EOT'\nhello\nEOT;");
     smoke_test!(binary_prefix_escape_sequences, "<?php echo b\"hello\\nworld\";");
     smoke_test!(binary_prefix_single_quoted_escape, "<?php echo b'hello\\'world';");
+    smoke_test!(issue_1713_nullsafe_in_interpolated_string, "<?php \"$a?->b\";");
+    smoke_test!(issue_1713_property_in_interpolated_baseline, "<?php \"$a->b\";");
+    smoke_test!(issue_1713_exit_first_class_callable, "<?php exit(...);");
+    smoke_test!(issue_1713_die_first_class_callable, "<?php die(...);");
+    smoke_test!(issue_1713_die_partial_application, "<?php die(1, ?);");
+    smoke_test!(issue_1713_exit_partial_application_variadic, "<?php exit(1, ?, ...);");
+    smoke_test!(issue_1713_match_trailing_comma, "<?php $value = match (1) { 0, 1, => 'Foo', default, => 'Bar', };");
+    smoke_test!(issue_1713_yield_unary_minus, "<?php function gen() { yield * -1; }");
 }

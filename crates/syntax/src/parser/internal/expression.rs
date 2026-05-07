@@ -40,10 +40,68 @@ use crate::parser::Parser;
 use crate::token::Associativity;
 use crate::token::GetPrecedence;
 use crate::token::Precedence;
+use crate::token::TokenKind;
 
-impl<'input, 'arena> Parser<'input, 'arena> {
+impl<'arena> Parser<'_, 'arena> {
     pub(crate) fn parse_expression(&mut self) -> Result<&'arena Expression<'arena>, ParseError> {
         self.parse_expression_with_precedence(Precedence::Lowest)
+    }
+
+    /// Parses an expression optionally prefixed with `&` (reference), for positions where
+    /// a by-reference value is legal (array element value, yield value, `list(&$x)` destructuring).
+    /// `&` outside such positions must remain a syntax error, so callers in those positions
+    /// should use this helper instead of `parse_expression`.
+    pub(crate) fn parse_possibly_referenced_expression(&mut self) -> Result<&'arena Expression<'arena>, ParseError> {
+        if matches!(self.stream.peek_kind(0)?, Some(T!["&"])) {
+            let ampersand_span = self.stream.eat_span(T!["&"])?;
+            let referenced_expr = self.parse_expression_with_precedence(Precedence::Reference)?;
+
+            return Ok(self.arena.alloc(Expression::UnaryPrefix(UnaryPrefix {
+                operator: UnaryPrefixOperator::Reference(ampersand_span),
+                operand: referenced_expr,
+            })));
+        }
+
+        self.parse_expression()
+    }
+
+    /// Returns `true` when `kind` could begin a value expression. Mirrors the
+    /// starter set accepted by [`Self::parse_lhs_expression`].
+    pub(crate) const fn is_at_start_of_expression(kind: TokenKind) -> bool {
+        if kind.is_literal() || kind.is_unary_prefix() || kind.is_magic_constant() || kind.is_construct() {
+            return true;
+        }
+
+        if matches!(
+            kind,
+            T!["#["
+                | "clone"
+                | "function"
+                | "fn"
+                | "static"
+                | "self"
+                | "parent"
+                | "list"
+                | "new"
+                | "throw"
+                | "yield"
+                | "match"
+                | "array"
+                | "["
+                | "("
+                | "\""
+                | "<<<"
+                | "`"]
+        ) {
+            return true;
+        }
+
+        if matches!(kind, T![Dollar | DollarLeftBrace | Variable]) {
+            return true;
+        }
+
+        matches!(kind, T![Identifier | QualifiedIdentifier | FullyQualifiedIdentifier])
+            || kind.is_soft_reserved_identifier()
     }
 
     /// Internal expression parsing that uses arena-allocated references to reduce stack usage.
@@ -130,16 +188,8 @@ impl<'input, 'arena> Parser<'input, 'arena> {
         let next = self.stream.peek_kind(1)?;
 
         let is_call = precedence != Precedence::New && matches!(next, Some(T!["("]));
-        let is_call_or_access = is_call
-            || matches!(
-                next,
-                Some(
-                    crate::token::TokenKind::LeftBracket
-                        | crate::token::TokenKind::ColonColon
-                        | crate::token::TokenKind::MinusGreaterThan
-                        | crate::token::TokenKind::QuestionMinusGreaterThan
-                )
-            );
+        let is_call_or_access =
+            is_call || matches!(next, Some(T![LeftBracket | ColonColon | MinusGreaterThan | QuestionMinusGreaterThan]));
 
         if token.kind.is_literal() && (!token.kind.is_keyword() || !is_call_or_access) {
             return Ok(self.arena.alloc(Expression::Literal(self.parse_literal()?)));
@@ -168,7 +218,7 @@ impl<'input, 'arena> Parser<'input, 'arena> {
             (T!["static"], _) => Expression::Static(self.expect_any_keyword()?),
             (T!["self"], _) if !is_call => Expression::Self_(self.expect_any_keyword()?),
             (T!["parent"], _) if !is_call => Expression::Parent(self.expect_any_keyword()?),
-            (kind, _) if kind.is_construct() => Expression::Construct(self.parse_construct()?),
+            (kind, _) if kind.is_construct() => self.parse_construct()?,
             (T!["list"], Some(T!["("])) => Expression::List(self.parse_list()?),
             (T!["new"], Some(T!["class" | "#["])) => Expression::AnonymousClass(self.parse_anonymous_class()?),
             (T!["new"], Some(T!["static"])) => Expression::Instantiation(self.parse_instantiation()?),
@@ -185,12 +235,7 @@ impl<'input, 'arena> Parser<'input, 'arena> {
             (T!["match"], Some(T!["("])) => Expression::Match(self.parse_match()?),
             (T!["array"], Some(T!["("])) => Expression::LegacyArray(self.parse_legacy_array()?),
             (T!["["], _) => Expression::Array(self.parse_array()?),
-            (
-                crate::token::TokenKind::Dollar
-                | crate::token::TokenKind::DollarLeftBrace
-                | crate::token::TokenKind::Variable,
-                _,
-            ) => Expression::Variable(self.parse_variable()?),
+            (T![Dollar | DollarLeftBrace | Variable], _) => Expression::Variable(self.parse_variable()?),
             (kind, _) if kind.is_magic_constant() => Expression::MagicConstant(self.parse_magic_constant()?),
             (kind, ..)
                 if matches!(kind, T![Identifier | QualifiedIdentifier | FullyQualifiedIdentifier | "clone"])
@@ -428,7 +473,10 @@ impl<'input, 'arena> Parser<'input, 'arena> {
                 operand: lhs,
                 operator: UnaryPostfixOperator::PostDecrement(self.stream.consume_span()?),
             }),
-            _ => unreachable!(),
+            // The dispatch above already filtered the postfix operators we accept; reaching the
+            // wildcard means the caller passed a non-postfix kind, which is a parser bug — bubble
+            // it up as an unexpected-token error instead of panicking.
+            _ => return Err(self.stream.unexpected(None, &[])),
         }))
     }
 
@@ -729,7 +777,10 @@ impl<'input, 'arena> Parser<'input, 'arena> {
 
                 Expression::Pipe(Pipe { input: lhs, operator, callable })
             }
-            _ => unreachable!(),
+            // The dispatch above already filtered the infix operators we accept; reaching the
+            // wildcard means the caller passed a non-infix kind, which is a parser bug — bubble
+            // it up as an unexpected-token error instead of panicking.
+            _ => return Err(self.stream.unexpected(None, &[])),
         }))
     }
 

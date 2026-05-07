@@ -92,7 +92,7 @@ fn unwrap_closure_return_array(array: &TArray, context: &ProviderContext<'_, '_,
                 return Some(TUnion::from_atomic(TAtomic::Array(TArray::Keyed(TKeyedArray {
                     parameters: keyed.parameters.as_ref().map(|(k, v)| {
                         let unwrapped_v = extract_closure_return_type(v).unwrap_or_else(|| (**v).clone());
-                        (k.clone(), Arc::new(unwrapped_v))
+                        (Arc::clone(k), Arc::new(unwrapped_v))
                     }),
                     non_empty: keyed.non_empty,
                     known_items: Some(new_items),
@@ -118,11 +118,8 @@ fn extract_closure_return_type(union: &TUnion) -> Option<TUnion> {
     for atomic in union.types.as_ref() {
         match atomic {
             TAtomic::Callable(TCallable::Signature(sig)) => {
-                if let Some(return_type) = sig.get_return_type() {
-                    result_types.extend(return_type.types.iter().cloned());
-                } else {
-                    return None;
-                }
+                let return_type = sig.get_return_type()?;
+                result_types.extend(return_type.types.iter().cloned());
             }
             _ => {
                 return None;

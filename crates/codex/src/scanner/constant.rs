@@ -1,3 +1,4 @@
+use bumpalo::Bump;
 use mago_atom::Atom;
 use mago_atom::ascii_lowercase_constant_name_atom;
 use mago_docblock::error::ParseError;
@@ -23,19 +24,14 @@ use crate::ttype::resolution::TypeResolutionContext;
 #[inline]
 pub fn scan_constant<'arena>(
     constant: &'arena Constant<'arena>,
-    context: &mut Context<'_, 'arena>,
+    context: &Context<'_, 'arena>,
     type_context: &TypeResolutionContext,
     scope: &NamespaceScope,
 ) -> Vec<ConstantMetadata> {
     let attributes = scan_attribute_lists(&constant.attribute_lists, context);
     let docblock = ConstantDocblockComment::create(context, constant);
 
-    let mut flags = MetadataFlags::empty();
-    if context.file.file_type.is_host() {
-        flags |= MetadataFlags::USER_DEFINED;
-    } else if context.file.file_type.is_builtin() {
-        flags |= MetadataFlags::BUILTIN;
-    }
+    let flags = MetadataFlags::origin_flags(context.file.file_type);
 
     constant
         .items
@@ -45,9 +41,9 @@ pub fn scan_constant<'arena>(
 
             let mut metadata = ConstantMetadata::new(name, item.span(), flags);
             metadata.attributes.clone_from(&attributes);
-            metadata.inferred_type = infer(context, scope, item.value);
+            metadata.inferred_type = infer(context, scope, item.value, None);
 
-            process_constant_docblock(&mut metadata, &docblock, None, type_context, scope);
+            process_constant_docblock(context.arena, &mut metadata, &docblock, None, type_context, scope);
 
             if metadata.attributes.iter().any(|attr| attr.name.eq_ignore_ascii_case("Deprecated")) {
                 metadata.flags |= MetadataFlags::DEPRECATED;
@@ -61,7 +57,7 @@ pub fn scan_constant<'arena>(
 #[inline]
 pub fn scan_defined_constant<'arena>(
     define: &'arena FunctionCall<'arena>,
-    context: &mut Context<'_, 'arena>,
+    context: &Context<'_, 'arena>,
     type_context: &TypeResolutionContext,
     scope: &NamespaceScope,
 ) -> Option<ConstantMetadata> {
@@ -74,35 +70,30 @@ pub fn scan_defined_constant<'arena>(
         return None;
     }
 
-    let arguments = define.argument_list.arguments.as_slice();
-    if arguments.len() != 2 {
+    let [first_arg, value_arg] = define.argument_list.arguments.as_slice() else {
         return None;
-    }
+    };
 
-    let Expression::Literal(Literal::String(name_string)) = arguments[0].value() else {
+    let Expression::Literal(Literal::String(name_string)) = first_arg.value() else {
         return None;
     };
 
     let docblock = ConstantDocblockComment::create(context, define);
 
     let name = ascii_lowercase_constant_name_atom(name_string.value?);
-    let mut flags = MetadataFlags::empty();
-    if context.file.file_type.is_host() {
-        flags |= MetadataFlags::USER_DEFINED;
-    } else if context.file.file_type.is_builtin() {
-        flags |= MetadataFlags::BUILTIN;
-    }
+    let flags = MetadataFlags::origin_flags(context.file.file_type);
 
     let mut metadata = ConstantMetadata::new(name, define.span(), flags);
-    metadata.inferred_type = infer(context, scope, arguments[1].value());
+    metadata.inferred_type = infer(context, scope, value_arg.value(), None);
 
-    process_constant_docblock(&mut metadata, &docblock, None, type_context, scope);
+    process_constant_docblock(context.arena, &mut metadata, &docblock, None, type_context, scope);
 
     Some(metadata)
 }
 
 #[inline]
 fn process_constant_docblock(
+    arena: &Bump,
     metadata: &mut ConstantMetadata,
     docblock: &Result<Option<ConstantDocblockComment>, ParseError>,
     classname: Option<Atom>,
@@ -143,7 +134,7 @@ fn process_constant_docblock(
     }
 
     if let Some(type_string) = &docblock.type_string {
-        match get_type_metadata_from_type_string(type_string, classname, type_context, scope) {
+        match get_type_metadata_from_type_string(arena, type_string, classname, type_context, scope) {
             Ok(type_metadata) => {
                 metadata.type_metadata = Some(type_metadata);
             }

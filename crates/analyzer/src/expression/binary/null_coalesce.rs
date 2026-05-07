@@ -42,6 +42,7 @@ use crate::utils::misc::unwrap_expression;
 /// - If the LHS is nullable (can be `null` or other types), the result type is the union of the
 ///   non-null parts of the LHS and the type of the RHS.
 /// - If the LHS type is unknown (`mixed`), the result type is `mixed`.
+#[allow(clippy::unwrap_used)]
 pub fn analyze_null_coalesce_operation<'ctx, 'arena>(
     binary: &Binary<'arena>,
     context: &mut Context<'ctx, 'arena>,
@@ -49,7 +50,10 @@ pub fn analyze_null_coalesce_operation<'ctx, 'arena>(
     artifacts: &mut AnalysisArtifacts,
 ) -> Result<(), AnalysisError> {
     let was_inside_isset = block_context.flags.inside_isset();
-    block_context.flags.set_inside_isset(true);
+    block_context.flags.set_inside_isset(matches!(
+        binary.lhs,
+        Expression::Variable(_) | Expression::Access(_) | Expression::ArrayAccess(_)
+    ));
     binary.lhs.analyze(context, block_context, artifacts)?;
     block_context.flags.set_inside_isset(was_inside_isset);
 

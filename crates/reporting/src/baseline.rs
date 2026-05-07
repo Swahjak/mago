@@ -27,7 +27,20 @@ use serde::Serialize;
 use mago_database::DatabaseReader;
 use mago_database::ReadDatabase;
 
+use crate::Annotation;
+use crate::Issue;
 use crate::IssueCollection;
+
+/// The annotation a baseline uses to identify an issue's location.
+///
+/// Prefers a primary annotation, falls back to the first annotation. This
+/// keeps the baseline resilient to rules that forget to mark any
+/// annotation as primary — those issues still get baselined/filtered
+/// instead of leaking through as unbaselined on every re-run.
+#[inline]
+fn baseline_annotation(issue: &Issue) -> Option<&Annotation> {
+    issue.annotations.iter().find(|a| a.is_primary()).or_else(|| issue.annotations.first())
+}
 
 /// The variant of baseline format to use.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, JsonSchema)]
@@ -49,7 +62,7 @@ pub enum BaselineVariant {
 /// Represents a single issue in the strict baseline format.
 ///
 /// This is a simplified representation of an issue for storage in the baseline file.
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash, Clone, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash, Clone, PartialOrd, Ord, JsonSchema)]
 pub struct StrictBaselineIssue {
     pub code: String,
     pub start_line: u32,
@@ -57,7 +70,7 @@ pub struct StrictBaselineIssue {
 }
 
 /// Represents a collection of issues for a specific file path in the strict baseline.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 pub struct StrictBaselineEntry {
     pub issues: Vec<StrictBaselineIssue>,
 }
@@ -66,7 +79,7 @@ pub struct StrictBaselineEntry {
 ///
 /// File paths are stored in a normalized format (using forward slashes)
 /// to ensure cross-platform compatibility.
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default, JsonSchema)]
 pub struct StrictBaseline {
     /// The baseline variant marker. When present, indicates this is a strict baseline.
     /// When absent (for backward compatibility), the baseline is assumed to be strict.
@@ -79,7 +92,7 @@ pub struct StrictBaseline {
 /// Represents a single issue entry in the loose baseline format.
 ///
 /// Issues are grouped by (file, code, message) tuple with a count.
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash, Clone, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash, Clone, PartialOrd, Ord, JsonSchema)]
 pub struct LooseBaselineIssue {
     /// The normalized file path where the issues occur.
     pub file: String,
@@ -92,7 +105,7 @@ pub struct LooseBaselineIssue {
 }
 
 /// The loose baseline structure with count-based issue tracking.
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default, JsonSchema)]
 pub struct LooseBaseline {
     /// The baseline variant marker.
     pub variant: BaselineVariant,
@@ -101,7 +114,8 @@ pub struct LooseBaseline {
 }
 
 /// A baseline that can be either strict or loose.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
 pub enum Baseline {
     /// Strict baseline with exact line matching.
     Strict(StrictBaseline),
@@ -145,19 +159,19 @@ impl StrictBaseline {
         let mut entries: BTreeMap<Cow<'static, str>, StrictBaselineEntry> = BTreeMap::new();
 
         for issue in issues.iter() {
-            let Some(primary_annotation) = issue.annotations.iter().find(|a| a.is_primary()) else {
+            let Some(annotation) = baseline_annotation(issue) else {
                 continue;
             };
 
-            let Ok(file) = read_database.get(&primary_annotation.span.file_id) else {
+            let Ok(file) = read_database.get(&annotation.span.file_id) else {
                 continue;
             };
 
             let normalized_path = normalize_path(&file.name);
             let entry = entries.entry(Cow::Owned(normalized_path)).or_default();
 
-            let start_line = file.line_number(primary_annotation.span.start.offset);
-            let end_line = file.line_number(primary_annotation.span.end.offset);
+            let start_line = file.line_number(annotation.span.start.offset);
+            let end_line = file.line_number(annotation.span.end.offset);
 
             let baseline_issue = StrictBaselineIssue {
                 code: issue.code.as_ref().unwrap_or(&String::from("unknown")).clone(),
@@ -187,12 +201,12 @@ impl StrictBaseline {
         let mut filtered_issues = Vec::new();
 
         for issue in issues {
-            let Some(primary_annotation) = issue.annotations.iter().find(|a| a.is_primary()) else {
+            let Some(annotation) = baseline_annotation(&issue) else {
                 filtered_issues.push(issue);
                 continue;
             };
 
-            let Ok(file) = read_database.get(&primary_annotation.span.file_id) else {
+            let Ok(file) = read_database.get(&annotation.span.file_id) else {
                 filtered_issues.push(issue);
                 continue;
             };
@@ -203,8 +217,8 @@ impl StrictBaseline {
                 continue;
             };
 
-            let start_line = file.line_number(primary_annotation.span.start.offset);
-            let end_line = file.line_number(primary_annotation.span.end.offset);
+            let start_line = file.line_number(annotation.span.start.offset);
+            let end_line = file.line_number(annotation.span.end.offset);
 
             let baseline_issue = StrictBaselineIssue {
                 code: issue.code.as_ref().unwrap_or(&String::from("unknown")).clone(),
@@ -301,11 +315,11 @@ impl LooseBaseline {
         let mut issue_counts: HashMap<(String, String, String), u32> = HashMap::default();
 
         for issue in issues.iter() {
-            let Some(primary_annotation) = issue.annotations.iter().find(|a| a.is_primary()) else {
+            let Some(annotation) = baseline_annotation(issue) else {
                 continue;
             };
 
-            let Ok(file) = read_database.get(&primary_annotation.span.file_id) else {
+            let Ok(file) = read_database.get(&annotation.span.file_id) else {
                 continue;
             };
 
@@ -339,12 +353,12 @@ impl LooseBaseline {
         let mut filtered_issues = Vec::new();
 
         for issue in issues {
-            let Some(primary_annotation) = issue.annotations.iter().find(|a| a.is_primary()) else {
+            let Some(annotation) = baseline_annotation(&issue) else {
                 filtered_issues.push(issue);
                 continue;
             };
 
-            let Ok(file) = read_database.get(&primary_annotation.span.file_id) else {
+            let Ok(file) = read_database.get(&annotation.span.file_id) else {
                 filtered_issues.push(issue);
                 continue;
             };
@@ -465,6 +479,7 @@ impl Baseline {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::get_unwrap)]
 mod tests {
     use super::*;
     use crate::Annotation;

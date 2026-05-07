@@ -4,6 +4,7 @@ use mago_atom::Atom;
 use mago_codex::ttype::TType;
 use mago_codex::ttype::TypeRef;
 use mago_codex::ttype::atomic::TAtomic;
+use mago_codex::ttype::atomic::object::TObject;
 use mago_codex::ttype::atomic::reference::TReference;
 use mago_codex::ttype::builder::get_type_from_string;
 use mago_codex::ttype::comparator::ComparisonResult;
@@ -21,6 +22,7 @@ use mago_reporting::Issue;
 use mago_span::HasSpan;
 use mago_span::Span;
 use mago_syntax::ast::Expression;
+use mago_syntax::comments::docblock::PrecedingDocblocks;
 
 use crate::artifacts::AnalysisArtifacts;
 use crate::code::IssueCode;
@@ -59,6 +61,10 @@ pub fn populate_docblock_variables_excluding<'ctx>(
     override_existing: bool,
     exclude_variable: Option<Atom>,
 ) {
+    if PrecedingDocblocks::new(context.comments, context.statement_span.start.offset).next().is_none() {
+        return;
+    }
+
     for (name, variable_type, variable_type_span) in get_docblock_variables(context, block_context, artifacts, true) {
         // Check for undefined type references in ALL @var types, regardless of variable name.
         for type_ref in variable_type.get_all_child_nodes() {
@@ -136,7 +142,7 @@ pub fn get_docblock_variables<'ctx>(
             _ => None,
         })
         .filter_map(|tag| {
-            if allow_tracing && let TagKind::PsalmTrace = tag.kind {
+            if allow_tracing && tag.kind == TagKind::PsalmTrace {
                 let variable_name = tag.description.trim();
                 let variable_atom = mago_atom::atom(variable_name);
                 match block_context.locals.get(&variable_atom) {
@@ -191,6 +197,7 @@ pub fn get_docblock_variables<'ctx>(
             let type_string = var_tag.type_string;
 
             match get_type_from_string(
+                context.arena,
                 &type_string.value,
                 type_string.span,
                 &context.scope,
@@ -331,9 +338,13 @@ pub fn insert_variable_from_docblock<'ctx>(
             && !previous_type.is_generic_parameter()
             && !previous_type.contains_placeholder();
 
+        let could_share_object_runtime_instance =
+            unions_could_share_object_runtime_instance(&previous_type, &variable_type);
+
         let is_impossible = !is_redundant
             && !is_super
             && !is_sub
+            && !could_share_object_runtime_instance
             && !can_expression_types_be_identical(context.codebase, &previous_type, &variable_type, false, false);
 
         if is_impossible {
@@ -362,6 +373,8 @@ pub fn insert_variable_from_docblock<'ctx>(
                     )))
                     .with_help("You can remove this redundant `@var` docblock tag."),
             );
+        } else {
+            // docblock narrows the previous type without contradiction or redundancy; accept silently
         }
     }
 
@@ -408,6 +421,7 @@ pub fn check_docblock_type_incompatibility(
     let is_impossible = !is_redundant
         && !is_super
         && !is_sub
+        && !unions_could_share_object_runtime_instance(inferred_type, docblock_type)
         && !can_expression_types_be_identical(context.codebase, inferred_type, docblock_type, false, true);
 
     if is_impossible {
@@ -497,4 +511,24 @@ pub fn check_docblock_type_incompatibility(
 
         context.collector.report_with_code(IssueCode::RedundantDocblockType, issue);
     }
+}
+
+fn unions_could_share_object_runtime_instance(inferred_type: &TUnion, docblock_type: &TUnion) -> bool {
+    for inferred_atomic in inferred_type.types.iter() {
+        let TAtomic::Object(TObject::Named(inferred_named)) = inferred_atomic else {
+            continue;
+        };
+
+        for docblock_atomic in docblock_type.types.iter() {
+            let TAtomic::Object(TObject::Named(docblock_named)) = docblock_atomic else {
+                continue;
+            };
+
+            if inferred_named.name.eq_ignore_ascii_case(&docblock_named.name) {
+                return true;
+            }
+        }
+    }
+
+    false
 }

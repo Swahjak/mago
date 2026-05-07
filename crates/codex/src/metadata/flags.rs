@@ -1,3 +1,4 @@
+use mago_database::file::FileType;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -42,6 +43,7 @@ impl MetadataFlags {
     pub const EXTERNAL_MUTATION_FREE: MetadataFlags = MetadataFlags(1 << 38);
     pub const SUSPENDS_FIBER: MetadataFlags = MetadataFlags(1 << 39);
     pub const EXPERIMENTAL: MetadataFlags = MetadataFlags(1 << 40);
+    pub const POLYFILL: MetadataFlags = MetadataFlags(1 << 41);
 }
 
 impl MetadataFlags {
@@ -66,6 +68,7 @@ impl MetadataFlags {
     }
 
     #[inline]
+    #[must_use]
     pub const fn contains(self, other: MetadataFlags) -> bool {
         (self.0 & other.0) == other.0
     }
@@ -76,6 +79,7 @@ impl MetadataFlags {
     }
 
     #[inline]
+    #[must_use]
     pub const fn intersects(self, other: MetadataFlags) -> bool {
         (self.0 & other.0) != 0
     }
@@ -314,6 +318,22 @@ impl MetadataFlags {
     #[must_use]
     pub const fn suspends_fiber(self) -> bool {
         self.contains(Self::SUSPENDS_FIBER)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn is_polyfill(self) -> bool {
+        self.contains(Self::POLYFILL)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn origin_flags(file_type: FileType) -> Self {
+        match file_type {
+            FileType::Host => Self::USER_DEFINED,
+            FileType::Builtin => Self::BUILTIN,
+            FileType::Vendored => Self::empty(),
+        }
     }
 }
 

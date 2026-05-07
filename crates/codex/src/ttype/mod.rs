@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use mago_atom::Atom;
@@ -107,9 +108,9 @@ pub mod union;
 
 /// A reference to a type in the type system, which can be either a union or an atomic type.
 #[derive(Clone, Copy, Debug)]
-pub enum TypeRef<'a> {
-    Union(&'a TUnion),
-    Atomic(&'a TAtomic),
+pub enum TypeRef<'ty> {
+    Union(&'ty TUnion),
+    Atomic(&'ty TAtomic),
 }
 
 /// A trait to be implemented by all types in the type system.
@@ -189,8 +190,8 @@ pub trait TType {
 }
 
 /// Implements the `TType` trait for `TypeRef`.
-impl<'a> TType for TypeRef<'a> {
-    fn get_child_nodes(&self) -> Vec<TypeRef<'a>> {
+impl<'ty> TType for TypeRef<'ty> {
+    fn get_child_nodes(&self) -> Vec<TypeRef<'ty>> {
         match self {
             TypeRef::Union(ttype) => ttype.get_child_nodes(),
             TypeRef::Atomic(ttype) => ttype.get_child_nodes(),
@@ -254,14 +255,14 @@ impl<'a> TType for TypeRef<'a> {
     }
 }
 
-impl<'a> From<&'a TUnion> for TypeRef<'a> {
-    fn from(reference: &'a TUnion) -> Self {
+impl<'ty> From<&'ty TUnion> for TypeRef<'ty> {
+    fn from(reference: &'ty TUnion) -> Self {
         TypeRef::Union(reference)
     }
 }
 
-impl<'a> From<&'a TAtomic> for TypeRef<'a> {
-    fn from(reference: &'a TAtomic) -> Self {
+impl<'ty> From<&'ty TAtomic> for TypeRef<'ty> {
+    fn from(reference: &'ty TAtomic) -> Self {
         TypeRef::Atomic(reference)
     }
 }
@@ -335,6 +336,15 @@ pub fn get_non_positive_int() -> TUnion {
 #[must_use]
 pub fn get_non_negative_int() -> TUnion {
     TUnion::from_single(Cow::Borrowed(NON_NEGATIVE_INT_ATOMIC))
+}
+
+#[inline]
+#[must_use]
+pub fn get_non_zero_int() -> TUnion {
+    TUnion::from_vec(vec![
+        TAtomic::Scalar(TScalar::Integer(TInteger::negative())),
+        TAtomic::Scalar(TScalar::Integer(TInteger::positive())),
+    ])
 }
 
 #[inline]
@@ -475,6 +485,7 @@ pub fn get_string() -> TUnion {
 /// This function maps all possible boolean property combinations to a canonical,
 /// static `TAtomic` instance, avoiding heap allocations for common string types.
 #[must_use]
+#[allow(clippy::fn_params_excessive_bools)]
 pub fn get_string_with_props(
     is_numeric: bool,
     is_truthy: bool,
@@ -705,6 +716,7 @@ pub fn get_callable_string() -> TUnion {
     TUnion::from_single(Cow::Borrowed(CALLABLE_STRING_ATOMIC))
 }
 
+#[must_use]
 pub fn get_numeric_string() -> TUnion {
     TUnion::from_single(Cow::Borrowed(NUMERIC_STRING_ATOMIC))
 }
@@ -866,6 +878,21 @@ pub fn add_optional_union_type(base_type: TUnion, maybe_type: Option<&TUnion>, c
     }
 }
 
+/// Reference-counted variant of [`add_optional_union_type`].
+#[must_use]
+pub fn add_optional_union_type_rc(
+    base_type: &Rc<TUnion>,
+    maybe_type: Option<&TUnion>,
+    codebase: &CodebaseMetadata,
+) -> Rc<TUnion> {
+    match maybe_type {
+        Some(type_2) => {
+            Rc::new(add_union_type((**base_type).clone(), type_2, codebase, combiner::CombinerOptions::default()))
+        }
+        None => Rc::clone(base_type),
+    }
+}
+
 #[inline]
 #[must_use]
 pub fn combine_optional_union_types(
@@ -881,6 +908,22 @@ pub fn combine_optional_union_types(
         (None, Some(type_2)) => type_2.clone(),
         (None, None) => get_mixed(),
     }
+}
+
+/// Reference-counted variant of [`combine_union_types`].
+#[inline]
+#[must_use]
+pub fn combine_union_types_rc(
+    type_1: &Rc<TUnion>,
+    type_2: &Rc<TUnion>,
+    codebase: &CodebaseMetadata,
+    options: combiner::CombinerOptions,
+) -> Rc<TUnion> {
+    if Rc::ptr_eq(type_1, type_2) {
+        return Rc::clone(type_1);
+    }
+
+    Rc::new(combine_union_types(type_1, type_2, codebase, options))
 }
 
 #[inline]
@@ -1150,6 +1193,13 @@ fn intersect_atomic_types(
         return Some(result);
     }
 
+    if let (TAtomic::Scalar(TScalar::String(s)), TAtomic::Scalar(TScalar::Numeric))
+    | (TAtomic::Scalar(TScalar::Numeric), TAtomic::Scalar(TScalar::String(s))) = (type_1, type_2)
+    {
+        *intersection_performed = true;
+        return Some(TAtomic::Scalar(TScalar::String(s.as_numeric(true))));
+    }
+
     if let (TAtomic::Scalar(TScalar::String(s1)), TAtomic::Scalar(TScalar::String(s2))) = (type_1, type_2) {
         if let (Some(v1), Some(v2)) = (&s1.get_known_literal_value(), &s2.get_known_literal_value())
             && v1 != v2
@@ -1327,6 +1377,10 @@ pub fn get_array_parameters(array_type: &TArray, codebase: &CodebaseMetadata) ->
                     value_param =
                         add_union_type(value_param, item_type, codebase, combiner::CombinerOptions::default());
                 }
+            }
+
+            if key_types.is_empty() {
+                key_types.push(TAtomic::Never);
             }
 
             let combined_key_types = combiner::combine(key_types, codebase, combiner::CombinerOptions::default());

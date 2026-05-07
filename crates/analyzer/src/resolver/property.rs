@@ -14,9 +14,9 @@ use mago_codex::ttype::atomic::object::TObject;
 use mago_codex::ttype::atomic::object::r#enum::TEnum;
 use mago_codex::ttype::atomic::object::named::TNamedObject;
 use mago_codex::ttype::atomic::scalar::TScalar;
+use mago_codex::ttype::expander;
 use mago_codex::ttype::expander::StaticClassType;
 use mago_codex::ttype::expander::TypeExpansionOptions;
-use mago_codex::ttype::expander::{self};
 use mago_codex::ttype::get_mixed;
 use mago_codex::ttype::template::TemplateResult;
 use mago_codex::ttype::template::inferred_type_replacer;
@@ -38,6 +38,7 @@ use crate::context::block::BlockContext;
 use crate::error::AnalysisError;
 use crate::resolver::class_name::report_non_existent_class_like;
 use crate::resolver::selector::resolve_member_selector;
+use crate::utils::names::display_class_like_name;
 use crate::utils::template::get_template_types_for_class_member;
 use crate::visibility::check_property_read_visibility;
 use crate::visibility::check_property_write_visibility;
@@ -499,33 +500,33 @@ fn find_property_in_class<'ctx, 'ast, 'arena>(
             ) {
                 if has_magic_method {
                     return Some(resolved);
-                } else {
-                    let magic_method_name = if for_assignment { "__set" } else { "__get" };
-                    if declaring_class_metadata.flags.is_final() {
-                        report_non_existent_mixin_property(
-                            context,
-                            object_expr.span(),
-                            selector.span(),
-                            declaring_class_id,
-                            prop_name,
-                            resolved.declaring_class_id.unwrap_or(declaring_class_id),
-                            magic_method_name,
-                        );
-                        result.has_invalid_path = true;
-                    } else {
-                        report_possibly_non_existent_mixin_property(
-                            context,
-                            object_expr.span(),
-                            selector.span(),
-                            declaring_class_id,
-                            prop_name,
-                            resolved.declaring_class_id.unwrap_or(declaring_class_id),
-                            magic_method_name,
-                        );
-                    }
-
-                    return Some(resolved);
                 }
+
+                let magic_method_name = if for_assignment { "__set" } else { "__get" };
+                if declaring_class_metadata.flags.is_final() {
+                    report_non_existent_mixin_property(
+                        context,
+                        object_expr.span(),
+                        selector.span(),
+                        declaring_class_id,
+                        prop_name,
+                        resolved.declaring_class_id.unwrap_or(declaring_class_id),
+                        magic_method_name,
+                    );
+                    result.has_invalid_path = true;
+                } else {
+                    report_possibly_non_existent_mixin_property(
+                        context,
+                        object_expr.span(),
+                        selector.span(),
+                        declaring_class_id,
+                        prop_name,
+                        resolved.declaring_class_id.unwrap_or(declaring_class_id),
+                        magic_method_name,
+                    );
+                }
+
+                return Some(resolved);
             }
         }
 
@@ -641,7 +642,7 @@ fn find_property_in_class<'ctx, 'ast, 'arena>(
         && property_metadata.type_declaration_metadata.is_some()
         && !property_metadata.flags.has_default()
         && !property_metadata.flags.is_promoted_property()
-        && !property_metadata.flags.is_virtual_property()
+        && (!property_metadata.flags.is_virtual_property() || declaring_class_metadata.kind.is_interface())
     {
         property_type.set_possibly_undefined(true, None);
     }
@@ -707,7 +708,7 @@ pub fn localize_property_type(
 
     inferred_type_replacer::replace(
         class_property_type,
-        &TemplateResult::new(Default::default(), template_types),
+        &TemplateResult::new(IndexMap::default(), template_types),
         context.codebase,
     )
 }
@@ -947,6 +948,7 @@ fn report_non_existent_property(
     is_sealed_object: bool, // `true` if we are accessing undefined prop on `object{foo: string}` type, not an actual class
 ) {
     let class_kind_str = context.codebase.get_class_like(&classname).map_or("class", |m| m.kind.as_str());
+    let classname = display_class_like_name(context, classname);
 
     context.collector.report_with_code(
         IssueCode::NonExistentProperty,
@@ -981,6 +983,7 @@ pub(super) fn report_non_documented_property(
 
     let magic_method = if for_assignment { "__set" } else { "__get" };
     let access_type = if for_assignment { "write to" } else { "read from" };
+    let classname = display_class_like_name(context, classname);
 
     context.collector.report_with_code(
         IssueCode::NonDocumentedProperty,
@@ -1011,6 +1014,8 @@ fn report_possibly_non_existent_mixin_property(
     mixin_classname: Atom,
     magic_method_name: &str,
 ) {
+    let mixin_classname = display_class_like_name(context, mixin_classname);
+    let classname = display_class_like_name(context, classname);
     context.collector.report_with_code(
         IssueCode::PossiblyNonExistentProperty,
         Issue::warning(format!(
@@ -1043,6 +1048,8 @@ fn report_non_existent_mixin_property(
     mixin_classname: Atom,
     magic_method_name: &str,
 ) {
+    let mixin_classname = display_class_like_name(context, mixin_classname);
+    let classname = display_class_like_name(context, classname);
     context.collector.report_with_code(
         IssueCode::NonExistentProperty,
         Issue::error(format!(
@@ -1073,6 +1080,7 @@ pub(super) fn report_magic_property_without_get_set_method(
 ) {
     let magic_method_name = if for_assignment { "__set" } else { "__get" };
     let access_type = if for_assignment { "write to" } else { "read from" };
+    let classname = display_class_like_name(context, classname);
 
     context.collector.report_with_code(
         IssueCode::MissingMagicMethod,
@@ -1303,7 +1311,7 @@ fn find_property_in_intersection_types(
                     });
                 }
             }
-            _ => continue,
+            _ => {}
         }
     }
 

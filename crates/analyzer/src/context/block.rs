@@ -13,8 +13,6 @@ use mago_codex::assertion::Assertion;
 use mago_codex::context::ScopeContext;
 use mago_codex::ttype::TType;
 use mago_codex::ttype::add_optional_union_type;
-use mago_codex::ttype::atomic::TAtomic;
-use mago_codex::ttype::atomic::scalar::TScalar;
 use mago_codex::ttype::comparator::ComparisonResult;
 use mago_codex::ttype::comparator::union_comparator;
 use mago_codex::ttype::get_mixed;
@@ -49,7 +47,7 @@ pub enum ReferenceConstraintSource {
 pub struct ReferenceConstraint {
     pub constraint_span: Span,
     pub source: ReferenceConstraintSource,
-    pub constraint_type: Option<TUnion>,
+    pub constraint_type: Option<Rc<TUnion>>,
 }
 
 #[derive(Clone, Debug)]
@@ -136,28 +134,40 @@ impl BreakContext {
 }
 
 impl ReferenceConstraint {
-    pub fn new(constraint_span: Span, source: ReferenceConstraintSource, constraint_type: Option<TUnion>) -> Self {
-        let constraint_type = match constraint_type {
-            Some(mut constraint_type) => {
-                if constraint_type.has_literal_string() {
-                    constraint_type.types.to_mut().push(TAtomic::Scalar(TScalar::string()));
-                }
+    pub fn new(constraint_span: Span, source: ReferenceConstraintSource, constraint_type: Option<Rc<TUnion>>) -> Self {
+        let constraint_type = constraint_type.map(|mut constraint_type| {
+            Rc::make_mut(&mut constraint_type).widen_literals();
 
-                if constraint_type.has_literal_int() {
-                    constraint_type.types.to_mut().push(TAtomic::Scalar(TScalar::int()));
-                }
-
-                if constraint_type.has_literal_float() {
-                    constraint_type.types.to_mut().push(TAtomic::Scalar(TScalar::float()));
-                }
-
-                Some(constraint_type)
-            }
-            None => None,
-        };
+            constraint_type
+        });
 
         Self { constraint_span, source, constraint_type }
     }
+}
+
+/// Locate the first accessor separator (`->` or `[`) in `var_name`. Returns
+/// the byte offset of the separator, or `None` if the name is a plain `$ident`.
+///
+/// A single linear scan with very favorable branch prediction.
+#[inline]
+fn find_accessor_separator(var_name: &str) -> Option<usize> {
+    let bytes = var_name.as_bytes();
+    let mut i = 0;
+    let len = bytes.len();
+    while i < len {
+        let b = bytes[i];
+        if b == b'[' {
+            return Some(i);
+        }
+
+        if b == b'-' && i + 1 < len && bytes[i + 1] == b'>' {
+            return Some(i);
+        }
+
+        i += 1;
+    }
+
+    None
 }
 
 impl<'ctx> BlockContext<'ctx> {
@@ -241,10 +251,12 @@ impl<'ctx> BlockContext<'ctx> {
             if let Some(this_type) = self.locals.get(var_id) {
                 if let Some(new_type) = new_locals.get(var_id) {
                     if new_type != this_type {
-                        redefined_vars.insert(*var_id, this_type.clone());
+                        redefined_vars.insert(*var_id, Rc::clone(this_type));
                     }
                 } else if include_new_vars {
-                    redefined_vars.insert(*var_id, this_type.clone());
+                    redefined_vars.insert(*var_id, Rc::clone(this_type));
+                } else {
+                    // variable is missing from new_locals and we aren't tracking newly-introduced ones
                 }
             } else {
                 removed_vars.insert(*var_id);
@@ -282,20 +294,20 @@ impl<'ctx> BlockContext<'ctx> {
 
         'outer: for c in clauses {
             if c.wedge {
-                included_clauses.push(c.clone());
+                included_clauses.push(Rc::clone(c));
                 continue;
             }
 
             for key in c.possibilities.keys() {
                 for changed_var_id in changed_var_ids {
                     if changed_var_id == key || var_has_root(*key, *changed_var_id) {
-                        rejected_clauses.push(c.clone());
+                        rejected_clauses.push(Rc::clone(c));
                         continue 'outer;
                     }
                 }
             }
 
-            included_clauses.push(c.clone());
+            included_clauses.push(Rc::clone(c));
         }
 
         (included_clauses, rejected_clauses)
@@ -343,7 +355,7 @@ impl<'ctx> BlockContext<'ctx> {
             let keep_clause = should_keep_clause(&clause, remove_var_id, new_type);
 
             if keep_clause {
-                clauses_to_keep.push(clause.clone());
+                clauses_to_keep.push(Rc::clone(&clause));
             } else {
                 other_clauses.push(clause);
             }
@@ -355,7 +367,7 @@ impl<'ctx> BlockContext<'ctx> {
             for clause in other_clauses {
                 let mut type_changed = false;
                 let Some(possibilities) = clause.possibilities.get(&remove_var_id) else {
-                    clauses_to_keep.push(clause.clone());
+                    clauses_to_keep.push(Rc::clone(&clause));
 
                     continue;
                 };
@@ -384,7 +396,7 @@ impl<'ctx> BlockContext<'ctx> {
                 }
 
                 if !type_changed {
-                    clauses_to_keep.push(clause.clone());
+                    clauses_to_keep.push(Rc::clone(&clause));
                 }
             }
         }
@@ -434,29 +446,13 @@ impl<'ctx> BlockContext<'ctx> {
     /// Registers a variable that is referenced conditionally, like in a property
     /// or array access (`$foo->bar`, `$foo[0]`).
     pub fn add_conditionally_referenced_variable(&mut self, var_name: &str) {
-        /// Strips an accessor suffix (from the first `->` or `[`) from a variable name.
-        /// Returns the original slice if no accessor is found.
-        fn strip_accessor_suffix(var_name: &str) -> &str {
-            let first_separator_pos = var_name
-                .find("->")
-                .map(|pos| {
-                    // If we find '->', see if '[' comes before it.
-                    var_name.find('[').map_or(pos, |bracket_pos| pos.min(bracket_pos))
-                })
-                .or_else(|| {
-                    // If '->' wasn't found, just look for '['.
-                    var_name.find('[')
-                });
-
-            if let Some(pos) = first_separator_pos { &var_name[..pos] } else { var_name }
-        }
-
-        let stripped_var = strip_accessor_suffix(var_name);
-
-        // A variable is conditionally referenced if it's part of an access chain
-        // (i.e., its suffix was stripped) and the base variable is not `$this`.
-        if stripped_var != "$this" || stripped_var != var_name {
-            self.conditionally_referenced_variable_ids.insert(atom(var_name));
+        match find_accessor_separator(var_name) {
+            None if var_name == "$this" => {
+                // Nothing
+            }
+            _ => {
+                self.conditionally_referenced_variable_ids.insert(atom(var_name));
+            }
         }
     }
 
@@ -466,6 +462,20 @@ impl<'ctx> BlockContext<'ctx> {
     pub fn has_variable(&mut self, var_name: &str) -> bool {
         self.add_conditionally_referenced_variable(var_name);
         self.locals.contains_key(&atom(var_name))
+    }
+
+    /// Variant of [`add_conditionally_referenced_variable`] that accepts an
+    /// already-interned [`Atom`] together with the original string. Saves one
+    /// `atom()` lookup on the hot path that already has the atom available.
+    pub fn add_conditionally_referenced_variable_atom(&mut self, var_name: &str, var_atom: Atom) {
+        match find_accessor_separator(var_name) {
+            None if var_name == "$this" => {
+                // Nothing
+            }
+            _ => {
+                self.conditionally_referenced_variable_ids.insert(var_atom);
+            }
+        }
     }
 
     pub(crate) fn remove_variable<'arena>(

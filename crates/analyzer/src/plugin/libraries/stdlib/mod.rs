@@ -43,6 +43,8 @@ impl Plugin for StdlibPlugin {
         registry.register_function_provider(spl::IteratorToArrayProvider);
         registry.register_function_provider(array::ArrayColumnProvider);
         registry.register_function_provider(array::ArrayFilterProvider);
+        registry.register_function_provider(array::ArrayFlipProvider);
+        registry.register_function_provider(array::ArrayKeyExistsProvider);
         registry.register_function_provider(array::ArrayMapProvider);
         registry.register_function_provider(array::ArrayMergeProvider);
         registry.register_function_provider(array::CompactProvider);
@@ -57,6 +59,7 @@ impl Plugin for StdlibPlugin {
         registry.register_function_call_hook(cookie::SetCookieHook);
         registry.register_function_call_hook(session::SessionSetSaveHandlerHook);
         registry.register_function_call_hook(session::SessionSetCookieParamsHook);
+        registry.register_function_call_hook(math::IntdivHook);
 
         registry.register_method_provider(closure::ClosureGetCurrentProvider);
         registry.register_method_provider(r#enum::EnumCasesProvider);

@@ -29,11 +29,13 @@ pub mod utils;
 pub struct ArgumentState {
     expand_first_argument: bool,
     expand_last_argument: bool,
+    named_argument_padding: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ParameterState {
     list_group_id: Option<GroupIdentifier>,
+    variable_padding: Option<usize>,
 }
 
 /// A region of source code that should not be formatted.
@@ -80,9 +82,8 @@ fn build_ignore_markers<'arena>(
 
         if has_start && current_start.is_none() {
             current_start = Some(comment.span.start.offset);
-        } else if has_end && current_start.is_some() {
-            regions.push(IgnoreRegion { start: current_start.unwrap(), end: comment.span.end.offset });
-            current_start = None;
+        } else if has_end && let Some(start) = current_start.take() {
+            regions.push(IgnoreRegion { start, end: comment.span.end.offset });
         }
 
         if has_next {

@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::rc::Rc;
 
 use mago_atom::atom;
@@ -116,25 +117,28 @@ fn read_variable<'ctx>(
     variable_name: &str,
     variable_span: Span,
 ) -> Rc<TUnion> {
-    let _ = block_context.has_variable(variable_name);
+    let variable_atom = atom(variable_name);
+    block_context.add_conditionally_referenced_variable_atom(variable_name, variable_atom);
 
-    let variable_type = match block_context.locals.get(&atom(variable_name)) {
-        Some(variable_type) => variable_type.clone(),
+    let variable_type = match block_context.locals.get(&variable_atom) {
+        Some(variable_type) => Rc::clone(variable_type),
         None => {
-            if block_context.variables_possibly_in_scope.contains(&atom(variable_name)) {
-                context.collector.report_with_code(
-                    IssueCode::PossiblyUndefinedVariable,
-                    Issue::warning(format!(
-                        "Variable `{variable_name}` might not have been defined on all execution paths leading to this point.",
-                    ))
-                    .with_annotation(
-                        Annotation::primary(variable_span)
-                            .with_message(format!("`{variable_name}` might be undefined here")),
-                    )
-                    .with_note("This can happen if the variable is assigned within a conditional block and there's an execution path to this usage where that block is skipped.")
-                    .with_note("Accessing an undefined variable will result in an `E_WARNING` (PHP 8+) or `E_NOTICE` (PHP 7) and it will be treated as `null`.")
-                    .with_help(format!("Initialize `{variable_name}` before conditional paths, or use `isset()` to check its existence."))
-                );
+            if block_context.variables_possibly_in_scope.contains(&variable_atom) {
+                if !block_context.flags.inside_isset() && !block_context.flags.inside_unset() {
+                    context.collector.report_with_code(
+                        IssueCode::PossiblyUndefinedVariable,
+                        Issue::warning(format!(
+                            "Variable `{variable_name}` might not have been defined on all execution paths leading to this point.",
+                        ))
+                        .with_annotation(
+                            Annotation::primary(variable_span)
+                                .with_message(format!("`{variable_name}` might be undefined here")),
+                        )
+                        .with_note("This can happen if the variable is assigned within a conditional block and there's an execution path to this usage where that block is skipped.")
+                        .with_note("Accessing an undefined variable will result in an `E_WARNING` (PHP 8+) or `E_NOTICE` (PHP 7) and it will be treated as `null`.")
+                        .with_help(format!("Initialize `{variable_name}` before conditional paths, or use `isset()` to check its existence."))
+                    );
+                }
 
                 Rc::new(get_mixed())
             } else if block_context.flags.inside_variable_reference() {
@@ -158,14 +162,13 @@ fn read_variable<'ctx>(
 
                 // This variable does not currently exist, but is being referenced.
                 // therefore, we need to analyze it as if it was being assigned `null`.
-                let variable_atom = atom(variable_name);
                 assignment::analyze_assignment_to_variable(
                     context,
                     block_context,
                     artifacts,
                     variable_span,
                     None,
-                    get_null(),
+                    Rc::new(get_null()),
                     variable_atom,
                     false,
                 );
@@ -205,6 +208,8 @@ fn read_variable<'ctx>(
                     help_message = format!(
                         "Ensure `{variable_name}` is assigned before use, or check for typos and variable scope."
                     );
+                } else {
+                    // confusable-character note above already explains the likely cause; keep default help
                 }
 
                 context.collector.report_with_code(IssueCode::UndefinedVariable, issue.with_help(help_message));
@@ -281,7 +286,7 @@ fn find_similar_variable_names(context: &BlockContext<'_>, target: &str) -> Vec<
                 let c2 = s2_buf[j];
                 let prev_val = row[j + 1];
 
-                let substitution = prev_sub + if c1 == c2 { 0 } else { 1 };
+                let substitution = prev_sub + usize::from(c1 != c2);
                 let deletion = prev_val + 1;
                 let insertion = row[j] + 1;
 
@@ -334,9 +339,13 @@ fn generate_confusable_character_note(variable_name: &str) -> Option<String> {
                     confusable_examples.push("'а' (Cyrillic 'a')");
                 } else if c == '\u{03BF}' {
                     confusable_examples.push("'ο' (Greek 'o')");
+                } else {
+                    // some other non-ASCII alphabetic; flagged but no concrete confusable example to surface
                 }
             } else if c > '\x7F' {
                 has_non_std_ascii_alphanumeric = true;
+            } else {
+                // ASCII non-alphanumeric character that isn't underscore; no further action
             }
         }
     }
@@ -344,7 +353,7 @@ fn generate_confusable_character_note(variable_name: &str) -> Option<String> {
     if has_non_std_ascii_alphanumeric {
         let mut note = format!("Variable name `{variable_name}` contains non-standard ASCII alphanumeric characters.");
         if !confusable_examples.is_empty() {
-            note.push_str(&format!(" For example, it might contain {}.", confusable_examples.join(" or ")));
+            let _ = write!(note, " For example, it might contain {}.", confusable_examples.join(" or "));
         }
 
         note.push_str(" Please verify all characters are intended.");

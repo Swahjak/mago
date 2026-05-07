@@ -26,12 +26,12 @@ use crate::context::Context;
 use crate::context::block::BlockContext;
 use crate::error::AnalysisError;
 use crate::expression::binary::utils::are_definitely_not_identical;
+use crate::expression::binary::utils::are_definitely_not_loosely_equal;
 use crate::expression::binary::utils::is_always_greater_than;
 use crate::expression::binary::utils::is_always_greater_than_or_equal;
 use crate::expression::binary::utils::is_always_identical_to;
 use crate::expression::binary::utils::is_always_less_than;
 use crate::expression::binary::utils::is_always_less_than_or_equal;
-use crate::expression::binary::utils::types_share_category;
 use crate::utils::misc::unwrap_expression;
 
 /// Analyzes standard comparison operations (e.g., `==`, `===`, `<`, `<=`, `>`, `>=`).
@@ -66,6 +66,9 @@ pub fn analyze_comparison_operation<'ctx, 'arena>(
     if context.settings.no_boolean_literal_comparison
         // Only consider equality/inequality operators.
         && binary.operator.is_equality()
+        // Skip synthetic comparisons (e.g., those fabricated for match-arm analysis),
+        // whose operator carries `Span::zero()` and cannot be safely rewritten.
+        && !binary.operator.span().file_id.is_zero()
         // Identify if one side is a boolean literal and the other side's type is `bool`.
         && let Some((variable_expr, literal_expr, literal_value)) =
             if let Some(literal_value) = get_boolean_literal(binary.rhs) {
@@ -154,6 +157,8 @@ pub fn analyze_comparison_operation<'ctx, 'arena>(
             );
 
             reported_general_invalid_operand = true;
+        } else {
+            // both sides are arrays, both non-arrays, or one side is null; no array/non-array mismatch
         }
     }
 
@@ -253,43 +258,35 @@ pub fn analyze_comparison_operation<'ctx, 'arena>(
                     get_bool()
                 }
             }
-            BinaryOperator::Equal(_) | BinaryOperator::AngledNotEqual(_) => {
-                let should_be_specific = should_use_specific_equality_inference(
-                    block_context,
-                    binary.lhs,
-                    lhs_type,
-                    binary.rhs,
-                    rhs_type,
-                    false,
-                );
+            BinaryOperator::Equal(_) => {
+                let should_be_specific =
+                    should_use_specific_equality_inference(block_context, binary.lhs, binary.rhs, false);
 
-                if should_be_specific && is_always_identical_to(lhs_type, rhs_type) {
+                if !should_be_specific {
+                    get_bool()
+                } else if is_always_identical_to(lhs_type, rhs_type) {
                     if !block_context.flags.inside_loop_expressions() {
-                        let (message_verb, result_value_str) = if matches!(binary.operator, BinaryOperator::Equal(_)) {
-                            ("always equal to", "`true`")
-                        } else {
-                            ("never equal to (always not equal)", "`false`")
-                        };
-
-                        report_redundant_comparison(context, artifacts, binary, message_verb, result_value_str);
+                        report_redundant_comparison(context, artifacts, binary, "always equal to", "`true`");
                     }
 
-                    if matches!(binary.operator, BinaryOperator::Equal(_)) { get_true() } else { get_false() }
+                    get_true()
+                } else if are_definitely_not_loosely_equal(context.codebase, lhs_type, rhs_type) {
+                    if !block_context.flags.inside_loop_expressions() {
+                        report_redundant_comparison(context, artifacts, binary, "never equal to", "`false`");
+                    }
+
+                    get_false()
                 } else {
                     get_bool()
                 }
             }
-            BinaryOperator::NotEqual(_) => {
-                let should_be_specific = should_use_specific_equality_inference(
-                    block_context,
-                    binary.lhs,
-                    lhs_type,
-                    binary.rhs,
-                    rhs_type,
-                    false,
-                );
+            BinaryOperator::NotEqual(_) | BinaryOperator::AngledNotEqual(_) => {
+                let should_be_specific =
+                    should_use_specific_equality_inference(block_context, binary.lhs, binary.rhs, false);
 
-                if should_be_specific && is_always_identical_to(lhs_type, rhs_type) {
+                if !should_be_specific {
+                    get_bool()
+                } else if is_always_identical_to(lhs_type, rhs_type) {
                     if !block_context.flags.inside_loop_expressions() {
                         report_redundant_comparison(
                             context,
@@ -301,19 +298,25 @@ pub fn analyze_comparison_operation<'ctx, 'arena>(
                     }
 
                     get_false()
+                } else if are_definitely_not_loosely_equal(context.codebase, lhs_type, rhs_type) {
+                    if !block_context.flags.inside_loop_expressions() {
+                        report_redundant_comparison(
+                            context,
+                            artifacts,
+                            binary,
+                            "always not equal to (always true for !=)",
+                            "`true`",
+                        );
+                    }
+
+                    get_true()
                 } else {
                     get_bool()
                 }
             }
             BinaryOperator::Identical(_) => {
-                let should_be_specific = should_use_specific_equality_inference(
-                    block_context,
-                    binary.lhs,
-                    lhs_type,
-                    binary.rhs,
-                    rhs_type,
-                    true,
-                );
+                let should_be_specific =
+                    should_use_specific_equality_inference(block_context, binary.lhs, binary.rhs, true);
 
                 if !should_be_specific {
                     get_bool()
@@ -334,14 +337,8 @@ pub fn analyze_comparison_operation<'ctx, 'arena>(
                 }
             }
             BinaryOperator::NotIdentical(_) => {
-                let should_be_specific = should_use_specific_equality_inference(
-                    block_context,
-                    binary.lhs,
-                    lhs_type,
-                    binary.rhs,
-                    rhs_type,
-                    true,
-                );
+                let should_be_specific =
+                    should_use_specific_equality_inference(block_context, binary.lhs, binary.rhs, true);
 
                 if !should_be_specific {
                     get_bool()
@@ -389,14 +386,11 @@ fn get_boolean_literal(expr: &Expression<'_>) -> Option<bool> {
 fn should_use_specific_equality_inference(
     block_context: &BlockContext<'_>,
     lhs: &Expression<'_>,
-    lhs_type: &TUnion,
     rhs: &Expression<'_>,
-    rhs_type: &TUnion,
     identity: bool,
 ) -> bool {
     if identity {
-        (!block_context.flags.inside_loop() || !types_share_category(lhs_type, rhs_type))
-            && !involves_external_reference(lhs, block_context)
+        !involves_external_reference(lhs, block_context)
             && !involves_external_reference(rhs, block_context)
             && !involves_static_variable(lhs, block_context)
             && !involves_static_variable(rhs, block_context)
@@ -485,13 +479,15 @@ fn check_comparison_operand<'ast, 'arena>(
             .with_note(format!("If this operand is `false` at runtime, PHP's specific comparison rules for `false` with `{op_str}` will apply."))
             .with_help("Ensure this operand is non-false or that comparison with `false` is intended and handled safely."),
         );
+    } else {
+        // operand isn't null/mixed/false-bearing; no comparison-operand diagnostic to emit
     }
 }
 
 /// Helper to report redundant comparison issues.
 fn report_redundant_comparison<'arena>(
     context: &mut Context<'_, 'arena>,
-    artifacts: &mut AnalysisArtifacts,
+    artifacts: &AnalysisArtifacts,
     binary: &Binary<'arena>,
     comparison_description: &str,
     result_value_str: &str,

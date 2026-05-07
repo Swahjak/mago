@@ -3,6 +3,7 @@ use strum::Display;
 
 use mago_span::HasSpan;
 use mago_span::Span;
+use mago_syntax_core::ast::Sequence;
 
 use crate::ast::Type;
 use crate::ast::VariableType;
@@ -18,38 +19,39 @@ pub enum CallableTypeKind {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, PartialOrd, Ord)]
-pub struct CallableType<'input> {
+pub struct CallableType<'arena> {
     pub kind: CallableTypeKind,
-    pub keyword: Keyword<'input>,
-    pub specification: Option<CallableTypeSpecification<'input>>,
+    pub keyword: Keyword<'arena>,
+    pub specification: Option<CallableTypeSpecification<'arena>>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, PartialOrd, Ord)]
-pub struct CallableTypeSpecification<'input> {
-    pub parameters: CallableTypeParameters<'input>,
-    pub return_type: Option<CallableTypeReturnType<'input>>,
+pub struct CallableTypeSpecification<'arena> {
+    pub parameters: CallableTypeParameters<'arena>,
+    pub return_type: Option<CallableTypeReturnType<'arena>>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, PartialOrd, Ord)]
-pub struct CallableTypeParameters<'input> {
+pub struct CallableTypeParameters<'arena> {
     pub left_parenthesis: Span,
-    pub entries: Vec<CallableTypeParameter<'input>>,
+    pub entries: Sequence<'arena, CallableTypeParameter<'arena>>,
     pub right_parenthesis: Span,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, PartialOrd, Ord)]
-pub struct CallableTypeParameter<'input> {
-    pub parameter_type: Option<Type<'input>>,
+pub struct CallableTypeParameter<'arena> {
+    pub parameter_type: Option<Type<'arena>>,
+    pub ampersand: Option<Span>,
     pub equals: Option<Span>,
     pub ellipsis: Option<Span>,
-    pub variable: Option<VariableType<'input>>,
+    pub variable: Option<VariableType<'arena>>,
     pub comma: Option<Span>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, PartialOrd, Ord)]
-pub struct CallableTypeReturnType<'input> {
+pub struct CallableTypeReturnType<'arena> {
     pub colon: Span,
-    pub return_type: Box<Type<'input>>,
+    pub return_type: &'arena Type<'arena>,
 }
 
 impl CallableTypeKind {
@@ -77,6 +79,12 @@ impl CallableTypeParameter<'_> {
     #[must_use]
     pub const fn is_optional(&self) -> bool {
         self.equals.is_some()
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn is_by_reference(&self) -> bool {
+        self.ampersand.is_some()
     }
 }
 
@@ -109,11 +117,12 @@ impl HasSpan for CallableTypeParameter<'_> {
         let start = match &self.parameter_type {
             Some(parameter_type) => parameter_type.span(),
             None => self
-                .equals
+                .ampersand
+                .or(self.equals)
                 .or(self.ellipsis)
                 .or(self.variable.as_ref().map(mago_span::HasSpan::span))
                 .or(self.comma)
-                .unwrap(),
+                .unwrap_or_else(Span::zero),
         };
 
         let end = self
@@ -121,6 +130,7 @@ impl HasSpan for CallableTypeParameter<'_> {
             .or(self.variable.as_ref().map(mago_span::HasSpan::span))
             .or(self.ellipsis)
             .or(self.equals)
+            .or(self.ampersand)
             .unwrap_or(start);
 
         start.join(end)
@@ -145,10 +155,16 @@ impl std::fmt::Display for CallableTypeParameter<'_> {
             write!(f, "{parameter_type}")?;
         }
 
+        if self.ampersand.is_some() {
+            write!(f, " &")?;
+        }
+
         if self.equals.is_some() {
             write!(f, "=")?;
         } else if self.ellipsis.is_some() {
             write!(f, "...")?;
+        } else {
+            // No default marker: parameter is required and not variadic.
         }
 
         if let Some(variable) = &self.variable {

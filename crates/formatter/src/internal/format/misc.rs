@@ -9,6 +9,7 @@ use mago_syntax::ast::ArrayAccess;
 use mago_syntax::ast::ArrayElement;
 use mago_syntax::ast::AttributeList;
 use mago_syntax::ast::Call;
+use mago_syntax::ast::CompositeString;
 use mago_syntax::ast::ConstantAccess;
 use mago_syntax::ast::Expression;
 use mago_syntax::ast::Identifier;
@@ -16,9 +17,11 @@ use mago_syntax::ast::Instantiation;
 use mago_syntax::ast::Keyword;
 use mago_syntax::ast::Literal;
 use mago_syntax::ast::Modifier;
+use mago_syntax::ast::ModifierSequenceExt;
 use mago_syntax::ast::Node;
 use mago_syntax::ast::Sequence;
 use mago_syntax::ast::Statement;
+use mago_syntax::ast::StringPart;
 use mago_syntax::ast::Terminator;
 use mago_syntax::ast::UnaryPrefixOperator;
 use mago_syntax::ast::Variable;
@@ -46,6 +49,21 @@ use super::block::block_is_empty;
 #[inline(always)]
 pub(super) fn has_new_line_in_range(text: &str, start: u32, end: u32) -> bool {
     text[start as usize..end as usize].contains('\n')
+}
+
+pub(crate) fn get_document_width(doc: &Document<'_>) -> usize {
+    match doc {
+        Document::String(s) => string_width(s),
+        Document::Array(docs) => docs.iter().map(get_document_width).sum(),
+        Document::Group(group) => group.contents.iter().map(get_document_width).sum(),
+        Document::Indent(docs) => docs.iter().map(get_document_width).sum(),
+        Document::Line(_) => 1,
+        Document::IfBreak(if_break) => {
+            get_document_width(if_break.break_contents).max(get_document_width(if_break.flat_content))
+        }
+        Document::IndentIfBreak(indent_if_break) => indent_if_break.contents.iter().map(get_document_width).sum(),
+        _ => 0,
+    }
 }
 
 /// Determines whether an expression can be "hugged" within brackets without line breaks.
@@ -463,6 +481,7 @@ pub(super) fn is_simple_call_argument<'arena>(node: &'arena Expression<'arena>, 
         }
         Expression::Array(array) => array.elements.iter().all(is_simple_element),
         Expression::LegacyArray(array) => array.elements.iter().all(is_simple_element),
+        Expression::CompositeString(composite_string) => is_simple_composite_string_argument(composite_string, depth),
         Expression::Call(call) => {
             let argument_list = match call {
                 Call::Function(function_call) => {
@@ -522,6 +541,18 @@ pub(super) fn is_simple_call_argument<'arena>(node: &'arena Expression<'arena>, 
         }
         _ => false,
     }
+}
+
+fn is_simple_composite_string_argument(composite_string: &CompositeString<'_>, depth: usize) -> bool {
+    if matches!(composite_string, CompositeString::Document(_)) {
+        return false;
+    }
+
+    composite_string.parts().iter().all(|part| match part {
+        StringPart::Literal(literal) => !literal.value.contains(['\n', '\r']),
+        StringPart::Expression(expression) => is_simple_call_argument(expression, depth),
+        StringPart::BracedExpression(braced) => is_simple_call_argument(braced.expression, depth),
+    })
 }
 
 pub(super) fn print_colon_delimited_body<'arena>(

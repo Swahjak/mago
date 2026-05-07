@@ -1,3 +1,4 @@
+use mago_atom::Atom;
 use mago_atom::atom;
 use mago_names::scope::NamespaceScope;
 use mago_span::HasSpan;
@@ -10,10 +11,13 @@ use crate::scanner::Context;
 use crate::scanner::attribute::scan_attribute_lists;
 use crate::scanner::inference::infer;
 
+use super::super::ttype::union::TUnion;
+
 #[inline]
 pub fn scan_enum_case<'arena>(
+    enum_name: Atom,
     case: &'arena EnumCase<'arena>,
-    context: &mut Context<'_, 'arena>,
+    context: &Context<'_, 'arena>,
     scope: &NamespaceScope,
 ) -> EnumCaseMetadata {
     let span = case.span();
@@ -22,11 +26,7 @@ pub fn scan_enum_case<'arena>(
     match &case.item {
         EnumCaseItem::Unit(item) => {
             let mut flags = MetadataFlags::UNIT_ENUM_CASE;
-            if context.file.file_type.is_host() {
-                flags |= MetadataFlags::USER_DEFINED;
-            } else if context.file.file_type.is_builtin() {
-                flags |= MetadataFlags::BUILTIN;
-            }
+            flags |= MetadataFlags::origin_flags(context.file.file_type);
 
             let mut meta = EnumCaseMetadata::new(atom(item.name.value), item.name.span, span, flags);
 
@@ -36,17 +36,12 @@ pub fn scan_enum_case<'arena>(
         }
         EnumCaseItem::Backed(item) => {
             let mut flags = MetadataFlags::BACKED_ENUM_CASE;
-            if context.file.file_type.is_host() {
-                flags |= MetadataFlags::USER_DEFINED;
-            } else if context.file.file_type.is_builtin() {
-                flags |= MetadataFlags::BUILTIN;
-            }
+            flags |= MetadataFlags::origin_flags(context.file.file_type);
 
             let mut meta = EnumCaseMetadata::new(atom(item.name.value), item.name.span, span, flags);
 
             meta.attributes = attributes;
-            meta.value_type =
-                infer(context, scope, item.value).map(super::super::ttype::union::TUnion::get_single_owned);
+            meta.value_type = infer(context, scope, item.value, Some(enum_name)).map(TUnion::get_single_owned);
 
             meta
         }

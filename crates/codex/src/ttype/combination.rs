@@ -54,11 +54,13 @@ impl CombinationFlags {
     }
 
     #[inline]
+    #[must_use]
     pub const fn contains(self, other: CombinationFlags) -> bool {
         (self.0 & other.0) == other.0
     }
 
     #[inline]
+    #[must_use]
     pub const fn intersects(self, other: CombinationFlags) -> bool {
         (self.0 & other.0) != 0
     }
@@ -147,6 +149,7 @@ pub struct TypeCombination {
     pub keyed_array_parameters: Option<(TUnion, TUnion)>,
     pub list_array_parameter: Option<TUnion>,
     pub sealed_arrays: Vec<TArray>,
+    pub sealed_keyed_budget_exhausted: bool,
     pub integers: Vec<TInteger>,
     pub literal_strings: AtomSet,
     pub literal_floats: Vec<OrderedFloat<f64>>,
@@ -176,6 +179,7 @@ impl TypeCombination {
             keyed_array_parameters: None,
             list_array_parameter: None,
             sealed_arrays: Vec::new(),
+            sealed_keyed_budget_exhausted: false,
             literal_strings: AtomSet::default(),
             integers: Vec::new(),
             literal_floats: Vec::new(),

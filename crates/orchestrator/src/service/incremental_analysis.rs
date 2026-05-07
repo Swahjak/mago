@@ -8,6 +8,7 @@ use foldhash::HashSet;
 
 use mago_analyzer::Analyzer;
 use mago_analyzer::analysis_result::AnalysisResult;
+use mago_analyzer::artifacts::AnalysisArtifacts;
 use mago_analyzer::plugin::PluginRegistry;
 use mago_analyzer::settings::Settings;
 use mago_atom::AtomSet;
@@ -74,9 +75,14 @@ impl std::fmt::Debug for IncrementalAnalysisService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IncrementalAnalysisService")
             .field("database", &"<ReadDatabase>")
+            .field("codebase", &"<CodebaseMetadata>")
+            .field("symbol_references", &"<SymbolReferences>")
+            .field("base_codebase", &"<Arc<CodebaseMetadata>>")
+            .field("base_symbol_references", &"<Arc<SymbolReferences>>")
             .field("settings", &self.settings)
             .field("parser_settings", &self.parser_settings)
-            .field("file_states", &format!("{} tracked files", self.file_states.len()))
+            .field("file_states", &format_args!("{} tracked files", self.file_states.len()))
+            .field("plugin_registry", &"<Arc<PluginRegistry>>")
             .field("initialized", &self.initialized)
             .field("codebase_issues", &self.codebase_issues.len())
             .finish()
@@ -235,6 +241,11 @@ impl IncrementalAnalysisService {
     ///
     /// After this call, [`analyze_incremental()`](Self::analyze_incremental) can be used
     /// for subsequent runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrchestratorError`] when source scanning, codebase population, or per-file
+    /// analysis fails.
     pub fn analyze(&mut self) -> Result<AnalysisResult, OrchestratorError> {
         let source_files: Vec<_> = self.database.files().filter(|f| f.file_type != FileType::Builtin).collect();
 
@@ -273,11 +284,22 @@ impl IncrementalAnalysisService {
             .collect();
 
         let mut merged_codebase = (*self.base_codebase).clone();
-        let mut file_states = HashMap::default();
 
-        for (file_id, content_hash, metadata) in per_file_results {
-            let entry_keys = metadata.extract_keys();
-            merged_codebase.extend(metadata);
+        let staged: Vec<(FileId, u64, CodebaseMetadata)> = per_file_results
+            .into_iter()
+            .map(|(file_id, content_hash, metadata)| {
+                let clone_for_ownership = metadata.clone();
+                merged_codebase.extend(metadata);
+                (file_id, content_hash, clone_for_ownership)
+            })
+            .collect();
+
+        let mut symbol_references = (*self.base_symbol_references).clone();
+        populate_codebase(&mut merged_codebase, &mut symbol_references, AtomSet::default(), HashSet::default());
+
+        let mut file_states: HashMap<FileId, FileState> = HashMap::default();
+        for (file_id, content_hash, metadata) in staged {
+            let entry_keys = metadata.extract_owned_keys(&merged_codebase);
             file_states.insert(
                 file_id,
                 FileState {
@@ -288,9 +310,6 @@ impl IncrementalAnalysisService {
                 },
             );
         }
-
-        let mut symbol_references = (*self.base_symbol_references).clone();
-        populate_codebase(&mut merged_codebase, &mut symbol_references, AtomSet::default(), HashSet::default());
 
         let (mut analysis_result, per_file_issues) =
             self.run_analyzer_selective(&merged_codebase, symbol_references, &self.settings, &HashSet::default())?;
@@ -332,14 +351,19 @@ impl IncrementalAnalysisService {
     ///   Files not in this set are assumed unchanged, avoiding O(all files) hashing.
     ///   Pass `None` to hash all files (correct but slower).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if called before [`analyze()`](Self::analyze) has been run at least once.
+    /// Returns [`OrchestratorError::General`] if `analyze()` has not been called yet, or when
+    /// re-scanning, populator updates, or per-file analysis fails for the changed subset.
     pub fn analyze_incremental(
         &mut self,
         changed_hint: Option<&[FileId]>,
     ) -> Result<AnalysisResult, OrchestratorError> {
-        assert!(self.initialized, "analyze() must be called before analyze_incremental()");
+        if !self.initialized {
+            return Err(OrchestratorError::General(
+                "analyze() must be called before analyze_incremental()".to_string(),
+            ));
+        }
 
         let source_files: Vec<_> = self.database.files().filter(|f| f.file_type != FileType::Builtin).collect();
 
@@ -582,7 +606,9 @@ impl IncrementalAnalysisService {
             for (file_id, metadata) in new_file_scans {
                 let content_hash = file_hashes[&file_id];
                 let analysis_issues = per_file_issues.remove(&file_id).unwrap_or_default();
-                let entry_keys = metadata.extract_keys();
+                // Owned keys (spans match merged) so a future touch of this file does
+                // not clobber a rival file that won the tiebreak over this one.
+                let entry_keys = metadata.extract_owned_keys(&merged_codebase);
                 let codebase_issues =
                     self.file_states.get(&file_id).map(|s| s.codebase_issues.clone()).unwrap_or_default();
                 self.file_states
@@ -620,11 +646,11 @@ impl IncrementalAnalysisService {
         merged_codebase.safe_symbols.clear();
         merged_codebase.safe_symbol_members.clear();
 
-        if !merged_codebase.mark_safe_symbols(&diff, &self.symbol_references) {
+        let Some(global_scope_invalid) = merged_codebase.mark_safe_symbols(&diff, &self.symbol_references) else {
             tracing::warn!("Invalidation cascade too expensive (>5000 steps), falling back to full analysis");
 
             return self.analyze();
-        }
+        };
 
         // Ensure classes that depend on changed class_likes are not marked safe.
         // This handles cases where reference graph edges were lost (e.g., a parent
@@ -689,13 +715,22 @@ impl IncrementalAnalysisService {
         let mut files_to_skip: HashSet<FileId> = HashSet::default();
         for &file_id in &unchanged_file_ids {
             if let Some(sig) = merged_codebase.get_file_signature(&file_id) {
-                let all_safe = sig.ast_nodes.iter().all(|node| {
-                    let symbol_safe = node.name.is_empty() || merged_codebase.safe_symbols.contains(&node.name);
-                    let children_safe = node.children.iter().all(|child| {
-                        child.name.is_empty() || merged_codebase.safe_symbol_members.contains(&(node.name, child.name))
-                    });
-                    symbol_safe && children_safe
-                });
+                let all_safe = if sig.ast_nodes.is_empty() {
+                    // A file with no named top-level symbols contains only
+                    // global-scope code. Global-scope code is tracked under the
+                    // (empty, empty) pseudo-symbol in the reference graph, so
+                    // check whether that pseudo-symbol was invalidated.
+                    !global_scope_invalid
+                } else {
+                    sig.ast_nodes.iter().all(|node| {
+                        let symbol_safe = node.name.is_empty() || merged_codebase.safe_symbols.contains(&node.name);
+                        let children_safe = node.children.iter().all(|child| {
+                            child.name.is_empty()
+                                || merged_codebase.safe_symbol_members.contains(&(node.name, child.name))
+                        });
+                        symbol_safe && children_safe
+                    })
+                };
 
                 if all_safe {
                     files_to_skip.insert(file_id);
@@ -789,7 +824,9 @@ impl IncrementalAnalysisService {
         for (file_id, metadata) in new_file_scans {
             let content_hash = file_hashes[&file_id];
             let analysis_issues = per_file_issues.remove(&file_id).unwrap_or_default();
-            let entry_keys = metadata.extract_keys();
+            // Owned keys (spans match merged) so a future touch of this file does
+            // not clobber a rival file that won the tiebreak over this one.
+            let entry_keys = metadata.extract_owned_keys(&merged_codebase);
             let codebase_issues = self.file_states.get(&file_id).map(|s| s.codebase_issues.clone()).unwrap_or_default();
             self.file_states.insert(file_id, FileState { content_hash, entry_keys, analysis_issues, codebase_issues });
         }
@@ -800,6 +837,47 @@ impl IncrementalAnalysisService {
         analysis_result.issues = self.collect_all_issues();
 
         Ok(analysis_result)
+    }
+
+    /// Analyzes a single file and returns both its issues and the
+    /// [`AnalysisArtifacts`] (per-expression types, assertions, inferred
+    /// returns, etc.) produced during analysis.
+    ///
+    /// Used by editor integrations that need precise type information at
+    /// arbitrary cursor positions; LSP completion and hover both rely on
+    /// this to answer "what's the type of `$obj` here?".
+    #[must_use]
+    pub fn analyze_file_with_artifacts(&self, file_id: FileId) -> Option<(IssueCollection, AnalysisArtifacts)> {
+        let file = self.database.get(&file_id).ok()?;
+
+        let arena = Bump::new();
+        let program = parse_file_with_settings(&arena, &file, self.parser_settings);
+        let resolved_names = NameResolver::new(&arena).resolve(program);
+
+        let mut issues = IssueCollection::new();
+        if program.has_errors() {
+            for error in program.errors.iter() {
+                issues.push(Issue::from(error));
+            }
+        }
+
+        let semantics_checker = SemanticsChecker::new(self.settings.version);
+        issues.extend(semantics_checker.check(&file, program, &resolved_names));
+
+        let mut analysis_result = AnalysisResult::new(SymbolReferences::new());
+        let analyzer =
+            Analyzer::new(&arena, &file, &resolved_names, &self.codebase, &self.plugin_registry, self.settings.clone());
+
+        let artifacts = match analyzer.analyze_with_artifacts(program, &mut analysis_result) {
+            Ok(artifacts) => artifacts,
+            Err(err) => {
+                issues.push(Issue::error(format!("Analysis error: {err}")));
+                return Some((issues, AnalysisArtifacts::new()));
+            }
+        };
+
+        issues.extend(analysis_result.issues);
+        Some((issues, artifacts))
     }
 
     /// Analyzes a single file synchronously, returning its issues.
@@ -850,7 +928,7 @@ impl IncrementalAnalysisService {
         skip_files: &HashSet<FileId>,
     ) -> Result<(AnalysisResult, HashMap<FileId, IssueCollection>), OrchestratorError> {
         #[cfg(not(target_arch = "wasm32"))]
-        const ANALYSIS_DURATION_THRESHOLD: Duration = Duration::from_millis(5000);
+        const ANALYSIS_DURATION_THRESHOLD: Duration = Duration::from_secs(5);
 
         let host_files: Vec<_> = self
             .database
@@ -918,6 +996,7 @@ impl IncrementalAnalysisService {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::similar_names)]
 mod tests {
     use super::*;
 
@@ -1969,7 +2048,7 @@ mod tests {
             .analyze_incremental(Some(&[child_id]))
             .expect("Incremental analysis failed after signature change following body-only change.");
 
-        let mut fresh2 = make_service_with_settings(&db, settings.clone());
+        let mut fresh2 = make_service_with_settings(&db, settings);
         let full2 = fresh2.analyze().expect("Full analysis failed.");
 
         let (only_incr2, only_full2) = diff_issues(&cycle2.issues, &full2.issues);

@@ -24,11 +24,14 @@ use crate::ttype::atomic::derived::index_access::TIndexAccess;
 use crate::ttype::atomic::derived::int_mask::TIntMask;
 use crate::ttype::atomic::derived::int_mask_of::TIntMaskOf;
 use crate::ttype::atomic::derived::key_of::TKeyOf;
+use crate::ttype::atomic::derived::new::TNew;
 use crate::ttype::atomic::derived::properties_of::TPropertiesOf;
+use crate::ttype::atomic::derived::template_type::TTemplateType;
 use crate::ttype::atomic::derived::value_of::TValueOf;
 use crate::ttype::atomic::mixed::TMixed;
 use crate::ttype::atomic::object::TObject;
 use crate::ttype::atomic::object::named::TNamedObject;
+use crate::ttype::atomic::reference::TGlobalReferenceSelector;
 use crate::ttype::atomic::reference::TReference;
 use crate::ttype::atomic::reference::TReferenceMemberSelector;
 use crate::ttype::atomic::scalar::TScalar;
@@ -46,6 +49,11 @@ thread_local! {
 
     /// Thread-local set for tracking objects whose type parameters are being expanded (cycle detection).
     static EXPANDING_OBJECT_PARAMS: RefCell<HashSet<Atom, FixedState>> = const { RefCell::new(HashSet::with_hasher(FixedState::with_seed(0))) };
+
+    /// Thread-local set for tracking class constants whose inferred initializer is currently
+    /// being expanded. Used to break cycles like `const int b = self::b;` where the inferred
+    /// type of a constant is a reference to itself.
+    static EXPANDING_CONSTANTS: RefCell<HashSet<(Atom, Atom), FixedState>> = const { RefCell::new(HashSet::with_hasher(FixedState::with_seed(0))) };
 }
 
 /// Resets the thread-local alias expansion state.
@@ -56,6 +64,7 @@ thread_local! {
 pub fn reset_expansion_state() {
     EXPANDING_ALIASES.with(|set| set.borrow_mut().clear());
     EXPANDING_OBJECT_PARAMS.with(|set| set.borrow_mut().clear());
+    EXPANDING_CONSTANTS.with(|set| set.borrow_mut().clear());
 }
 
 /// RAII guard to ensure alias expansion state is properly cleaned up.
@@ -66,6 +75,7 @@ struct AliasExpansionGuard {
 }
 
 impl AliasExpansionGuard {
+    #[must_use]
     fn new(class_name: Atom, alias_name: Atom) -> Self {
         EXPANDING_ALIASES.with(|set| set.borrow_mut().insert((class_name, alias_name)));
         Self { class_name, alias_name }
@@ -84,6 +94,7 @@ struct ObjectParamsExpansionGuard {
 }
 
 impl ObjectParamsExpansionGuard {
+    #[must_use]
     fn try_new(object_name: Atom) -> Option<Self> {
         EXPANDING_OBJECT_PARAMS.with(|set| {
             let mut set = set.borrow_mut();
@@ -100,6 +111,38 @@ impl ObjectParamsExpansionGuard {
 impl Drop for ObjectParamsExpansionGuard {
     fn drop(&mut self) {
         EXPANDING_OBJECT_PARAMS.with(|set| set.borrow_mut().remove(&self.object_name));
+    }
+}
+
+/// RAII guard for class constant inferred-initializer expansion cycle detection.
+///
+/// A constant whose initializer references itself (directly via `self::FOO` or
+/// transitively via another constant) would otherwise drive `expand_member_reference`
+/// into infinite recursion. The guard tracks `(class_name, constant_name)` pairs that
+/// are currently being expanded and refuses re-entry.
+struct ConstantExpansionGuard {
+    class_name: Atom,
+    constant_name: Atom,
+}
+
+impl ConstantExpansionGuard {
+    #[must_use]
+    fn try_new(class_name: Atom, constant_name: Atom) -> Option<Self> {
+        EXPANDING_CONSTANTS.with(|set| {
+            let mut set = set.borrow_mut();
+            if set.contains(&(class_name, constant_name)) {
+                None
+            } else {
+                set.insert((class_name, constant_name));
+                Some(Self { class_name, constant_name })
+            }
+        })
+    }
+}
+
+impl Drop for ConstantExpansionGuard {
+    fn drop(&mut self) {
+        EXPANDING_CONSTANTS.with(|set| set.borrow_mut().remove(&(self.class_name, self.constant_name)));
     }
 }
 
@@ -256,6 +299,10 @@ pub(crate) fn expand_atomic(
             *skip_key = true;
             expand_member_reference(*class_like_name, member_selector, codebase, options, new_return_type_parts);
         }
+        TAtomic::Reference(TReference::Global { selector }) => {
+            *skip_key = true;
+            expand_global_reference(selector, codebase, options, new_return_type_parts);
+        }
         TAtomic::Callable(TCallable::Alias(id)) => {
             if let Some(value) = get_atomic_of_function_like_identifier(id, codebase) {
                 *skip_key = true;
@@ -302,6 +349,14 @@ pub(crate) fn expand_atomic(
             TDerived::PropertiesOf(properties_of) => {
                 *skip_key = true;
                 new_return_type_parts.extend(expand_properties_of(properties_of, codebase, options));
+            }
+            TDerived::New(new_type) => {
+                *skip_key = true;
+                new_return_type_parts.extend(expand_new(new_type, codebase, options));
+            }
+            TDerived::TemplateType(template_type) => {
+                *skip_key = true;
+                new_return_type_parts.extend(expand_template_type(template_type, codebase, options));
             }
         },
         TAtomic::Iterable(iterable) => {
@@ -395,6 +450,13 @@ fn expand_member_reference(
     options: &TypeExpansionOptions,
     new_return_type_parts: &mut Vec<TAtomic>,
 ) {
+    if let TReferenceMemberSelector::Identifier(member_name) = member_selector
+        && member_name.eq_ignore_ascii_case("class")
+    {
+        new_return_type_parts.push(TAtomic::Scalar(TScalar::literal_class_string(class_like_name)));
+        return;
+    }
+
     let Some(class_like) = codebase.get_class_like(&class_like_name) else {
         new_return_type_parts.push(TAtomic::Mixed(TMixed::new()));
         return;
@@ -406,6 +468,11 @@ fn expand_member_reference(
         }
 
         if let Some(inferred_type) = constant.inferred_type.as_ref() {
+            let Some(_guard) = ConstantExpansionGuard::try_new(class_like_name, *constant_name) else {
+                new_return_type_parts.push(TAtomic::Never);
+                continue;
+            };
+
             let mut inferred_type = inferred_type.clone();
             let mut skip_inferred_type = false;
             expand_atomic(&mut inferred_type, codebase, options, &mut skip_inferred_type, new_return_type_parts);
@@ -442,6 +509,35 @@ fn expand_member_reference(
     }
 }
 
+fn expand_global_reference(
+    selector: &TGlobalReferenceSelector,
+    codebase: &CodebaseMetadata,
+    options: &TypeExpansionOptions,
+    new_return_type_parts: &mut Vec<TAtomic>,
+) {
+    for (constant_name, constant) in &codebase.constants {
+        if !selector.matches(*constant_name) {
+            continue;
+        }
+
+        if let Some(inferred_type) = constant.inferred_type.as_ref() {
+            let mut inferred_type = inferred_type.clone();
+            expand_union(codebase, &mut inferred_type, options);
+            new_return_type_parts.extend(inferred_type.types.into_owned());
+        } else if let Some(type_metadata) = constant.type_metadata.as_ref() {
+            let mut constant_type = type_metadata.type_union.clone();
+            expand_union(codebase, &mut constant_type, options);
+            new_return_type_parts.extend(constant_type.types.into_owned());
+        } else {
+            new_return_type_parts.push(TAtomic::Mixed(TMixed::new()));
+        }
+    }
+
+    if new_return_type_parts.is_empty() {
+        new_return_type_parts.push(TAtomic::Mixed(TMixed::new()));
+    }
+}
+
 fn expand_object(object: &mut TObject, codebase: &CodebaseMetadata, options: &TypeExpansionOptions) {
     resolve_special_class_names(object, codebase, options);
 
@@ -449,11 +545,21 @@ fn expand_object(object: &mut TObject, codebase: &CodebaseMetadata, options: &Ty
         return;
     };
 
+    let has_params = named.type_parameters.as_ref().is_some_and(|p| !p.is_empty());
+    let class_metadata = codebase.get_class_like(&named.name);
+    let has_required_intersections =
+        class_metadata.map(|m| !m.require_extends.is_empty() || !m.require_implements.is_empty()).unwrap_or(false);
+    let needs_default_params = !has_params && class_metadata.map(|m| !m.template_types.is_empty()).unwrap_or(false);
+
+    if !has_params && !has_required_intersections && !needs_default_params {
+        return;
+    }
+
     let Some(_guard) = ObjectParamsExpansionGuard::try_new(named.name) else {
         return;
     };
 
-    if let Some(class_metadata) = codebase.get_class_like(&named.name) {
+    if has_required_intersections && let Some(class_metadata) = class_metadata {
         for &required in class_metadata.require_extends.iter().chain(&class_metadata.require_implements) {
             named.add_intersection_type(TAtomic::Object(TObject::Named(TNamedObject::new(required))));
         }
@@ -462,35 +568,82 @@ fn expand_object(object: &mut TObject, codebase: &CodebaseMetadata, options: &Ty
     expand_or_fill_type_parameters(named, codebase, options);
 }
 
+/// Classifies a class-like name as one of the PHP "special" tokens that require
+/// resolution against the expansion options. The check is case-insensitive but
+/// avoids the (relatively expensive) `ascii_lowercase_atom` interning step on
+/// the common path where the input is not a special name at all.
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum SpecialClassName {
+    None,
+    SelfType,
+    Static,
+    Parent,
+    This,
+}
+
+#[inline]
+fn classify_special_class_name(name: &str) -> SpecialClassName {
+    match name.len() {
+        4 => {
+            if name.eq_ignore_ascii_case("self") {
+                SpecialClassName::SelfType
+            } else {
+                SpecialClassName::None
+            }
+        }
+        5 => {
+            if name == "$this" || name.eq_ignore_ascii_case("$this") {
+                SpecialClassName::This
+            } else {
+                SpecialClassName::None
+            }
+        }
+        6 => {
+            if name.eq_ignore_ascii_case("static") {
+                SpecialClassName::Static
+            } else if name.eq_ignore_ascii_case("parent") {
+                SpecialClassName::Parent
+            } else {
+                SpecialClassName::None
+            }
+        }
+        _ => SpecialClassName::None,
+    }
+}
+
 /// Resolves `static`, `$this`, `self`, and `parent` to their concrete class names.
 fn resolve_special_class_names(object: &mut TObject, codebase: &CodebaseMetadata, options: &TypeExpansionOptions) {
-    if let TObject::Named(named) = object {
-        let name_lc = ascii_lowercase_atom(&named.name);
-        let needs_static_resolution = matches!(name_lc.as_str(), "static" | "$this") || named.is_this;
+    let TObject::Named(named) = object else {
+        return;
+    };
 
-        if needs_static_resolution
-            && let StaticClassType::Object(TObject::Enum(static_enum)) = &options.static_class_type
-        {
-            *object = TObject::Enum(static_enum.clone());
-            return;
-        }
+    let special = classify_special_class_name(named.name.as_str());
+    if matches!(special, SpecialClassName::None) && !named.is_static && !named.is_this {
+        return;
+    }
+
+    let needs_static_resolution = matches!(special, SpecialClassName::Static | SpecialClassName::This) || named.is_this;
+
+    if needs_static_resolution && let StaticClassType::Object(TObject::Enum(static_enum)) = &options.static_class_type {
+        *object = TObject::Enum(static_enum.clone());
+        return;
     }
 
     let TObject::Named(named) = object else {
         return;
     };
 
-    let name_lc = ascii_lowercase_atom(&named.name);
     let was_this = named.is_this;
-
-    match name_lc.as_str() {
-        "static" | "$this" => resolve_static_type(named, was_this, false, codebase, options),
-        "self" => {
+    match special {
+        SpecialClassName::Static | SpecialClassName::This => {
+            resolve_static_type(named, was_this, false, codebase, options)
+        }
+        SpecialClassName::SelfType => {
             if let Some(self_class) = options.self_class {
                 named.name = self_class;
             }
         }
-        "parent" => {
+        SpecialClassName::Parent => {
             if let Some(self_class) = options.self_class
                 && let Some(class_metadata) = codebase.get_class_like(&self_class)
                 && let Some(parent) = class_metadata.direct_parent_class
@@ -498,8 +651,8 @@ fn resolve_special_class_names(object: &mut TObject, codebase: &CodebaseMetadata
                 named.name = parent;
             }
         }
-        _ if named.is_static => resolve_static_type(named, was_this, true, codebase, options),
-        _ => {}
+        SpecialClassName::None if named.is_static => resolve_static_type(named, was_this, true, codebase, options),
+        SpecialClassName::None => {}
     }
 }
 
@@ -585,7 +738,9 @@ fn should_use_static_type_params(named: &TNamedObject, static_obj: &TNamedObject
     let templates = &class_metadata.template_types;
 
     current_params.len() == templates.len()
-        && current_params.iter().zip(templates.values()).all(|(current, template)| current == &template.constraint)
+        && current_params.iter().zip(templates.values()).all(|(current, template)| {
+            current == &template.constraint || template.default.as_ref().is_some_and(|default| current == default)
+        })
 }
 
 /// Expands existing type parameters or fills them with default template bounds.
@@ -594,27 +749,26 @@ fn expand_or_fill_type_parameters(
     codebase: &CodebaseMetadata,
     options: &TypeExpansionOptions,
 ) {
-    if let Some(params) = &mut named.type_parameters
-        && !params.is_empty()
-    {
+    if let Some(class_metadata) = codebase.get_class_like(&named.name) {
+        let template_count = class_metadata.template_types.len();
+        let supplied_count = named.type_parameters.as_ref().map_or(0, Vec::len);
+
+        if supplied_count < template_count {
+            let mut params = named.type_parameters.take().unwrap_or_default();
+            params.extend(class_metadata.template_types.values().skip(supplied_count).map(|template| {
+                let mut fallback = template.default.clone().unwrap_or_else(|| template.constraint.clone());
+                fallback.set_from_template_default(true);
+                fallback
+            }));
+            named.type_parameters = Some(params);
+        }
+    }
+
+    if let Some(params) = &mut named.type_parameters {
         for param in params.iter_mut() {
             expand_union(codebase, param, options);
         }
-        return;
     }
-
-    let Some(class_metadata) = codebase.get_class_like(&named.name) else {
-        return;
-    };
-
-    if class_metadata.template_types.is_empty() {
-        return;
-    }
-
-    let defaults: Vec<TUnion> =
-        class_metadata.template_types.values().map(|template| template.constraint.clone()).collect();
-
-    named.type_parameters = Some(defaults);
 }
 
 #[must_use]
@@ -706,7 +860,8 @@ pub fn get_signature_of_function_like_metadata(
         None
     };
 
-    let mut signature = TCallableSignature::new(function_like_metadata.flags.is_pure(), true)
+    let is_closure = matches!(function_like_identifier, FunctionLikeIdentifier::Closure(..));
+    let mut signature = TCallableSignature::new(function_like_metadata.flags.is_pure(), is_closure)
         .with_parameters(parameters)
         .with_return_type(return_type)
         .with_source(Some(*function_like_identifier));
@@ -768,6 +923,36 @@ fn expand_index_access(
     };
 
     new_return_types.types.into_owned()
+}
+
+#[cold]
+fn expand_new(new_type: &TNew, codebase: &CodebaseMetadata, options: &TypeExpansionOptions) -> Vec<TAtomic> {
+    let mut target_type = new_type.get_target_type().clone();
+    expand_union(codebase, &mut target_type, options);
+
+    let Some(new_return_types) = TNew::get_new_targets(&target_type.types, codebase) else {
+        return vec![TAtomic::Derived(TDerived::New(new_type.clone()))];
+    };
+
+    new_return_types.types.into_owned()
+}
+
+#[cold]
+fn expand_template_type(
+    template_type: &TTemplateType,
+    codebase: &CodebaseMetadata,
+    options: &TypeExpansionOptions,
+) -> Vec<TAtomic> {
+    let mut expanded = template_type.clone();
+    expand_union(codebase, expanded.get_object_mut(), options);
+    expand_union(codebase, expanded.get_class_name_mut(), options);
+    expand_union(codebase, expanded.get_template_name_mut(), options);
+
+    let Some(resolved) = expanded.resolve(codebase) else {
+        return vec![TAtomic::Mixed(TMixed::new())];
+    };
+
+    resolved.types.into_owned()
 }
 
 #[cold]
@@ -849,7 +1034,7 @@ fn expand_alias(alias: &TAlias, codebase: &CodebaseMetadata, options: &TypeExpan
         return vec![TAtomic::Alias(alias.clone())];
     };
 
-    let _ = AliasExpansionGuard::new(class_name, alias_name);
+    let _guard = AliasExpansionGuard::new(class_name, alias_name);
 
     expand_union(codebase, &mut expanded_union, options);
 
@@ -857,14 +1042,17 @@ fn expand_alias(alias: &TAlias, codebase: &CodebaseMetadata, options: &TypeExpan
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
     use std::borrow::Cow;
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     use bumpalo::Bump;
 
+    use mago_atom::AtomSet;
     use mago_atom::atom;
     use mago_database::Database;
     use mago_database::DatabaseReader;
@@ -925,7 +1113,7 @@ mod tests {
             codebase.extend(program_codebase);
         }
 
-        populate_codebase(&mut codebase, &mut SymbolReferences::new(), Default::default(), Default::default());
+        populate_codebase(&mut codebase, &mut SymbolReferences::new(), AtomSet::default(), HashSet::default());
 
         codebase
     }
@@ -1021,7 +1209,7 @@ mod tests {
 
     #[test]
     fn test_expand_keyed_array_with_self_key() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let mut keyed = TKeyedArray::new();
@@ -1029,7 +1217,7 @@ mod tests {
         let input = TUnion::from_atomic(TAtomic::Array(TArray::Keyed(keyed)));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         if let TAtomic::Array(TArray::Keyed(keyed)) = &actual.types[0]
@@ -1047,7 +1235,7 @@ mod tests {
 
     #[test]
     fn test_expand_keyed_array_with_self_value() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let mut keyed = TKeyedArray::new();
@@ -1055,7 +1243,7 @@ mod tests {
         let input = TUnion::from_atomic(TAtomic::Array(TArray::Keyed(keyed)));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         if let TAtomic::Array(TArray::Keyed(keyed)) = &actual.types[0]
@@ -1073,7 +1261,7 @@ mod tests {
 
     #[test]
     fn test_expand_keyed_array_known_items() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         use crate::ttype::atomic::array::key::ArrayKey;
@@ -1086,7 +1274,7 @@ mod tests {
         let input = TUnion::from_atomic(TAtomic::Array(TArray::Keyed(keyed)));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         if let TAtomic::Array(TArray::Keyed(keyed)) = &actual.types[0]
@@ -1105,14 +1293,14 @@ mod tests {
 
     #[test]
     fn test_expand_list_with_self_element() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let list = TList::new(Arc::new(make_self_object()));
         let input = TUnion::from_atomic(TAtomic::Array(TArray::List(list)));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         if let TAtomic::Array(TArray::List(list)) = &actual.types[0] {
@@ -1128,7 +1316,7 @@ mod tests {
 
     #[test]
     fn test_expand_list_known_elements() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         use std::collections::BTreeMap;
@@ -1140,7 +1328,7 @@ mod tests {
         let input = TUnion::from_atomic(TAtomic::Array(TArray::List(list)));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         if let TAtomic::Array(TArray::List(list)) = &actual.types[0]
@@ -1159,7 +1347,7 @@ mod tests {
 
     #[test]
     fn test_expand_nested_array() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let inner_list = TList::new(Arc::new(make_self_object()));
@@ -1170,7 +1358,7 @@ mod tests {
         let input = TUnion::from_atomic(TAtomic::Array(TArray::Keyed(outer)));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         if let TAtomic::Array(TArray::Keyed(keyed)) = &actual.types[0]
@@ -1206,7 +1394,7 @@ mod tests {
 
     #[test]
     fn test_expand_non_empty_list() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let mut list = TList::new(Arc::new(make_self_object()));
@@ -1214,7 +1402,7 @@ mod tests {
         let input = TUnion::from_atomic(TAtomic::Array(TArray::List(list)));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         if let TAtomic::Array(TArray::List(list)) = &actual.types[0] {
@@ -1231,12 +1419,12 @@ mod tests {
 
     #[test]
     fn test_expand_self_to_class_name() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let input = make_self_object();
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         assert!(actual.types.iter().any(|t| {
@@ -1250,12 +1438,12 @@ mod tests {
 
     #[test]
     fn test_expand_static_to_class_name() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let input = make_static_object();
         let options = options_with_static("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         assert!(actual.types.iter().any(|t| {
@@ -1269,13 +1457,13 @@ mod tests {
 
     #[test]
     fn test_expand_static_with_object_type() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let input = make_static_object();
         let static_obj = TObject::Named(TNamedObject::new(ascii_lowercase_atom("foo")));
         let options = options_with_static_object(static_obj);
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         assert!(actual.types.iter().any(|t| {
@@ -1289,13 +1477,13 @@ mod tests {
 
     #[test]
     fn test_expand_static_with_enum_type() {
-        let code = r"<?php enum Status { case Active; case Inactive; }";
+        let code = "<?php enum Status { case Active; case Inactive; }";
         let codebase = create_test_codebase(code);
 
         let input = make_static_object();
         let static_enum = TObject::Enum(TEnum::new(ascii_lowercase_atom("status")));
         let options = options_with_static_object(static_enum);
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         assert!(actual.types.iter().any(|t| matches!(t, TAtomic::Object(TObject::Enum(_)))));
@@ -1303,7 +1491,7 @@ mod tests {
 
     #[test]
     fn test_expand_parent_to_parent_class() {
-        let code = r"<?php
+        let code = "<?php
             class BaseClass {}
             class ChildClass extends BaseClass {}
         ";
@@ -1311,7 +1499,7 @@ mod tests {
 
         let input = make_parent_object();
         let options = options_with_self("ChildClass");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         assert!(actual.types.iter().any(|t| {
@@ -1325,12 +1513,12 @@ mod tests {
 
     #[test]
     fn test_expand_parent_without_parent_class() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let input = make_parent_object();
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         assert!(actual.types.iter().any(|t| {
@@ -1340,12 +1528,12 @@ mod tests {
 
     #[test]
     fn test_expand_this_variable() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let input = TUnion::from_atomic(TAtomic::Object(TObject::Named(TNamedObject::new_this(atom("$this")))));
         let options = options_with_static("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         assert!(actual.types.iter().any(|t| {
@@ -1359,7 +1547,7 @@ mod tests {
 
     #[test]
     fn test_expand_this_with_final_function() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let input = make_static_object();
@@ -1369,7 +1557,7 @@ mod tests {
             function_is_final: true,
             ..Default::default()
         };
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         assert!(actual.types.iter().any(|t| {
@@ -1383,7 +1571,7 @@ mod tests {
 
     #[test]
     fn test_expand_object_with_type_parameters() {
-        let code = r"<?php class Container {}";
+        let code = "<?php class Container {}";
         let codebase = create_test_codebase(code);
 
         let named =
@@ -1391,7 +1579,7 @@ mod tests {
         let input = TUnion::from_atomic(TAtomic::Object(TObject::Named(named)));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         if let TAtomic::Object(TObject::Named(named)) = &actual.types[0]
@@ -1409,7 +1597,7 @@ mod tests {
 
     #[test]
     fn test_expand_object_gets_default_type_params() {
-        let code = r"<?php
+        let code = "<?php
             /** @template T */
             class Container {}
         ";
@@ -1418,7 +1606,7 @@ mod tests {
         let named = TNamedObject::new(ascii_lowercase_atom("container"));
         let input = TUnion::from_atomic(TAtomic::Object(TObject::Named(named)));
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &TypeExpansionOptions::default());
 
         if let TAtomic::Object(TObject::Named(named)) = &actual.types[0] {
@@ -1428,7 +1616,7 @@ mod tests {
 
     #[test]
     fn test_expand_object_intersection_from_static() {
-        let code = r"<?php
+        let code = "<?php
             interface Stringable {}
             class Foo implements Stringable {}
         ";
@@ -1442,7 +1630,7 @@ mod tests {
         let static_obj = TObject::Named(static_named);
         let options = options_with_static_object(static_obj);
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         if let TAtomic::Object(TObject::Named(named)) = &actual.types[0] {
@@ -1455,7 +1643,7 @@ mod tests {
         let codebase = CodebaseMetadata::new();
 
         let input = make_self_object();
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &TypeExpansionOptions::default());
 
         assert!(actual.types.iter().any(|t| {
@@ -1465,14 +1653,14 @@ mod tests {
 
     #[test]
     fn test_expand_callable_return_type() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let sig = TCallableSignature::new(false, false).with_return_type(Some(Arc::new(make_self_object())));
         let input = TUnion::from_atomic(TAtomic::Callable(TCallable::Signature(sig)));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         if let TAtomic::Callable(TCallable::Signature(sig)) = &actual.types[0]
@@ -1490,7 +1678,7 @@ mod tests {
 
     #[test]
     fn test_expand_callable_parameter_types() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let param = TCallableParameter::new(Some(Arc::new(make_self_object())), false, false, false);
@@ -1498,7 +1686,7 @@ mod tests {
         let input = TUnion::from_atomic(TAtomic::Callable(TCallable::Signature(sig)));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         if let TAtomic::Callable(TCallable::Signature(sig)) = &actual.types[0]
@@ -1517,7 +1705,7 @@ mod tests {
 
     #[test]
     fn test_expand_callable_alias_to_function() {
-        let code = r"<?php
+        let code = "<?php
             function myFunc(): int { return 1; }
         ";
         let codebase = create_test_codebase(code);
@@ -1525,7 +1713,7 @@ mod tests {
         let alias = TCallable::Alias(FunctionLikeIdentifier::Function(ascii_lowercase_atom("myfunc")));
         let input = TUnion::from_atomic(TAtomic::Callable(alias));
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &TypeExpansionOptions::default());
 
         assert!(actual.types.iter().any(|t| matches!(t, TAtomic::Callable(TCallable::Signature(_)))));
@@ -1533,7 +1721,7 @@ mod tests {
 
     #[test]
     fn test_expand_callable_alias_to_method() {
-        let code = r"<?php
+        let code = "<?php
             class Foo {
                 public function bar(): int { return 1; }
             }
@@ -1544,7 +1732,7 @@ mod tests {
             TCallable::Alias(FunctionLikeIdentifier::Method(ascii_lowercase_atom("foo"), ascii_lowercase_atom("bar")));
         let input = TUnion::from_atomic(TAtomic::Callable(alias));
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &TypeExpansionOptions::default());
 
         assert!(actual.types.iter().any(|t| matches!(t, TAtomic::Callable(TCallable::Signature(_)))));
@@ -1555,9 +1743,9 @@ mod tests {
         let codebase = CodebaseMetadata::new();
 
         let alias = TCallable::Alias(FunctionLikeIdentifier::Function(atom("nonexistent")));
-        let input = TUnion::from_atomic(TAtomic::Callable(alias.clone()));
+        let input = TUnion::from_atomic(TAtomic::Callable(alias));
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &TypeExpansionOptions::default());
 
         assert!(actual.types.iter().any(|t| matches!(t, TAtomic::Callable(TCallable::Alias(_)))));
@@ -1565,14 +1753,14 @@ mod tests {
 
     #[test]
     fn test_expand_closure_signature() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let sig = TCallableSignature::new(false, true).with_return_type(Some(Arc::new(make_self_object())));
         let input = TUnion::from_atomic(TAtomic::Callable(TCallable::Signature(sig)));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         if let TAtomic::Callable(TCallable::Signature(sig)) = &actual.types[0]
@@ -1590,7 +1778,7 @@ mod tests {
 
     #[test]
     fn test_expand_generic_parameter_constraint() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let generic = TGenericParameter::new(
@@ -1601,7 +1789,7 @@ mod tests {
         let input = TUnion::from_atomic(TAtomic::GenericParameter(generic));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         if let TAtomic::GenericParameter(param) = &actual.types[0] {
@@ -1617,7 +1805,7 @@ mod tests {
 
     #[test]
     fn test_expand_nested_generic_constraint() {
-        let code = r"<?php class Foo {} class Bar {}";
+        let code = "<?php class Foo {} class Bar {}";
         let codebase = create_test_codebase(code);
 
         let container =
@@ -1632,7 +1820,7 @@ mod tests {
         let input = TUnion::from_atomic(TAtomic::GenericParameter(generic));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         if let TAtomic::GenericParameter(param) = &actual.types[0]
@@ -1651,7 +1839,7 @@ mod tests {
 
     #[test]
     fn test_expand_generic_with_intersection() {
-        let code = r"<?php
+        let code = "<?php
             interface Stringable {}
             class Foo {}
         ";
@@ -1667,7 +1855,7 @@ mod tests {
         let input = TUnion::from_atomic(TAtomic::GenericParameter(generic));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         if let TAtomic::GenericParameter(param) = &actual.types[0] {
@@ -1684,7 +1872,7 @@ mod tests {
 
     #[test]
     fn test_expand_class_string_of_self() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let constraint = Arc::new(TAtomic::Object(TObject::Named(TNamedObject::new(atom("self")))));
@@ -1692,7 +1880,7 @@ mod tests {
         let input = TUnion::from_atomic(TAtomic::Scalar(TScalar::ClassLikeString(class_string)));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         if let TAtomic::Scalar(TScalar::ClassLikeString(TClassLikeString::OfType { constraint, .. })) = &actual.types[0]
@@ -1704,7 +1892,7 @@ mod tests {
 
     #[test]
     fn test_expand_class_string_of_static() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let constraint = Arc::new(TAtomic::Object(TObject::Named(TNamedObject::new(atom("static")))));
@@ -1712,7 +1900,7 @@ mod tests {
         let input = TUnion::from_atomic(TAtomic::Scalar(TScalar::ClassLikeString(class_string)));
 
         let options = options_with_static("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         if let TAtomic::Scalar(TScalar::ClassLikeString(TClassLikeString::OfType { constraint, .. })) = &actual.types[0]
@@ -1724,7 +1912,7 @@ mod tests {
 
     #[test]
     fn test_expand_interface_string_of_type() {
-        let code = r"<?php interface MyInterface {}";
+        let code = "<?php interface MyInterface {}";
         let codebase = create_test_codebase(code);
 
         let constraint = Arc::new(TAtomic::Object(TObject::Named(TNamedObject::new(atom("self")))));
@@ -1732,7 +1920,7 @@ mod tests {
         let input = TUnion::from_atomic(TAtomic::Scalar(TScalar::ClassLikeString(class_string)));
 
         let options = options_with_self("MyInterface");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         if let TAtomic::Scalar(TScalar::ClassLikeString(TClassLikeString::OfType { kind, constraint })) =
@@ -1747,7 +1935,7 @@ mod tests {
 
     #[test]
     fn test_expand_member_reference_wildcard_constants() {
-        let code = r"<?php
+        let code = "<?php
             class Foo {
                 public const A = 1;
                 public const B = 2;
@@ -1758,7 +1946,7 @@ mod tests {
         let reference = TReference::new_member(ascii_lowercase_atom("foo"), TReferenceMemberSelector::Wildcard);
         let input = TUnion::from_atomic(TAtomic::Reference(reference));
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &TypeExpansionOptions::default());
 
         assert!(!actual.types.is_empty());
@@ -1766,7 +1954,7 @@ mod tests {
 
     #[test]
     fn test_expand_member_reference_wildcard_enum_cases() {
-        let code = r"<?php
+        let code = "<?php
             enum Status {
                 case Active;
                 case Inactive;
@@ -1777,7 +1965,7 @@ mod tests {
         let reference = TReference::new_member(ascii_lowercase_atom("status"), TReferenceMemberSelector::Wildcard);
         let input = TUnion::from_atomic(TAtomic::Reference(reference));
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &TypeExpansionOptions::default());
 
         assert_eq!(actual.types.len(), 2);
@@ -1786,7 +1974,7 @@ mod tests {
 
     #[test]
     fn test_expand_member_reference_starts_with() {
-        let code = r"<?php
+        let code = "<?php
             class Foo {
                 public const STATUS_ACTIVE = 1;
                 public const STATUS_INACTIVE = 2;
@@ -1799,7 +1987,7 @@ mod tests {
             TReference::new_member(ascii_lowercase_atom("foo"), TReferenceMemberSelector::StartsWith(atom("STATUS_")));
         let input = TUnion::from_atomic(TAtomic::Reference(reference));
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &TypeExpansionOptions::default());
 
         assert!(!actual.types.is_empty());
@@ -1807,7 +1995,7 @@ mod tests {
 
     #[test]
     fn test_expand_member_reference_ends_with() {
-        let code = r"<?php
+        let code = "<?php
             class Foo {
                 public const READ_ERROR = 1;
                 public const WRITE_ERROR = 2;
@@ -1820,7 +2008,7 @@ mod tests {
             TReference::new_member(ascii_lowercase_atom("foo"), TReferenceMemberSelector::EndsWith(atom("_ERROR")));
         let input = TUnion::from_atomic(TAtomic::Reference(reference));
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &TypeExpansionOptions::default());
 
         assert!(!actual.types.is_empty());
@@ -1828,7 +2016,7 @@ mod tests {
 
     #[test]
     fn test_expand_member_reference_identifier_constant() {
-        let code = r"<?php
+        let code = "<?php
             class Foo {
                 public const BAR = 42;
             }
@@ -1839,7 +2027,7 @@ mod tests {
             TReference::new_member(ascii_lowercase_atom("foo"), TReferenceMemberSelector::Identifier(atom("BAR")));
         let input = TUnion::from_atomic(TAtomic::Reference(reference));
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &TypeExpansionOptions::default());
 
         assert_eq!(actual.types.len(), 1);
@@ -1847,7 +2035,7 @@ mod tests {
 
     #[test]
     fn test_expand_member_reference_identifier_enum_case() {
-        let code = r"<?php
+        let code = "<?php
             enum Status {
                 case Active;
             }
@@ -1860,7 +2048,7 @@ mod tests {
         );
         let input = TUnion::from_atomic(TAtomic::Reference(reference));
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &TypeExpansionOptions::default());
 
         assert_eq!(actual.types.len(), 1);
@@ -1874,7 +2062,7 @@ mod tests {
         let reference = TReference::new_member(atom("NonExistent"), TReferenceMemberSelector::Identifier(atom("FOO")));
         let input = TUnion::from_atomic(TAtomic::Reference(reference));
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &TypeExpansionOptions::default());
 
         assert!(actual.types.iter().any(|t| matches!(t, TAtomic::Mixed(_))));
@@ -1882,7 +2070,7 @@ mod tests {
 
     #[test]
     fn test_expand_member_reference_unknown_member() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let reference = TReference::new_member(
@@ -1891,7 +2079,7 @@ mod tests {
         );
         let input = TUnion::from_atomic(TAtomic::Reference(reference));
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &TypeExpansionOptions::default());
 
         assert!(actual.types.iter().any(|t| matches!(t, TAtomic::Mixed(_))));
@@ -1910,7 +2098,7 @@ mod tests {
             TReference::new_member(ascii_lowercase_atom("foo"), TReferenceMemberSelector::Identifier(atom("VALUE")));
         let input = TUnion::from_atomic(TAtomic::Reference(reference));
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &TypeExpansionOptions::default());
 
         assert_eq!(actual.types.len(), 1);
@@ -1918,7 +2106,7 @@ mod tests {
 
     #[test]
     fn test_expand_member_reference_constant_with_type_metadata() {
-        let code = r"<?php
+        let code = "<?php
             class Foo {
                 /** @var int */
                 public const VALUE = 42;
@@ -1930,7 +2118,7 @@ mod tests {
             TReference::new_member(ascii_lowercase_atom("foo"), TReferenceMemberSelector::Identifier(atom("VALUE")));
         let input = TUnion::from_atomic(TAtomic::Reference(reference));
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &TypeExpansionOptions::default());
 
         assert_eq!(actual.types.len(), 1);
@@ -1938,7 +2126,7 @@ mod tests {
 
     #[test]
     fn test_expand_conditional_both_branches() {
-        let code = r"<?php class Foo {} class Bar {}";
+        let code = "<?php class Foo {} class Bar {}";
         let codebase = create_test_codebase(code);
 
         let conditional = TConditional::new(
@@ -1951,7 +2139,7 @@ mod tests {
         let input = TUnion::from_atomic(TAtomic::Conditional(conditional));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         assert!(actual.types.iter().any(|t| {
@@ -1965,7 +2153,7 @@ mod tests {
 
     #[test]
     fn test_expand_conditional_with_self_in_then() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let conditional = TConditional::new(
@@ -1978,7 +2166,7 @@ mod tests {
         let input = TUnion::from_atomic(TAtomic::Conditional(conditional));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         assert!(!actual.types.is_empty());
@@ -1986,7 +2174,7 @@ mod tests {
 
     #[test]
     fn test_expand_conditional_with_self_in_otherwise() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let conditional = TConditional::new(
@@ -1999,7 +2187,7 @@ mod tests {
         let input = TUnion::from_atomic(TAtomic::Conditional(conditional));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         assert!(!actual.types.is_empty());
@@ -2007,7 +2195,7 @@ mod tests {
 
     #[test]
     fn test_expand_simple_alias() {
-        let code = r"<?php
+        let code = "<?php
             class Foo {
                 /** @phpstan-type MyInt = int */
             }
@@ -2017,7 +2205,7 @@ mod tests {
         let alias = TAlias::new(ascii_lowercase_atom("foo"), atom("MyInt"));
         let input = TUnion::from_atomic(TAtomic::Alias(alias));
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &TypeExpansionOptions::default());
 
         assert!(!actual.types.is_empty());
@@ -2025,7 +2213,7 @@ mod tests {
 
     #[test]
     fn test_expand_nested_alias() {
-        let code = r"<?php
+        let code = "<?php
             class Foo {
                 /** @phpstan-type Inner = int */
                 /** @phpstan-type Outer = Inner */
@@ -2036,7 +2224,7 @@ mod tests {
         let alias = TAlias::new(ascii_lowercase_atom("foo"), atom("Outer"));
         let input = TUnion::from_atomic(TAtomic::Alias(alias));
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &TypeExpansionOptions::default());
 
         assert!(!actual.types.is_empty());
@@ -2044,15 +2232,19 @@ mod tests {
 
     #[test]
     fn test_expand_alias_cycle_detection() {
-        let codebase = CodebaseMetadata::new();
+        let code = "<?php
+            /** @phpstan-type SelfRef = int|array<int, SelfRef> */
+            class Foo {}
+        ";
+        let codebase = create_test_codebase(code);
 
-        let alias = TAlias::new(atom("Foo"), atom("SelfRef"));
-        let input = TUnion::from_atomic(TAtomic::Alias(alias.clone()));
+        let alias = TAlias::new(ascii_lowercase_atom("foo"), atom("SelfRef"));
+        let input = TUnion::from_atomic(TAtomic::Alias(alias));
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &TypeExpansionOptions::default());
 
-        assert!(actual.types.iter().any(|t| matches!(t, TAtomic::Alias(_))));
+        assert!(!actual.types.is_empty());
     }
 
     #[test]
@@ -2060,9 +2252,9 @@ mod tests {
         let codebase = CodebaseMetadata::new();
 
         let alias = TAlias::new(atom("NonExistent"), atom("Unknown"));
-        let input = TUnion::from_atomic(TAtomic::Alias(alias.clone()));
+        let input = TUnion::from_atomic(TAtomic::Alias(alias));
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &TypeExpansionOptions::default());
 
         assert!(actual.types.iter().any(|t| matches!(t, TAtomic::Alias(_))));
@@ -2070,7 +2262,7 @@ mod tests {
 
     #[test]
     fn test_expand_alias_with_self_inside() {
-        let code = r"<?php
+        let code = "<?php
             class Foo {
                 /** @phpstan-type MySelf = self */
             }
@@ -2081,7 +2273,7 @@ mod tests {
         let input = TUnion::from_atomic(TAtomic::Alias(alias));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         assert!(!actual.types.is_empty());
@@ -2098,7 +2290,7 @@ mod tests {
         let key_of = TKeyOf::new(Arc::new(array_type));
         let input = TUnion::from_atomic(TAtomic::Derived(TDerived::KeyOf(key_of)));
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &TypeExpansionOptions::default());
 
         assert!(actual.types.iter().any(super::super::atomic::TAtomic::is_string));
@@ -2106,7 +2298,7 @@ mod tests {
 
     #[test]
     fn test_expand_key_of_with_self() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let mut keyed = TKeyedArray::new();
@@ -2117,7 +2309,7 @@ mod tests {
         let input = TUnion::from_atomic(TAtomic::Derived(TDerived::KeyOf(key_of)));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         assert!(!actual.types.is_empty());
@@ -2134,7 +2326,7 @@ mod tests {
         let value_of = TValueOf::new(Arc::new(array_type));
         let input = TUnion::from_atomic(TAtomic::Derived(TDerived::ValueOf(value_of)));
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &TypeExpansionOptions::default());
 
         assert!(actual.types.iter().any(super::super::atomic::TAtomic::is_int));
@@ -2142,7 +2334,7 @@ mod tests {
 
     #[test]
     fn test_expand_value_of_enum() {
-        let code = r"<?php
+        let code = "<?php
             enum Status: string {
                 case Active = 'active';
                 case Inactive = 'inactive';
@@ -2155,7 +2347,7 @@ mod tests {
         let value_of = TValueOf::new(Arc::new(enum_type));
         let input = TUnion::from_atomic(TAtomic::Derived(TDerived::ValueOf(value_of)));
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &TypeExpansionOptions::default());
 
         assert!(!actual.types.is_empty());
@@ -2180,7 +2372,7 @@ mod tests {
         let index_access = TIndexAccess::new(array_type, index_type);
         let input = TUnion::from_atomic(TAtomic::Derived(TDerived::IndexAccess(index_access)));
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &TypeExpansionOptions::default());
 
         assert!(!actual.types.is_empty());
@@ -2188,7 +2380,7 @@ mod tests {
 
     #[test]
     fn test_expand_index_access_with_self() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         use crate::ttype::atomic::array::key::ArrayKey;
@@ -2207,7 +2399,7 @@ mod tests {
         let input = TUnion::from_atomic(TAtomic::Derived(TDerived::IndexAccess(index_access)));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         assert!(!actual.types.is_empty());
@@ -2215,14 +2407,14 @@ mod tests {
 
     #[test]
     fn test_expand_iterable_key_type() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let iterable = TIterable::new(Arc::new(make_self_object()), Arc::new(get_int()));
         let input = TUnion::from_atomic(TAtomic::Iterable(iterable));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         if let TAtomic::Iterable(iter) = &actual.types[0] {
@@ -2238,14 +2430,14 @@ mod tests {
 
     #[test]
     fn test_expand_iterable_value_type() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let iterable = TIterable::new(Arc::new(get_int()), Arc::new(make_self_object()));
         let input = TUnion::from_atomic(TAtomic::Iterable(iterable));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         if let TAtomic::Iterable(iter) = &actual.types[0] {
@@ -2278,7 +2470,7 @@ mod tests {
 
     #[test]
     fn test_get_signature_of_method() {
-        let code = r"<?php
+        let code = "<?php
             class Foo {
                 public function bar(string $s): int { return 0; }
             }
@@ -2306,7 +2498,7 @@ mod tests {
 
     #[test]
     fn test_get_atomic_of_function() {
-        let code = r"<?php
+        let code = "<?php
             function myFunc(): void {}
         ";
         let codebase = create_test_codebase(code);
@@ -2320,7 +2512,7 @@ mod tests {
 
     #[test]
     fn test_get_signature_with_parameters() {
-        let code = r"<?php
+        let code = "<?php
             function multiParam(int $a, string $b, ?float $c = null): bool { return true; }
         ";
         let codebase = create_test_codebase(code);
@@ -2339,7 +2531,7 @@ mod tests {
 
     #[test]
     fn test_expand_preserves_by_reference_flag() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let mut input = make_self_object();
@@ -2354,7 +2546,7 @@ mod tests {
 
     #[test]
     fn test_expand_preserves_possibly_undefined_flag() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let mut input = make_self_object();
@@ -2369,7 +2561,7 @@ mod tests {
 
     #[test]
     fn test_expand_multiple_self_in_union() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let input = TUnion::from_vec(vec![
@@ -2378,7 +2570,7 @@ mod tests {
         ]);
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         assert!(actual.types.len() <= 2);
@@ -2386,7 +2578,7 @@ mod tests {
 
     #[test]
     fn test_expand_deeply_nested_types() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let inner = TList::new(Arc::new(make_self_object()));
@@ -2395,7 +2587,7 @@ mod tests {
         let input = TUnion::from_atomic(TAtomic::Array(TArray::List(outer)));
 
         let options = options_with_self("Foo");
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         if let TAtomic::Array(TArray::List(outer)) = &actual.types[0]
@@ -2414,7 +2606,7 @@ mod tests {
 
     #[test]
     fn test_expand_with_all_options_disabled() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let input = make_self_object();
@@ -2429,7 +2621,7 @@ mod tests {
             expand_templates: false,
         };
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         assert!(actual.types.iter().any(|t| {
@@ -2439,13 +2631,13 @@ mod tests {
 
     #[test]
     fn test_expand_already_expanded_type() {
-        let code = r"<?php class Foo {}";
+        let code = "<?php class Foo {}";
         let codebase = create_test_codebase(code);
 
         let input = make_named_object("Foo");
         let options = options_with_self("Foo");
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         let mut actual2 = actual.clone();
@@ -2456,7 +2648,7 @@ mod tests {
 
     #[test]
     fn test_expand_complex_generic_class() {
-        let code = r"<?php
+        let code = "<?php
             /**
              * @template T
              * @template U
@@ -2477,7 +2669,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut actual = input.clone();
+        let mut actual = input;
         expand_union(&codebase, &mut actual, &options);
 
         if let TAtomic::Object(TObject::Named(named)) = &actual.types[0]

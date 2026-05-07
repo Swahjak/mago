@@ -312,10 +312,30 @@ impl IssueProcessor {
         &self,
         orchestrator: &Orchestrator<'_>,
         database: &mut Database<'_>,
-        issues: IssueCollection,
+        mut issues: IssueCollection,
         baseline: Option<Baseline>,
         fail_on_out_of_sync_baseline: bool,
     ) -> Result<(ExitCode, Vec<FileId>), Error> {
+        if !self.retain_code.is_empty() {
+            let total_before_filter = issues.len();
+            issues.filter_retain_codes(&self.retain_code);
+            let total_after_filter = issues.len();
+            let filtered_count = total_before_filter - total_after_filter;
+
+            let codes_list = self.retain_code.join(", ");
+
+            if total_after_filter == 0 && total_before_filter > 0 {
+                tracing::warn!("No issues found matching code(s): {}", codes_list);
+            } else if filtered_count > 0 {
+                tracing::info!(
+                    "Retaining {} of {} issues with code(s): {}",
+                    total_after_filter,
+                    total_before_filter,
+                    codes_list
+                );
+            }
+        }
+
         if self.fix {
             self.handle_fix_mode(orchestrator, database, issues, baseline)
         } else {
@@ -415,32 +435,11 @@ impl IssueProcessor {
     fn handle_report_mode<'d>(
         &self,
         database: &'d Database<'d>,
-        mut issues: IssueCollection,
+        issues: IssueCollection,
         baseline: Option<Baseline>,
         fail_on_out_of_sync_baseline: bool,
     ) -> Result<ExitCode, Error> {
         let read_database = database.read_only();
-
-        // Filter to only show issues with the specified codes, if provided
-        if !self.retain_code.is_empty() {
-            let total_before_filter = issues.len();
-            issues.filter_retain_codes(&self.retain_code);
-            let total_after_filter = issues.len();
-            let filtered_count = total_before_filter - total_after_filter;
-
-            let codes_list = self.retain_code.join(", ");
-
-            if total_after_filter == 0 && total_before_filter > 0 {
-                tracing::warn!("No issues found matching code(s): {}", codes_list);
-            } else if filtered_count > 0 {
-                tracing::info!(
-                    "Retaining {} of {} issues with code(s): {}",
-                    total_after_filter,
-                    total_before_filter,
-                    codes_list
-                );
-            }
-        }
 
         let issues_to_report = issues;
 
@@ -461,9 +460,11 @@ impl IssueProcessor {
         let reporter = Reporter::new(read_database, reporter_configuration);
         let status = reporter.report(issues_to_report, baseline)?;
 
-        if status.baseline_dead_issues {
+        if status.baseline_dead_issues > 0 {
+            let dead = status.baseline_dead_issues;
+            let noun = if dead == 1 { "entry" } else { "entries" };
             tracing::warn!(
-                "Your baseline file contains entries for issues that no longer exist. Consider regenerating it with `--generate-baseline`."
+                "Your baseline file contains {dead} {noun} for issues that no longer exist. Consider regenerating it with `--generate-baseline`."
             );
 
             if fail_on_out_of_sync_baseline {
@@ -540,7 +541,6 @@ impl IssueProcessor {
             .map_init(Bump::new, |arena, (file_id, batches)| {
                 let file = read_database.get_ref(&file_id)?;
                 let mut editor = TextEditor::with_safety(&file.contents, safety_threshold);
-                let checker = |code: &str| check_php_code(arena, file_id, code, parser_settings);
 
                 let mut skipped_unsafe = 0usize;
                 let mut skipped_potentially_unsafe = 0usize;
@@ -549,7 +549,9 @@ impl IssueProcessor {
                 // Each batch contains all edits from a single issue - they must be applied together
                 for (rule_code, edits) in batches {
                     let rule_code = rule_code.as_deref().unwrap_or("unknown");
-                    let result = editor.apply_batch(edits, Some(checker));
+                    let result = editor.apply_batch(edits, Some(|code: &str| check_php_code(arena, file_id, code, parser_settings)));
+                    arena.reset();
+
                     match result {
                         ApplyResult::Applied => {
                             // Successfully applied
@@ -573,6 +575,12 @@ impl IssueProcessor {
                         ApplyResult::Rejected => {
                             tracing::error!("Edit for `{}` (issue: `{rule_code}`) was rejected because it would produce invalid PHP syntax.", file.name.as_ref());
                             tracing::error!("This is a bug in Mago. Please report this issue at {}", ISSUE_URL);
+
+                            bugs += 1;
+                        }
+                        _ => {
+                            tracing::error!("Unexpected edit application result for `{}` (issue: `{rule_code}`). This is a bug in Mago.", file.name.as_ref());
+                            tracing::error!("Please report this issue at {}", ISSUE_URL);
 
                             bugs += 1;
                         }

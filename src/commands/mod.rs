@@ -63,6 +63,8 @@ use crate::commands::format::FormatCommand;
 use crate::commands::generate_completions::GenerateCompletionsCommand;
 use crate::commands::guard::GuardCommand;
 use crate::commands::init::InitCommand;
+#[cfg(feature = "language-server")]
+use crate::commands::language_server::LanguageServerCommand;
 use crate::commands::lint::LintCommand;
 use crate::commands::list_files::ListFilesCommand;
 use crate::commands::self_update::SelfUpdateCommand;
@@ -77,6 +79,8 @@ pub mod format;
 pub mod generate_completions;
 pub mod guard;
 pub mod init;
+#[cfg(feature = "language-server")]
+pub mod language_server;
 pub mod lint;
 pub mod list_files;
 pub mod self_update;
@@ -225,6 +229,11 @@ pub enum MagoCommand {
     /// **Usage**: `mago generate-completions`
     #[command(name = "generate-completions")]
     GenerateCompletions(GenerateCompletionsCommand),
+
+    /// Start the Mago language server (LSP over stdio).
+    #[cfg(feature = "language-server")]
+    #[command(name = "language-server")]
+    LanguageServer(LanguageServerCommand),
 }
 
 /// Top-level CLI arguments parsed by [`clap`].
@@ -315,6 +324,18 @@ pub struct CliArguments {
     /// Use this flag to bypass the check for supported PHP versions. This is not recommended, as it may lead to unexpected behavior.
     #[arg(long, default_value_t = false)]
     pub allow_unsupported_php_version: bool,
+
+    /// Silence the project version drift warning.
+    ///
+    /// Suppresses the warning emitted when the installed mago binary differs from the
+    /// `version` pinned in `mago.toml`, as long as the drift is within the same major version.
+    /// A major-version mismatch is *always* fatal and is not affected by this flag;
+    /// the whole point of a major pin is to stop runs across incompatible config schemas.
+    ///
+    /// Can also be set via the `MAGO_NO_VERSION_CHECK` environment variable or
+    /// `no-version-check = true` in `mago.toml`.
+    #[arg(long, default_value_t = false)]
+    pub no_version_check: bool,
 
     /// When to use colored output. Can be "auto", "always", or "never".
     ///

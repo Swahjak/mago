@@ -18,6 +18,7 @@ use mago_codex::ttype::atomic::array::list::TList;
 use mago_codex::ttype::atomic::callable::TCallableSignature;
 use mago_codex::ttype::atomic::mixed::TMixed;
 use mago_codex::ttype::atomic::object::TObject;
+use mago_codex::ttype::atomic::object::named::TNamedObject;
 use mago_codex::ttype::atomic::scalar::TScalar;
 use mago_codex::ttype::atomic::scalar::float::TFloat;
 use mago_codex::ttype::atomic::scalar::int::TInteger;
@@ -215,11 +216,20 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for UnaryPrefix<'arena> {
                             invalid_operand_messages.push(("Cannot negate `resource`".to_string(), operand_span));
                         }
                         TAtomic::Mixed(_) => {
-                            // Could be anything - possibly invalid
-                            invalid_operand_messages.push((
-                                "Cannot reliably negate `mixed`; it may contain non-numeric types".to_string(),
-                                operand_span,
-                            ));
+                            context.collector.report_with_code(
+                                IssueCode::MixedOperand,
+                                Issue::error("Cannot reliably negate a `mixed` operand.")
+                                    .with_annotation(
+                                        Annotation::primary(operand_span)
+                                            .with_message("Operand is `mixed`."),
+                                    )
+                                    .with_note(
+                                        "Negating `mixed` is unsafe as the actual runtime type is unknown.",
+                                    )
+                                    .with_help(
+                                        "Ensure the operand has a known type (e.g., `int`, `float`) using type hints, assertions, or checks.",
+                                    ),
+                            );
                             resulting_types.push(TAtomic::Scalar(TScalar::int()));
                             resulting_types.push(TAtomic::Scalar(TScalar::float()));
                         }
@@ -274,11 +284,11 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for UnaryPrefix<'arena> {
             }
             UnaryPrefixOperator::PreIncrement(_) => {
                 let resulting_type = increment_operand(context, block_context, artifacts, self.operand, self.span())?;
-                artifacts.set_expression_type(self, resulting_type);
+                artifacts.set_rc_expression_type(self, resulting_type);
             }
             UnaryPrefixOperator::PreDecrement(_) => {
                 let resulting_type = decrement_operand(context, block_context, artifacts, self.operand, self.span())?;
-                artifacts.set_expression_type(self, resulting_type);
+                artifacts.set_rc_expression_type(self, resulting_type);
             }
             UnaryPrefixOperator::IntCast(_, _) | UnaryPrefixOperator::IntegerCast(_, _) => {
                 let resulting_type = match operand_type {
@@ -466,12 +476,13 @@ fn increment_operand<'ctx, 'arena>(
     artifacts: &mut AnalysisArtifacts,
     operand: &Expression<'arena>,
     operation_span: Span,
-) -> Result<TUnion, AnalysisError> {
+) -> Result<Rc<TUnion>, AnalysisError> {
     let Some(operand_type) = artifacts.get_expression_type(operand) else {
-        return Ok(get_mixed());
+        return Ok(Rc::new(get_mixed()));
     };
 
     let mut possibilities = vec![];
+    let mut reported_invalid = false;
     for operand_atomic_type in operand_type.types.as_ref() {
         match operand_atomic_type {
             TAtomic::Scalar(scalar) => match scalar {
@@ -608,9 +619,28 @@ fn increment_operand<'ctx, 'arena>(
             TAtomic::Never => {
                 // never type is unreachable, don't produce mixed, just skip.
             }
-            _ => {
-                let type_name = operand_atomic_type.get_id();
+            TAtomic::Mixed(_) => {
                 context.collector.report_with_code(
+                    IssueCode::MixedOperand,
+                    Issue::error("Cannot reliably increment a `mixed` operand.")
+                        .with_annotation(
+                            Annotation::primary(operand.span()).with_message("Operand is `mixed`."),
+                        )
+                        .with_note(
+                            "Incrementing `mixed` is unsafe as the actual runtime type is unknown.",
+                        )
+                        .with_help(
+                            "Ensure the operand has a known type (e.g., `int`, `float`, `string`) using type hints, assertions, or checks.",
+                        ),
+                );
+
+                possibilities.push(TAtomic::Mixed(TMixed::new()));
+            }
+            _ => {
+                if !reported_invalid {
+                    reported_invalid = true;
+                    let type_name = operand_type.get_id();
+                    context.collector.report_with_code(
                         IssueCode::InvalidOperand,
                         Issue::error(format!(
                             "Cannot increment value of type `{type_name}`."
@@ -620,21 +650,22 @@ fn increment_operand<'ctx, 'arena>(
                             TAtomic::Array(_) => "Incrementing an array results in a `TypeError` exception.",
                             TAtomic::Object(_) => "Incrementing an object without operator overloading support results in a `TypeError` exception.",
                             TAtomic::Resource(_) => "Incrementing a resource results in a `TypeError` exception.",
-                            _ => "This type is not suitable for decrement operations."
+                            _ => "This type is not suitable for increment operations."
                         })
                         .with_help("Ensure the operand is a number or a string suitable for incrementing."),
                     );
+                }
 
                 possibilities.push(TAtomic::Mixed(TMixed::new()));
             }
         }
     }
 
-    let resulting_type_union = if possibilities.is_empty() {
+    let resulting_type_union = Rc::new(if possibilities.is_empty() {
         if operand_type.is_never() { get_never() } else { get_mixed() }
     } else {
         TUnion::from_vec(combine(possibilities, context.codebase, context.settings.combiner_options()))
-    };
+    });
 
     let operand_id = get_expression_id(
         operand,
@@ -650,7 +681,7 @@ fn increment_operand<'ctx, 'arena>(
         operand,
         operand_id,
         None,
-        resulting_type_union.clone(),
+        Rc::clone(&resulting_type_union),
         false,
     )?;
 
@@ -692,10 +723,10 @@ fn decrement_operand<'ctx, 'arena>(
     artifacts: &mut AnalysisArtifacts,
     operand: &Expression<'arena>,
     operation_span: Span,
-) -> Result<TUnion, AnalysisError> {
+) -> Result<Rc<TUnion>, AnalysisError> {
     // Changed return to Result for consistency
     let Some(operand_type) = artifacts.get_expression_type(operand) else {
-        return Ok(get_mixed());
+        return Ok(Rc::new(get_mixed()));
     };
 
     let mut possibilities = vec![];
@@ -842,6 +873,23 @@ fn decrement_operand<'ctx, 'arena>(
             TAtomic::Never => {
                 // never type is unreachable, don't produce mixed, just skip.
             }
+            TAtomic::Mixed(_) => {
+                context.collector.report_with_code(
+                    IssueCode::MixedOperand,
+                    Issue::error("Cannot reliably decrement a `mixed` operand.")
+                        .with_annotation(
+                            Annotation::primary(operand.span()).with_message("Operand is `mixed`."),
+                        )
+                        .with_note(
+                            "Decrementing `mixed` is unsafe as the actual runtime type is unknown.",
+                        )
+                        .with_help(
+                            "Ensure the operand has a known type (e.g., `int`, `float`, `string`) using type hints, assertions, or checks.",
+                        ),
+                );
+
+                possibilities.push(TAtomic::Mixed(TMixed::new()));
+            }
             _ => {
                 let type_name = operand_atomic_type.get_id();
                 context.collector.report_with_code(
@@ -864,11 +912,11 @@ fn decrement_operand<'ctx, 'arena>(
         }
     }
 
-    let resulting_type_union = if possibilities.is_empty() {
+    let resulting_type_union = Rc::new(if possibilities.is_empty() {
         if operand_type.is_never() { get_never() } else { get_mixed() }
     } else {
         TUnion::from_vec(combine(possibilities, context.codebase, context.settings.combiner_options()))
-    };
+    });
 
     let operand_id = get_expression_id(
         operand,
@@ -884,7 +932,7 @@ fn decrement_operand<'ctx, 'arena>(
         operand,
         operand_id,
         None,
-        resulting_type_union.clone(),
+        Rc::clone(&resulting_type_union),
         false,
     )?;
 
@@ -1264,7 +1312,7 @@ fn cast_type_to_float<'arena>(
     TUnion::from_vec(combine(resulting_float_atomics, context.codebase, context.settings.combiner_options()))
 }
 
-fn cast_type_to_int(operand_type: &TUnion, context: &mut Context<'_, '_>) -> TUnion {
+fn cast_type_to_int(operand_type: &TUnion, context: &Context<'_, '_>) -> TUnion {
     let mut possibilities = vec![];
     for t in operand_type.types.as_ref() {
         let possible = match t {
@@ -1386,10 +1434,16 @@ fn cast_type_to_object<'arena>(
                         known_properties.insert(property_name, item.clone());
                     }
 
-                    possibilities.push(TAtomic::Object(TObject::new_with_properties(
+                    // Casting an array to an object produces a `stdClass` instance in PHP,
+                    // so intersect the shape with `stdClass` to preserve both the shape
+                    // information and the nominal `stdClass` type.
+                    let mut named = TNamedObject::new(atom("stdClass"));
+                    named.intersection_types = Some(vec![TAtomic::Object(TObject::new_with_properties(
                         keyed_array.parameters.is_none(),
                         known_properties,
-                    )));
+                    ))]);
+
+                    possibilities.push(TAtomic::Object(TObject::Named(named)));
                 }
             }
             _ => {}
@@ -1666,7 +1720,7 @@ pub fn cast_type_to_string<'ctx>(
 
             TAtomic::Null | TAtomic::Void => possibilities.push(TAtomic::Scalar(TScalar::literal_string(atom("")))),
             TAtomic::Resource(_) => possibilities.push(TAtomic::Scalar(TScalar::non_empty_string())),
-            TAtomic::Never => continue,
+            TAtomic::Never => {}
             _ => {
                 if let Some(result) = find_to_string_in_intersections(
                     t,
@@ -1741,7 +1795,7 @@ fn find_to_string_in_intersections<'ctx>(
                     expression_span,
                 ));
             }
-            _ => continue,
+            _ => {}
         }
     }
 
@@ -1756,7 +1810,7 @@ mod tests {
 
     test_analysis! {
         name = unary_increment_decrement_operators,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /**
@@ -1811,7 +1865,7 @@ mod tests {
              * @param non-empty-list<non-empty-string> $args
              * @param non-empty-string $cwd
              */
-            function shell_execute(string $command, array $args, string $cwd = ''): void {
+            function shell_execute(string $command, array $args, string $cwd = '.'): void {
                 echo "Executing command: $command [" . $args[0] . ", ..] in directory: $cwd\n";
             }
 
@@ -1851,7 +1905,7 @@ mod tests {
 
     test_analysis! {
         name = negate_integer_ranges,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             final readonly class Duration
@@ -1884,7 +1938,7 @@ mod tests {
 
     test_analysis! {
         name = cast_stdclass_to_array,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             class stdClass
@@ -1902,7 +1956,7 @@ mod tests {
 
     test_analysis! {
         name = negative_numeric_string_increment_decrement,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /**

@@ -33,6 +33,7 @@ use crate::internal::format::misc::is_breaking_expression;
 use crate::internal::format::misc::is_simple_call_argument;
 use crate::internal::format::misc::is_simple_expression;
 use crate::internal::format::misc::is_string_word_type;
+use crate::internal::utils::get_expression_width;
 use crate::internal::utils::string_width;
 use crate::internal::utils::unwrap_parenthesized;
 
@@ -96,6 +97,16 @@ impl<'arena> MemberAccess<'arena> {
             MemberAccess::StaticMethodCall(call) => Some(&call.argument_list),
             _ => None,
         }
+    }
+
+    fn get_flat_width(&self) -> Option<usize> {
+        let selector_width = get_selector_width(self.get_selector())?;
+        let arguments_width = match self.get_arguments_list() {
+            Some(argument_list) => get_argument_list_width(argument_list)?,
+            None => 0,
+        };
+
+        Some(string_width(self.get_operator_as_str()) + selector_width + arguments_width)
     }
 }
 
@@ -251,6 +262,7 @@ impl<'arena> MemberAccessChain<'arena> {
                         }
                         Expression::Identifier(_) | Expression::ConstantAccess(_) => 6,
                         Expression::Instantiation(_) => 6,
+                        #[allow(clippy::unreachable)]
                         _ => unreachable!(), // We already matched these variants
                     }
                 }
@@ -267,8 +279,90 @@ impl<'arena> MemberAccessChain<'arena> {
     }
 
     #[inline]
+    fn is_first_link_already_broken(&self, f: &FormatterState) -> bool {
+        let Some(first_access) = self.accesses.first() else {
+            return false;
+        };
+
+        misc::has_new_line_in_range(
+            f.source_text,
+            self.base.span().end.offset,
+            first_access.get_operator_span().start.offset,
+        )
+    }
+
+    #[inline]
     fn is_first_link_object_method_call(&self) -> bool {
         matches!(self.accesses.first(), Some(MemberAccess::MethodCall(_) | MemberAccess::NullSafeMethodCall(_)))
+    }
+
+    fn exceeds_print_width(&self, f: &FormatterState) -> bool {
+        let Some(width) = self.get_flat_width() else {
+            return false;
+        };
+
+        width > f.settings.print_width
+    }
+
+    #[inline]
+    fn has_break_after_first_access(&self, f: &FormatterState) -> bool {
+        for (i, access) in self.accesses.iter().enumerate() {
+            if i == 0 {
+                continue;
+            }
+
+            let prev_access = &self.accesses[i - 1];
+            let prev_selector = prev_access.get_selector();
+            let prev_selector_end = match prev_access.get_arguments_list() {
+                Some(args) => args.span().end,
+                None => prev_selector.span().end,
+            };
+
+            if misc::has_new_line_in_range(
+                f.source_text,
+                prev_selector_end.offset,
+                access.get_operator_span().start_offset(),
+            ) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn has_line_break_before_statement_terminator(&self, f: &FormatterState) -> bool {
+        let Some(last_access) = self.accesses.last() else {
+            return false;
+        };
+
+        let chain_end = match last_access.get_arguments_list() {
+            Some(argument_list) => argument_list.span().end.offset,
+            None => last_access.get_selector().span().end.offset,
+        };
+
+        let terminator_start = match f.parent_node() {
+            Node::ExpressionStatement(statement) => statement.terminator.span().start.offset,
+            Node::Return(r#return) => r#return.terminator.span().start.offset,
+            Node::Assignment(_) => match (f.grandparent_node(), f.great_grandparent_node()) {
+                (Some(Node::Expression(_)), Some(Node::ExpressionStatement(statement))) => {
+                    statement.terminator.span().start.offset
+                }
+                (Some(Node::Expression(_)), Some(Node::Return(r#return))) => r#return.terminator.span().start.offset,
+                _ => return false,
+            },
+            _ => return false,
+        };
+
+        misc::has_new_line_in_range(f.source_text, chain_end, terminator_start)
+    }
+
+    fn get_flat_width(&self) -> Option<usize> {
+        let mut width = get_flat_expression_width(self.base)?;
+        for access in &self.accesses {
+            width += access.get_flat_width()?;
+        }
+
+        Some(width)
     }
 
     #[inline]
@@ -388,6 +482,14 @@ impl<'arena> MemberAccessChain<'arena> {
 
     #[inline]
     fn must_break(&self, f: &FormatterState) -> bool {
+        if f.settings.preserve_breaking_member_access_chain && self.has_line_break_before_statement_terminator(f) {
+            return true;
+        }
+
+        if self.has_comments_in_chain(f) && self.is_already_broken(f) {
+            return true;
+        }
+
         if self.is_first_link_static_method_call() && self.accesses.len() > 5 {
             return true;
         }
@@ -441,6 +543,7 @@ impl<'arena> MemberAccessChain<'arena> {
 
         let mut i = 0;
         let mut pattern_start_index = None;
+        let mut first_pattern_method_count = 0usize;
         let mut patterns_count = 0;
 
         // Iterate through all accesses
@@ -477,6 +580,7 @@ impl<'arena> MemberAccessChain<'arena> {
             if property_count > 0 && method_count > 0 {
                 if pattern_start_index.is_none() {
                     pattern_start_index = Some(property_start);
+                    first_pattern_method_count = method_count;
                 }
 
                 patterns_count += 1;
@@ -485,9 +589,86 @@ impl<'arena> MemberAccessChain<'arena> {
 
         match pattern_start_index {
             Some(0) if patterns_count > 1 => Some(0),
-            Some(start) if start > 0 => Some(start),
+            Some(start) if start > 0 && patterns_count > 1 => Some(start),
+            Some(start) if start > 0 && patterns_count == 1 && first_pattern_method_count <= 1 => Some(start),
             _ => None,
         }
+    }
+}
+
+fn get_argument_width(argument: &Argument<'_>) -> Option<usize> {
+    match argument {
+        Argument::Positional(argument) => {
+            let unpack_width = usize::from(argument.ellipsis.is_some()) * 3;
+
+            get_flat_expression_width(argument.value).map(|width| width + unpack_width)
+        }
+        Argument::Named(argument) => {
+            get_flat_expression_width(argument.value).map(|width| width + string_width(argument.name.value) + 2)
+        }
+    }
+}
+
+fn get_argument_list_width(argument_list: &ArgumentList<'_>) -> Option<usize> {
+    let mut width = 2;
+    for (i, argument) in argument_list.arguments.iter().enumerate() {
+        if i > 0 {
+            width += 2;
+        }
+
+        width += get_argument_width(argument)?;
+    }
+
+    Some(width)
+}
+
+fn get_variable_width(variable: &Variable<'_>) -> Option<usize> {
+    match variable {
+        Variable::Direct(variable) => Some(string_width(variable.name)),
+        Variable::Indirect(variable) => get_expression_width(variable.expression).map(|width| width + 3),
+        Variable::Nested(variable) => get_variable_width(variable.variable).map(|width| width + 1),
+    }
+}
+
+fn get_selector_width(selector: &ClassLikeMemberSelector<'_>) -> Option<usize> {
+    match selector {
+        ClassLikeMemberSelector::Identifier(identifier) => Some(string_width(identifier.value)),
+        ClassLikeMemberSelector::Variable(variable) => get_variable_width(variable),
+        ClassLikeMemberSelector::Expression(selector) => {
+            get_flat_expression_width(selector.expression).map(|width| width + 2)
+        }
+        ClassLikeMemberSelector::Missing(_) => None,
+    }
+}
+
+fn get_flat_expression_width(expression: &Expression<'_>) -> Option<usize> {
+    if let Some(width) = get_expression_width(expression) {
+        return Some(width);
+    }
+
+    match expression {
+        Expression::Parenthesized(parenthesized) => {
+            get_flat_expression_width(parenthesized.expression).map(|width| width + 2)
+        }
+        Expression::Access(Access::Property(access)) => get_flat_expression_width(access.object)
+            .zip(get_selector_width(&access.property))
+            .map(|(object, property)| object + string_width("->") + property),
+        Expression::Access(Access::NullSafeProperty(access)) => get_flat_expression_width(access.object)
+            .zip(get_selector_width(&access.property))
+            .map(|(object, property)| object + string_width("?->") + property),
+        Expression::Call(Call::Method(call)) => get_flat_expression_width(call.object)
+            .zip(get_selector_width(&call.method))
+            .zip(get_argument_list_width(&call.argument_list))
+            .map(|((object, method), arguments)| object + string_width("->") + method + arguments),
+        Expression::Call(Call::NullSafeMethod(call)) => get_flat_expression_width(call.object)
+            .zip(get_selector_width(&call.method))
+            .zip(get_argument_list_width(&call.argument_list))
+            .map(|((object, method), arguments)| object + string_width("?->") + method + arguments),
+        Expression::Call(Call::StaticMethod(call)) => get_flat_expression_width(call.class)
+            .zip(get_selector_width(&call.method))
+            .zip(get_argument_list_width(&call.argument_list))
+            .map(|((class, method), arguments)| class + string_width("::") + method + arguments),
+        _ => None,
     }
 }
 
@@ -661,7 +842,7 @@ pub(super) fn print_member_access_chain<'arena>(
         parts.push(Document::BreakParent);
     }
 
-    if matches!(f.parent_node(), Node::ExpressionStatement(_)) {
+    if matches!(f.parent_node(), Node::ExpressionStatement(_) | Node::Assignment(_) | Node::Return(_)) {
         f.set_member_access_chain_group_id(group_id);
     }
 
@@ -673,6 +854,38 @@ fn should_inline_first_access<'arena>(
     f: &FormatterState<'_, 'arena>,
     member_access_chain: &MemberAccessChain<'arena>,
 ) -> bool {
+    let preserve_same_line_first_method = f.settings.preserve_breaking_member_access_chain
+        && f.settings.preserve_breaking_member_access_chain_first_method_on_same_line
+        && member_access_chain.is_first_link_object_method_call()
+        && (member_access_chain.is_first_link_already_broken(f)
+            || member_access_chain.has_break_after_first_access(f)
+            || member_access_chain.exceeds_print_width(f));
+
+    if preserve_same_line_first_method {
+        return true;
+    }
+
+    if f.settings.preserve_breaking_member_access_chain
+        && member_access_chain.is_first_link_object_method_call()
+        && member_access_chain.is_first_link_already_broken(f)
+    {
+        return false;
+    }
+
+    if f.settings.preserve_breaking_member_access_chain
+        && member_access_chain.is_first_link_object_method_call()
+        && member_access_chain.has_break_after_first_access(f)
+    {
+        return false;
+    }
+
+    if f.settings.preserve_breaking_member_access_chain
+        && member_access_chain.is_first_link_object_method_call()
+        && member_access_chain.exceeds_print_width(f)
+    {
+        return false;
+    }
+
     if f.settings.first_method_chain_on_new_line && member_access_chain.is_first_link_object_method_call() {
         return false;
     }

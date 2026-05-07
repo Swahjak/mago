@@ -52,7 +52,8 @@ pub mod reference;
 pub mod resource;
 pub mod scalar;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Eq, Hash, PartialOrd, Ord)]
+#[allow(clippy::derived_hash_with_manual_eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, Hash, PartialOrd, Ord)]
 pub enum TAtomic {
     Scalar(TScalar),
     Callable(TCallable),
@@ -71,6 +72,36 @@ pub enum TAtomic {
     Null,
     Void,
     Placeholder,
+}
+
+impl PartialEq for TAtomic {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        if std::ptr::eq(self, other) {
+            return true;
+        }
+
+        match (self, other) {
+            (TAtomic::Scalar(a), TAtomic::Scalar(b)) => a == b,
+            (TAtomic::Callable(a), TAtomic::Callable(b)) => a == b,
+            (TAtomic::Mixed(a), TAtomic::Mixed(b)) => a == b,
+            (TAtomic::Object(a), TAtomic::Object(b)) => a == b,
+            (TAtomic::Array(a), TAtomic::Array(b)) => a == b,
+            (TAtomic::Iterable(a), TAtomic::Iterable(b)) => a == b,
+            (TAtomic::Resource(a), TAtomic::Resource(b)) => a == b,
+            (TAtomic::Reference(a), TAtomic::Reference(b)) => a == b,
+            (TAtomic::GenericParameter(a), TAtomic::GenericParameter(b)) => a == b,
+            (TAtomic::Variable(a), TAtomic::Variable(b)) => a == b,
+            (TAtomic::Conditional(a), TAtomic::Conditional(b)) => a == b,
+            (TAtomic::Derived(a), TAtomic::Derived(b)) => a == b,
+            (TAtomic::Alias(a), TAtomic::Alias(b)) => a == b,
+            (TAtomic::Never, TAtomic::Never)
+            | (TAtomic::Null, TAtomic::Null)
+            | (TAtomic::Void, TAtomic::Void)
+            | (TAtomic::Placeholder, TAtomic::Placeholder) => true,
+            _ => false,
+        }
+    }
 }
 
 impl TAtomic {
@@ -248,12 +279,12 @@ impl TAtomic {
             }
 
             let parameters = named_object.get_type_parameters().unwrap_or_default();
-            match parameters.len() {
-                0 => Some((get_mixed(), get_mixed(), get_mixed(), get_mixed())),
-                1 => Some((get_mixed(), parameters[0].clone(), get_mixed(), get_mixed())),
-                2 => Some((parameters[0].clone(), parameters[1].clone(), get_mixed(), get_mixed())),
-                3 => Some((parameters[0].clone(), parameters[1].clone(), parameters[2].clone(), get_mixed())),
-                4 => Some((parameters[0].clone(), parameters[1].clone(), parameters[2].clone(), parameters[3].clone())),
+            match parameters {
+                [] => Some((get_mixed(), get_mixed(), get_mixed(), get_mixed())),
+                [a] => Some((get_mixed(), a.clone(), get_mixed(), get_mixed())),
+                [a, b] => Some((a.clone(), b.clone(), get_mixed(), get_mixed())),
+                [a, b, c] => Some((a.clone(), b.clone(), c.clone(), get_mixed())),
+                [a, b, c, d] => Some((a.clone(), b.clone(), c.clone(), d.clone())),
                 _ => None,
             }
         };
@@ -730,6 +761,7 @@ impl TAtomic {
             TAtomic::Scalar(scalar) => scalar.is_truthy(),
             TAtomic::Array(array) => array.is_truthy(),
             TAtomic::Mixed(mixed) => mixed.is_truthy(),
+            TAtomic::Resource(resource) => resource.closed.is_none_or(|closed| !closed),
             TAtomic::Object(_) | TAtomic::Callable(_) => true,
             _ => false,
         }
@@ -741,6 +773,7 @@ impl TAtomic {
             TAtomic::Scalar(scalar) if scalar.is_falsy() => true,
             TAtomic::Array(array) if array.is_falsy() => true,
             TAtomic::Mixed(mixed) if mixed.is_falsy() => true,
+            TAtomic::Resource(resource) => resource.closed.is_some_and(|closed| closed),
             TAtomic::Null | TAtomic::Void => true,
             _ => false,
         }
@@ -795,20 +828,20 @@ impl TAtomic {
                         let has_kv_pair = type_parameters.len() == 2;
 
                         if let Some(key_or_value_param) = type_parameters.get_mut(0)
-                            && let TAtomic::Placeholder = key_or_value_param.get_single()
+                            && matches!(key_or_value_param.get_single(), TAtomic::Placeholder)
                         {
                             *key_or_value_param = if has_kv_pair { get_arraykey() } else { get_mixed() };
                         }
 
                         if has_kv_pair
                             && let Some(value_param) = type_parameters.get_mut(1)
-                            && let TAtomic::Placeholder = value_param.get_single()
+                            && matches!(value_param.get_single(), TAtomic::Placeholder)
                         {
                             *value_param = get_mixed();
                         }
                     } else {
                         for type_param in type_parameters {
-                            if let TAtomic::Placeholder = type_param.get_single() {
+                            if matches!(type_param.get_single(), TAtomic::Placeholder) {
                                 *type_param = get_mixed();
                             }
                         }
@@ -1309,6 +1342,9 @@ pub fn populate_atomic_type(
                     }
                 }
             }
+            TReference::Global { .. } => {
+                // Global-constant wildcards are resolved at expansion time; nothing to populate.
+            }
         },
         TAtomic::GenericParameter(TGenericParameter { constraint, intersection_types, .. }) => {
             populate_union_type(
@@ -1389,8 +1425,34 @@ pub fn populate_atomic_type(
                     symbol_references,
                     force,
                 );
+
                 populate_union_type(
                     index_access.get_index_type_mut(),
+                    codebase_symbols,
+                    reference_source,
+                    symbol_references,
+                    force,
+                );
+            }
+            TDerived::TemplateType(template_type) => {
+                populate_union_type(
+                    template_type.get_object_mut(),
+                    codebase_symbols,
+                    reference_source,
+                    symbol_references,
+                    force,
+                );
+
+                populate_union_type(
+                    template_type.get_class_name_mut(),
+                    codebase_symbols,
+                    reference_source,
+                    symbol_references,
+                    force,
+                );
+
+                populate_union_type(
+                    template_type.get_template_name_mut(),
                     codebase_symbols,
                     reference_source,
                     symbol_references,

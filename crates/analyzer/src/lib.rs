@@ -1,4 +1,9 @@
 #![allow(clippy::too_many_arguments)]
+#![allow(clippy::wildcard_imports)]
+#![allow(clippy::exhaustive_enums)]
+#![allow(clippy::float_arithmetic)]
+#![allow(clippy::pub_use)]
+#![allow(clippy::match_wildcard_for_single_variants)]
 
 use bumpalo::Bump;
 
@@ -22,13 +27,15 @@ use crate::settings::Settings;
 use crate::statement::analyze_statements;
 
 pub mod analysis_result;
+pub mod artifacts;
 pub mod code;
 pub mod error;
 pub mod plugin;
 pub mod settings;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod telemetry;
 
 mod analyzable;
-mod artifacts;
 mod assertion;
 mod common;
 mod context;
@@ -62,14 +69,35 @@ impl<'ctx, 'ast, 'arena> Analyzer<'ctx, 'ast, 'arena> {
         plugin_registry: &'ctx PluginRegistry,
         settings: Settings,
     ) -> Self {
-        Self { arena, source_file, resolved_names, codebase, plugin_registry, settings }
+        Self { arena, source_file, resolved_names, codebase, settings, plugin_registry }
     }
 
+    /// Runs the analyzer over `program` and accumulates findings into `analysis_result`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] when a plugin hook fails or analysis cannot complete.
     pub fn analyze(
         &self,
         program: &'ast Program<'arena>,
         analysis_result: &mut AnalysisResult,
     ) -> Result<(), AnalysisError> {
+        self.analyze_with_artifacts(program, analysis_result).map(|_| ())
+    }
+
+    /// Same as [`Self::analyze`], but returns the [`AnalysisArtifacts`]
+    /// produced during analysis. Used by editor integrations (e.g. the
+    /// LSP server) that need to query per-expression types after analysis
+    /// has finished.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] when a plugin hook fails or analysis cannot complete.
+    pub fn analyze_with_artifacts(
+        &self,
+        program: &'ast Program<'arena>,
+        analysis_result: &mut AnalysisResult,
+    ) -> Result<AnalysisArtifacts, AnalysisError> {
         #[cfg(not(target_arch = "wasm32"))]
         let start_time = std::time::Instant::now();
 
@@ -79,11 +107,16 @@ impl<'ctx, 'ast, 'arena> Analyzer<'ctx, 'ast, 'arena> {
                 analysis_result.time_in_analysis = start_time.elapsed();
             }
 
-            return Ok(());
+            return Ok(AnalysisArtifacts::new());
         }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let trace_enabled = tracing::enabled!(tracing::Level::TRACE);
 
         let statements = program.statements.as_slice();
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let setup_start = trace_enabled.then(std::time::Instant::now);
         let mut collector = Collector::new(self.arena, self.source_file, program, COLLECTOR_CATEGORIES);
         if self.settings.diff {
             collector.set_skip_unfulfilled_expect(true);
@@ -103,25 +136,28 @@ impl<'ctx, 'ast, 'arena> Analyzer<'ctx, 'ast, 'arena> {
 
         let mut block_context = BlockContext::new(ScopeContext::new(), context.settings.register_super_globals);
         let mut artifacts = AnalysisArtifacts::new();
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(start) = setup_start {
+            telemetry::record_setup(start.elapsed());
+        }
 
         if self.plugin_registry.has_program_hooks() {
             let mut hook_context = HookContext::new(context.codebase, &mut block_context, &mut artifacts);
 
-            if let HookAction::Skip =
-                self.plugin_registry.before_program(self.source_file, program, &mut hook_context)?
-            {
+            if self.plugin_registry.before_program(self.source_file, program, &mut hook_context)? == HookAction::Skip {
                 for reported in hook_context.take_issues() {
                     context.collector.report_with_code(reported.code, reported.issue);
                 }
 
-                context.finish(artifacts, analysis_result);
+                analysis_result.symbol_references.extend(std::mem::take(&mut artifacts.symbol_references));
+                context.finish_collector(analysis_result);
 
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     analysis_result.time_in_analysis = start_time.elapsed();
                 }
 
-                return Ok(());
+                return Ok(artifacts);
             }
 
             for reported in hook_context.take_issues() {
@@ -129,7 +165,13 @@ impl<'ctx, 'ast, 'arena> Analyzer<'ctx, 'ast, 'arena> {
             }
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let statements_start = trace_enabled.then(std::time::Instant::now);
         analyze_statements(statements, &mut context, &mut block_context, &mut artifacts)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(start) = statements_start {
+            telemetry::record_statements(start.elapsed());
+        }
 
         // Call after_program hooks
         if self.plugin_registry.has_program_hooks() {
@@ -140,7 +182,14 @@ impl<'ctx, 'ast, 'arena> Analyzer<'ctx, 'ast, 'arena> {
             }
         }
 
-        context.finish(artifacts, analysis_result);
+        #[cfg(not(target_arch = "wasm32"))]
+        let finish_start = trace_enabled.then(std::time::Instant::now);
+        analysis_result.symbol_references.extend(std::mem::take(&mut artifacts.symbol_references));
+        context.finish_collector(analysis_result);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(start) = finish_start {
+            telemetry::record_finish(start.elapsed());
+        }
 
         // Filter issues through registered issue filter hooks
         if self.plugin_registry.has_issue_filter_hooks() {
@@ -149,11 +198,14 @@ impl<'ctx, 'ast, 'arena> Analyzer<'ctx, 'ast, 'arena> {
         }
 
         #[cfg(not(target_arch = "wasm32"))]
+        telemetry::record_file();
+
+        #[cfg(not(target_arch = "wasm32"))]
         {
             analysis_result.time_in_analysis = start_time.elapsed();
         }
 
-        Ok(())
+        Ok(artifacts)
     }
 }
 
@@ -161,6 +213,7 @@ impl<'ctx, 'ast, 'arena> Analyzer<'ctx, 'ast, 'arena> {
 mod tests {
     use std::borrow::Cow;
     use std::collections::BTreeMap;
+    use std::fmt::Write as _;
 
     use foldhash::HashSet;
 
@@ -301,7 +354,7 @@ mod tests {
         if !discrepancies.is_empty() {
             let mut panic_message = format!("Test '{test_name}' failed with issue discrepancies:\n");
             for d in discrepancies {
-                panic_message.push_str(&format!("  {d}\n"));
+                let _ = writeln!(panic_message, "  {d}");
             }
 
             panic!("{}", panic_message);
@@ -310,11 +363,12 @@ mod tests {
         if expected_issue_codes.is_empty() && actual_issues_count != 0 {
             let mut panic_message = format!("Test '{test_name}': Expected no issues, but found:\n");
             for issue in actual_issues_collected {
-                panic_message.push_str(&format!(
-                    "  - Code: `{}`, Message: \"{}\"\n",
+                let _ = writeln!(
+                    panic_message,
+                    "  - Code: `{}`, Message: \"{}\"",
                     issue.code.unwrap_or_default(),
                     issue.message
-                ));
+                );
             }
 
             panic!("{}", panic_message);

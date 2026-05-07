@@ -3,6 +3,7 @@ use std::rc::Rc;
 use mago_atom::AtomSet;
 
 use mago_codex::ttype::TType;
+use mago_codex::ttype::add_optional_union_type_rc;
 use mago_codex::ttype::combine_union_types;
 use mago_codex::ttype::combiner::CombinerOptions;
 use mago_reporting::Annotation;
@@ -139,6 +140,20 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Continue<'arena> {
             }
         });
 
+        for var_id in loop_scope.parent_context_variables.keys() {
+            if !redefined_vars.contains_key(var_id)
+                && let Some(current_type) = block_context.locals.get(var_id)
+            {
+                let combined = add_optional_union_type_rc(
+                    current_type,
+                    loop_scope.possibly_redefined_loop_variables.get(var_id).map(std::convert::AsRef::as_ref),
+                    context.codebase,
+                );
+
+                loop_scope.possibly_redefined_loop_variables.insert(*var_id, combined);
+            }
+        }
+
         for (var_id, var_type) in redefined_vars {
             loop_scope.possibly_redefined_loop_variables.insert(
                 var_id,
@@ -149,7 +164,7 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Continue<'arena> {
                         context.codebase,
                         CombinerOptions::default(),
                     )),
-                    None => var_type.clone(),
+                    None => Rc::clone(&var_type),
                 },
             );
         }
@@ -165,7 +180,7 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Continue<'arena> {
                         CombinerOptions::default(),
                     ));
                 } else {
-                    finally_scope.locals.insert(*var_id, var_type.clone());
+                    finally_scope.locals.insert(*var_id, Rc::clone(var_type));
                 }
             }
         }

@@ -33,7 +33,7 @@ use crate::error::AnalysisError;
 ///
 /// For `"a" . "b" . "c"`, this returns `["a", "b", "c"]` instead of recursing through the nested binary nodes.
 /// This avoids stack overflow on deeply nested concatenations.
-fn collect_concat_operands<'a, 'arena>(binary: &'a Binary<'arena>) -> Vec<&'a Expression<'arena>> {
+fn collect_concat_operands<'ast, 'arena>(binary: &'ast Binary<'arena>) -> Vec<&'ast Expression<'arena>> {
     let mut operands = Vec::new();
     let mut stack: Vec<&Expression<'arena>> = vec![&binary.rhs, &binary.lhs];
 
@@ -94,7 +94,7 @@ pub fn analyze_string_concat_operation<'ctx, 'arena>(
 #[inline]
 fn analyze_string_concat_operand<'arena>(
     context: &mut Context<'_, 'arena>,
-    artifacts: &mut AnalysisArtifacts,
+    artifacts: &AnalysisArtifacts,
     operand: &Expression<'arena>,
     side: &'static str,
 ) {
@@ -187,14 +187,39 @@ fn analyze_string_concat_operand<'arena>(
 
         match operand_atomic_type {
             TAtomic::GenericParameter(parameter) => {
-                if parameter.constraint.is_any_string()
-                    || parameter.constraint.is_int()
-                    || parameter.constraint.is_float()
-                    || parameter.constraint.is_array_key()
-                    || parameter.constraint.is_mixed()
-                    || parameter.constraint.is_numeric()
-                {
+                let constraint = parameter.constraint.as_ref();
+                let constraint_is_concatenable = !constraint.types.is_empty()
+                    && constraint.types.iter().all(|atom| match atom {
+                        TAtomic::Scalar(scalar) => {
+                            scalar.is_any_string()
+                                || scalar.is_int()
+                                || scalar.is_float()
+                                || scalar.is_array_key()
+                                || scalar.is_numeric()
+                        }
+                        _ => false,
+                    });
+
+                if constraint_is_concatenable {
                     current_atomic_is_valid = true;
+                } else if parameter.constraint.is_mixed() {
+                    if !reported_invalid_issue {
+                        context.collector.report_with_code(
+                            IssueCode::MixedOperand,
+                            Issue::error(format!(
+                                "Invalid {} operand: template parameter `{}` is unconstrained (effectively `mixed`) and cannot be reliably used in string concatenation.",
+                                side,
+                                parameter.parameter_name,
+                            ))
+                            .with_annotation(Annotation::primary(operand.span()).with_message("Template type is unconstrained"))
+                            .with_note("An unconstrained template parameter could be substituted with any type, including arrays or objects without `__toString`.")
+                            .with_help(format!("Constrain the template parameter, e.g. `@template {} of string` or `@template {} of string|int`, or cast the value explicitly.", parameter.parameter_name, parameter.parameter_name)),
+                        );
+
+                        reported_invalid_issue = true;
+                    }
+
+                    overall_type_match = false;
                 } else {
                     if !reported_invalid_issue {
                         context.collector.report_with_code(
@@ -399,6 +424,8 @@ fn analyze_string_concat_operand<'arena>(
                 "Ensure the operand always has a compatible type using checks or assertions before concatenation.",
             ),
         );
+    } else {
+        // operand fully matches concatenation, or an invalid-operand issue was already reported
     }
 }
 

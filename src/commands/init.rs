@@ -135,6 +135,8 @@ impl AnalyzerStrictnessPreset {
                 find_unused_parameters: false,
                 memoize_properties: true,
                 strict_list_index_checks: false,
+                strict_array_index_existence: false,
+                allow_array_truthy_operand: false,
                 no_boolean_literal_comparison: false,
                 check_missing_type_hints: false,
                 register_super_globals: true,
@@ -150,6 +152,8 @@ impl AnalyzerStrictnessPreset {
                 find_unused_parameters: false,
                 memoize_properties: true,
                 strict_list_index_checks: false,
+                strict_array_index_existence: false,
+                allow_array_truthy_operand: false,
                 no_boolean_literal_comparison: false,
                 check_missing_type_hints: false,
                 register_super_globals: true,
@@ -165,6 +169,8 @@ impl AnalyzerStrictnessPreset {
                 find_unused_parameters: true,
                 memoize_properties: true,
                 strict_list_index_checks: true,
+                strict_array_index_existence: false,
+                allow_array_truthy_operand: false,
                 no_boolean_literal_comparison: false,
                 check_missing_type_hints: false,
                 register_super_globals: true,
@@ -180,6 +186,8 @@ impl AnalyzerStrictnessPreset {
                 find_unused_parameters: true,
                 memoize_properties: true,
                 strict_list_index_checks: true,
+                strict_array_index_existence: true,
+                allow_array_truthy_operand: false,
                 no_boolean_literal_comparison: true,
                 check_missing_type_hints: true,
                 register_super_globals: true,
@@ -199,8 +207,10 @@ impl AnalyzerStrictnessPreset {
 /// - Formatter style settings (PER-CS compatible by default)
 /// - Linter rules and integrations
 /// - Analyzer features and options
-const CONFIGURATION_TEMPLATE: &str = r#"# Welcome to Mago!
+const CONFIGURATION_TEMPLATE: &str = r#"#:schema https://mago.carthage.software/{mago_version}/schema.json
+# Welcome to Mago!
 # For full documentation, see https://mago.carthage.software/tools/overview
+version = "1"
 php-version = "{php_version}"
 
 [source]
@@ -331,6 +341,7 @@ impl InitCommand {
 
         print_step_header(5, "Review & Confirm");
         let config_content = CONFIGURATION_TEMPLATE
+            .replace("{mago_version}", env!("CARGO_PKG_VERSION"))
             .replace("{php_version}", &php_version)
             .replace("{paths}", &quote_format_strings(&paths))
             .replace("{includes}", &quote_format_strings(&includes))
@@ -401,6 +412,10 @@ struct InitializationAnalyzerSettings {
     memoize_properties: bool,
     /// Whether to enforce strict checks when accessing list elements by index
     strict_list_index_checks: bool,
+    /// Whether to widen possibly-undefined array/list reads to `T|null` and warn
+    strict_array_index_existence: bool,
+    /// Whether to allow arrays as operands of `&&`, `||`, and `xor` without `invalid-operand`
+    allow_array_truthy_operand: bool,
     /// Whether to disallow comparisons with boolean literals
     no_boolean_literal_comparison: bool,
     /// Whether to check for missing type hints
@@ -512,7 +527,7 @@ fn setup_formatter(theme: &ColorfulTheme) -> Result<String, Error> {
     println!("  │  {}", "This ends debates about spacing and helps you focus on the code.".bright_black());
     println!("  │");
 
-    if Confirm::with_theme(theme)
+    let base_config = if Confirm::with_theme(theme)
         .with_prompt(" │  Do you want to use a preset formatter configuration?")
         .default(false)
         .interact()?
@@ -528,9 +543,8 @@ fn setup_formatter(theme: &ColorfulTheme) -> Result<String, Error> {
 
         println!("  │");
         println!("  │  {}", format!("Selected preset: {}", preset_items[selection]).green());
-        println!("  ╰─");
 
-        Ok(format!("[formatter]\npreset = \"{}\"", selected_preset))
+        format!("[formatter]\npreset = \"{}\"", selected_preset)
     } else {
         let defaults = (120, 4, false);
 
@@ -551,22 +565,40 @@ fn setup_formatter(theme: &ColorfulTheme) -> Result<String, Error> {
                 "  │  {}",
                 "ℹ️  The formatter has many more options. Check the docs to customize it further.".blue()
             );
-            println!("  ╰─");
-            Ok(format!(
-                "[formatter]\nprint-width = {}\ntab-width = {}\nuse-tabs = {}",
-                print_width, tab_width, use_tabs
-            ))
+            format!("[formatter]\nprint-width = {}\ntab-width = {}\nuse-tabs = {}", print_width, tab_width, use_tabs)
         } else {
             println!("  │");
             println!("  │  {}", "Great choice! Sticking to the defaults is highly recommended.".green());
-            println!("  ╰─");
-            Ok(format!(
-                "[formatter]\nprint-width = {}\ntab-width = {}\nuse-tabs = {}",
-                defaults.0, defaults.1, defaults.2
-            ))
+            format!("[formatter]\nprint-width = {}\ntab-width = {}\nuse-tabs = {}", defaults.0, defaults.1, defaults.2)
         }
-    }
+    };
+
+    println!("  │");
+    let minimal_diff = Confirm::with_theme(theme)
+        .with_prompt(" │  Opt into the smallest possible diff when formatting? (keeps your line breaks intact — let Mago decide if unsure)")
+        .default(false)
+        .interact()?;
+
+    let config = if minimal_diff {
+        println!("  │  {}", "Enabled preserve-* options to minimize reformatting churn.".green());
+        format!("{}\n{}", base_config, PRESERVE_ALL_FORMATTER_BLOCK)
+    } else {
+        base_config
+    };
+
+    println!("  ╰─");
+    Ok(config)
 }
+
+const PRESERVE_ALL_FORMATTER_BLOCK: &str = "preserve-breaking-member-access-chain = true
+preserve-breaking-member-access-chain-first-method-on-same-line = true
+preserve-breaking-argument-list = true
+preserve-breaking-array-like = true
+preserve-breaking-parameter-list = true
+preserve-breaking-attribute-list = true
+preserve-breaking-conditional-expression = true
+preserve-breaking-condition-expression = true
+preserve-redundant-logical-binary-expression-parentheses = true";
 
 fn setup_analyzer(theme: &ColorfulTheme) -> Result<InitializationAnalyzerSettings, Error> {
     print_step_header(4, "Analyzer Configuration");
@@ -644,6 +676,14 @@ fn setup_analyzer(theme: &ColorfulTheme) -> Result<InitializationAnalyzerSetting
         settings.strict_list_index_checks = Confirm::with_theme(theme)
             .with_prompt(" │  Enforce strict checks for list index access?")
             .default(settings.strict_list_index_checks)
+            .interact()?;
+        settings.strict_array_index_existence = Confirm::with_theme(theme)
+            .with_prompt(" │  Treat possibly-undefined array/list reads as `T|null` and warn?")
+            .default(settings.strict_array_index_existence)
+            .interact()?;
+        settings.allow_array_truthy_operand = Confirm::with_theme(theme)
+            .with_prompt(" │  Allow arrays as operands of `&&`, `||`, and `xor`?")
+            .default(settings.allow_array_truthy_operand)
             .interact()?;
 
         println!("  │");
@@ -916,9 +956,13 @@ fn build_analyzer_settings_string(settings: &InitializationAnalyzerSettings) -> 
     lines.push(format!("memoize-properties = {}", settings.memoize_properties));
     lines.push(format!("allow-possibly-undefined-array-keys = {}", settings.allow_possibly_undefined_array_keys));
     lines.push(format!("check-throws = {}", settings.check_throws));
+    lines.push("unchecked-exceptions = [\"Error\", \"LogicException\"]".to_string());
+    lines.push("unchecked-exception-classes = []".to_string());
     lines.push(format!("check-missing-override = {}", settings.check_missing_override));
     lines.push(format!("find-unused-parameters = {}", settings.find_unused_parameters));
     lines.push(format!("strict-list-index-checks = {}", settings.strict_list_index_checks));
+    lines.push(format!("strict-array-index-existence = {}", settings.strict_array_index_existence));
+    lines.push(format!("allow-array-truthy-operand = {}", settings.allow_array_truthy_operand));
     lines.push(format!("no-boolean-literal-comparison = {}", settings.no_boolean_literal_comparison));
     lines.push(format!("check-missing-type-hints = {}", settings.check_missing_type_hints));
     lines.push(format!("register-super-globals = {}", settings.register_super_globals));
@@ -944,6 +988,8 @@ mod tests {
             find_unused_parameters: false,
             memoize_properties: true,
             strict_list_index_checks: false,
+            strict_array_index_existence: false,
+            allow_array_truthy_operand: false,
             no_boolean_literal_comparison: false,
             check_missing_type_hints: false,
             register_super_globals: true,
@@ -961,6 +1007,7 @@ mod tests {
         analyzer_settings: &InitializationAnalyzerSettings,
     ) -> String {
         CONFIGURATION_TEMPLATE
+            .replace("{mago_version}", env!("CARGO_PKG_VERSION"))
             .replace("{php_version}", php_version)
             .replace("{paths}", &quote_format_strings(paths))
             .replace("{includes}", &quote_format_strings(includes))
@@ -995,6 +1042,28 @@ mod tests {
     }
 
     #[test]
+    fn test_generated_config_parses_with_minimal_diff_preserve_block() {
+        let formatter_config = format!(
+            "[formatter]\nprint-width = {}\ntab-width = {}\nuse-tabs = {}\n{}",
+            120, 4, false, PRESERVE_ALL_FORMATTER_BLOCK
+        );
+        let content = generate_config_content(
+            "8.2",
+            &["src".to_string()],
+            &["vendor".to_string()],
+            &[],
+            &[],
+            &formatter_config,
+            &create_default_analyzer_settings(),
+        );
+
+        let result: Result<Configuration, _> = toml::from_str(&content);
+        assert!(result.is_ok(), "Generated config should parse. Error: {:?}\n\nConfig:\n{}", result.err(), content);
+        assert!(content.contains("preserve-breaking-member-access-chain = true"));
+        assert!(content.contains("preserve-redundant-logical-binary-expression-parentheses = true"));
+    }
+
+    #[test]
     fn test_generated_config_parses_with_all_options() {
         let settings = InitializationAnalyzerSettings {
             plugins: vec![AnalyzerPlugin::Psl, AnalyzerPlugin::FlowPhp, AnalyzerPlugin::PsrContainer],
@@ -1007,6 +1076,8 @@ mod tests {
             find_unused_parameters: false,
             memoize_properties: true,
             strict_list_index_checks: true,
+            strict_array_index_existence: true,
+            allow_array_truthy_operand: true,
             no_boolean_literal_comparison: true,
             check_missing_type_hints: true,
             register_super_globals: false,
@@ -1055,6 +1126,8 @@ mod tests {
         assert!(output.contains("memoize-properties = true"));
         assert!(output.contains("allow-possibly-undefined-array-keys = true"));
         assert!(output.contains("check-throws = false"));
+        assert!(output.contains("unchecked-exceptions = [\"Error\", \"LogicException\"]"));
+        assert!(output.contains("unchecked-exception-classes = []"));
         assert!(output.contains("check-missing-override = false"));
         assert!(output.contains("find-unused-parameters = false"));
         assert!(output.contains("strict-list-index-checks = false"));

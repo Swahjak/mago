@@ -31,6 +31,7 @@ use crate::internal::format::misc::should_hug_expression;
 use crate::internal::utils::could_expand_value;
 use crate::internal::utils::foreach_binary_operand;
 use crate::internal::utils::get_expression_width;
+use crate::internal::utils::string_width;
 use crate::internal::utils::unwrap_parenthesized;
 use crate::internal::utils::will_break;
 
@@ -108,6 +109,25 @@ pub(super) fn print_argument_list<'arena>(
         }
     }
 
+    if !force_break && let Some(argument) = argument_list.arguments.first() {
+        let argument_expr = argument.value();
+        let leading_bound = deepest_leading_token_offset(argument_expr);
+        if f.has_inner_line_comment_in_range(argument_list.left_parenthesis.end_offset(), leading_bound) {
+            force_break = true;
+        }
+    }
+
+    if !force_break
+        && f.settings.inline_single_breaking_value_argument
+        && should_inline_single_value_argument(f, argument_list)
+    {
+        let argument = &argument_list.arguments.as_slice()[0];
+        let argument_doc = argument.format(f);
+        let right_parenthesis = format_token(f, argument_list.right_parenthesis, ")");
+
+        return Document::Array(vec![in f.arena; left_parenthesis, argument_doc, right_parenthesis]);
+    }
+
     let mut contents = vec![in f.arena; clone_in_arena(f.arena, &left_parenthesis)];
 
     // First, run all the decision functions with unformatted arguments
@@ -118,10 +138,23 @@ pub(super) fn print_argument_list<'arena>(
     let should_expand_last =
         can_expand_first_or_last && !force_break && should_expand_last_arg(f, argument_list, false);
     let is_single_late_breaking_argument = !force_break && is_single_late_breaking_argument(f, argument_list);
+    let named_argument_width = if should_align_named_arguments(f, argument_list, should_break_all, should_inline) {
+        Some(get_max_named_argument_width(argument_list))
+    } else {
+        None
+    };
 
     let arguments_count = argument_list.arguments.len();
     let mut formatted_arguments: Vec<'arena, Document<'arena>> = Vec::with_capacity_in(arguments_count, f.arena);
+    let previous_named_argument_padding = f.argument_state.named_argument_padding;
     for (i, arg) in argument_list.arguments.iter().enumerate() {
+        f.argument_state.named_argument_padding = match (named_argument_width, arg) {
+            (Some(max_width), Argument::Named(argument)) => {
+                Some(max_width.saturating_sub(string_width(argument.name.value)))
+            }
+            _ => None,
+        };
+
         if !should_break_all && !should_inline {
             if should_expand_first && (i == 0) {
                 let previous = f.argument_state.expand_first_argument;
@@ -146,6 +179,7 @@ pub(super) fn print_argument_list<'arena>(
 
         formatted_arguments.push(arg.format(f));
     }
+    f.argument_state.named_argument_padding = previous_named_argument_padding;
 
     let dangling_comments = f.print_dangling_comments(argument_list.span(), true);
     let right_parenthesis = format_token(f, argument_list.right_parenthesis, ")");
@@ -317,6 +351,7 @@ pub(super) fn print_argument_list<'arena>(
             first_arguments.push(Document::Line(Line::default()));
         }
 
+        #[allow(clippy::unwrap_used)]
         let last_argument = clone_in_arena(f.arena, formatted_arguments.last().unwrap());
 
         return Document::Group(Group::new(vec![
@@ -348,6 +383,40 @@ pub(super) fn print_argument_list<'arena>(
     contents.push(print_right_parenthesis(f, dangling_comments.as_ref(), &right_parenthesis, None));
 
     Document::Group(Group::new(contents).with_id(group_id))
+}
+
+fn should_align_named_arguments(
+    f: &FormatterState<'_, '_>,
+    argument_list: &ArgumentList<'_>,
+    should_break_all: bool,
+    should_inline: bool,
+) -> bool {
+    if !f.settings.align_named_arguments || should_inline || argument_list.arguments.len() < 2 {
+        return false;
+    }
+
+    if !argument_list.arguments.iter().all(|arg| matches!(arg, Argument::Named(_))) {
+        return false;
+    }
+
+    should_break_all
+        || misc::has_new_line_in_range(
+            f.source_text,
+            argument_list.left_parenthesis.start.offset,
+            argument_list.right_parenthesis.end.offset,
+        )
+}
+
+fn get_max_named_argument_width(argument_list: &ArgumentList<'_>) -> usize {
+    argument_list
+        .arguments
+        .iter()
+        .filter_map(|arg| match arg {
+            Argument::Named(argument) => Some(string_width(argument.name.value)),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn print_right_parenthesis<'arena>(
@@ -522,6 +591,33 @@ fn is_single_late_breaking_argument<'arena>(
     call.get_argument_list().arguments.iter().all(|a| a.is_positional() && is_simple_expression(a.value()))
 }
 
+/// Detects single value-shaped positional arguments whose call should stay
+/// inline regardless of `print-width`. Breaking the parens around such an
+/// argument adds an indent + a closing-paren line without making the long
+/// value any shorter, so the standard break-on-overflow path produces a
+/// pure-noise diff. Gated by `inline_single_breaking_value_argument`.
+#[inline]
+fn should_inline_single_value_argument<'arena>(
+    f: &FormatterState<'_, 'arena>,
+    argument_list: &'arena ArgumentList<'arena>,
+) -> bool {
+    let arguments = argument_list.arguments.as_slice();
+    if arguments.len() != 1 {
+        return false;
+    }
+
+    let argument = &arguments[0];
+    if !argument.is_positional() {
+        return false;
+    }
+
+    if argument_has_surrounding_comments(f, argument) {
+        return false;
+    }
+
+    is_simple_expression(argument.value())
+}
+
 #[inline]
 fn should_inline_breaking_arguments<'arena>(
     f: &FormatterState<'_, 'arena>,
@@ -617,9 +713,9 @@ pub fn should_expand_first_arg<'arena>(
         return false;
     }
 
-    let arguments = argument_list.arguments.as_slice();
-    let first_argument = &arguments[0];
-    let second_argument = &arguments[1];
+    let [first_argument, second_argument] = argument_list.arguments.as_slice() else {
+        return false;
+    };
 
     if f.has_comment(first_argument.span(), CommentFlags::LEADING | CommentFlags::TRAILING)
         || f.has_comment(second_argument.span(), CommentFlags::LEADING | CommentFlags::TRAILING)
@@ -704,5 +800,25 @@ fn is_hopefully_short_call_argument(mut node: &Expression) -> bool {
             is_simple_call_argument(operation.lhs, 1) && is_simple_call_argument(operation.rhs, 1)
         }
         _ => is_simple_call_argument(node, 2),
+    }
+}
+
+/// Peel through wrappers to find the offset of the argument's first meaningful
+/// token. A line comment anchored before this offset will be visible at the
+/// top of the argument's flat layout and needs to force a break.
+fn deepest_leading_token_offset(expr: &Expression<'_>) -> u32 {
+    let mut current = expr;
+    loop {
+        match current {
+            Expression::Parenthesized(p) => current = p.expression,
+            Expression::Call(Call::Function(call)) => {
+                if let Expression::Parenthesized(p) = call.function {
+                    current = p.expression;
+                } else {
+                    return current.start_offset();
+                }
+            }
+            _ => return current.start_offset(),
+        }
     }
 }

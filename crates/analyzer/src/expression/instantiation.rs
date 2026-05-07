@@ -1,3 +1,6 @@
+use std::borrow::Cow;
+use std::sync::Arc;
+
 use foldhash::HashMap;
 use foldhash::fast::RandomState;
 use indexmap::IndexMap;
@@ -10,14 +13,17 @@ use mago_codex::identifier::method::MethodIdentifier;
 use mago_codex::ttype::TType;
 use mago_codex::ttype::add_optional_union_type;
 use mago_codex::ttype::atomic::TAtomic;
+use mago_codex::ttype::atomic::generic::TGenericParameter;
 use mago_codex::ttype::atomic::object::TObject;
 use mago_codex::ttype::atomic::object::named::TNamedObject;
+use mago_codex::ttype::atomic::scalar::class_like_string::TClassLikeString;
 use mago_codex::ttype::expander::StaticClassType;
 use mago_codex::ttype::get_never;
 use mago_codex::ttype::get_object;
 use mago_codex::ttype::template::GenericTemplate;
 use mago_codex::ttype::template::TemplateResult;
-use mago_codex::ttype::template::standin_type_replacer::get_most_specific_type_from_bounds;
+use mago_codex::ttype::template::bounds::get_most_specific_type_from_bounds;
+use mago_codex::ttype::template::variance::Variance;
 use mago_codex::ttype::union::TUnion;
 use mago_codex::ttype::wrap_atomic;
 use mago_reporting::Annotation;
@@ -39,6 +45,7 @@ use crate::invocation::InvocationTarget;
 use crate::invocation::MethodTargetContext;
 use crate::invocation::analyzer::analyze_invocation;
 use crate::invocation::post_process::post_invocation_process;
+use crate::resolver::class_name::ResolutionOrigin;
 use crate::resolver::class_name::ResolvedClassname;
 use crate::resolver::class_name::resolve_classnames_from_expression;
 use crate::utils::template::get_generic_parameter_for_offset;
@@ -215,6 +222,7 @@ fn analyze_class_instantiation<'ctx, 'arena>(
 
         return Ok(get_never());
     }
+    // class kind is a regular class; no kind-specific instantiation diagnostic to emit
 
     if classname.is_from_class_string() && (metadata.kind.is_interface() || metadata.kind.is_trait()) {
         let kind_name = if metadata.kind.is_interface() { "interface" } else { "trait" };
@@ -350,8 +358,8 @@ fn analyze_class_instantiation<'ctx, 'arena>(
         }
 
         let mut resolved_template_types = vec![];
-        for (template_name, _) in &metadata.template_types {
-            let template_type = if let Some(lower_bounds) =
+        for (offset, (template_name, _)) in metadata.template_types.iter().enumerate() {
+            let mut template_type = if let Some(lower_bounds) =
                 template_result.get_lower_bounds_for_class_like(*template_name, metadata.name)
             {
                 get_most_specific_type_from_bounds(lower_bounds, context.codebase)
@@ -387,6 +395,11 @@ fn analyze_class_instantiation<'ctx, 'arena>(
                 wrap_atomic(TAtomic::Placeholder)
             };
 
+            let variance = metadata.template_variance.get(offset).copied().unwrap_or(Variance::Invariant);
+            if matches!(variance, Variance::Invariant) {
+                template_type.widen_scalars();
+            }
+
             resolved_template_types.push(template_type);
         }
 
@@ -418,6 +431,8 @@ fn analyze_class_instantiation<'ctx, 'arena>(
                 .map(|(_, _)| if is_spl_object_storage { get_never() } else { wrap_atomic(TAtomic::Placeholder) })
                 .collect(),
         );
+    } else {
+        // class has no constructor, no extra arguments, and no templates; no type parameters to record
     }
 
     let skip_constructor_warning =
@@ -473,16 +488,33 @@ fn analyze_class_instantiation<'ctx, 'arena>(
         return Ok(get_never());
     }
 
-    let result_type = wrap_atomic(TAtomic::Object(TObject::Named(TNamedObject {
+    let constraint_object = TAtomic::Object(TObject::Named(TNamedObject {
         name: metadata.original_name,
         type_parameters,
         is_static: classname.is_static() || (classname.is_self() && metadata.flags.is_final()),
         is_this: false,
         intersection_types: None,
         remapped_parameters: false,
-    })));
+    }));
 
-    Ok(result_type)
+    // `new $className()` where `$className: class-string<T>` produces a `T`, not the constraint.
+    // Preserve the template parameter so the function's `@return T` keeps narrowing on the call site.
+    let result_atomic = if let ResolutionOrigin::SpecificClassLikeString(TClassLikeString::Generic {
+        parameter_name,
+        defining_entity,
+        ..
+    }) = &classname.origin
+    {
+        TAtomic::GenericParameter(TGenericParameter::new(
+            *parameter_name,
+            Arc::new(TUnion::from_single(Cow::Owned(constraint_object))),
+            *defining_entity,
+        ))
+    } else {
+        constraint_object
+    };
+
+    Ok(wrap_atomic(result_atomic))
 }
 
 /// Analyzes the constructor invocation for an anonymous class.
@@ -564,6 +596,8 @@ pub fn analyze_anonymous_class_constructor<'ctx, 'arena>(
         );
 
         argument_list.analyze(context, block_context, artifacts)?;
+    } else {
+        // anonymous class has no constructor and no arguments were provided; nothing to report
     }
 
     Ok(())
@@ -578,7 +612,7 @@ mod tests {
 
     test_analysis! {
         name = templated_class_instantiation,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /**
@@ -626,7 +660,7 @@ mod tests {
 
     test_analysis! {
         name = ambiguous_instantiation_target,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             class A {}
@@ -652,7 +686,7 @@ mod tests {
 
     test_analysis! {
         name = instantiation_of_interface,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             interface MyInterface {}
@@ -667,7 +701,7 @@ mod tests {
 
     test_analysis! {
         name = instantiation_of_trait,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             trait MyTrait {}
@@ -682,7 +716,7 @@ mod tests {
 
     test_analysis! {
         name = instantiation_of_enum,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             enum MyEnum {}
@@ -697,7 +731,7 @@ mod tests {
 
     test_analysis! {
         name = instantiation_of_abstract_class,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             abstract class MyAbstractClass {}
@@ -712,7 +746,7 @@ mod tests {
 
     test_analysis! {
         name = instantiation_self_outside_class,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             $a = new self();
@@ -725,7 +759,7 @@ mod tests {
 
     test_analysis! {
         name = instantiation_static_outside_class,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             $a = new static();
@@ -738,7 +772,7 @@ mod tests {
 
     test_analysis! {
         name = instantiation_parent_outside_class,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             $a = new parent();
@@ -751,7 +785,7 @@ mod tests {
 
     test_analysis! {
         name = instantiation_of_undefined_class,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             $a = new NonExistentClass();
@@ -764,7 +798,7 @@ mod tests {
 
     test_analysis! {
         name = instantiation_from_invalid_expression_type,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             $className = 123; // Not a class string
@@ -779,7 +813,7 @@ mod tests {
 
     test_analysis! {
         name = instantiation_from_general_string_variable,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /** @param string $className */
@@ -794,7 +828,7 @@ mod tests {
 
     test_analysis! {
         name = instantiation_from_mixed_variable,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
             /** @param mixed $className */
             function create_instance_mixed($className) {
@@ -808,7 +842,7 @@ mod tests {
 
     test_analysis! {
         name = instantiation_too_many_args_no_constructor,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
             class NoConstructor {}
             $a = new NoConstructor(1, 2, 3);
@@ -818,7 +852,7 @@ mod tests {
 
     test_analysis! {
         name = instantiation_too_many_args_with_constructor,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
             class WithConstructor {
                 public function __construct(int $a, int $b) {}
@@ -830,7 +864,7 @@ mod tests {
 
     test_analysis! {
         name = instantiation_with_child_constructor,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             class Base {
@@ -850,7 +884,7 @@ mod tests {
 
     test_analysis! {
         name = instantiation_with_parent_constructor,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             class Base {
@@ -866,7 +900,7 @@ mod tests {
 
     test_analysis! {
         name = resolve_nested_type_parameters,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /**
@@ -900,7 +934,7 @@ mod tests {
 
     test_analysis! {
         name = handles_recursive_type,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /** @template T */
@@ -916,7 +950,7 @@ mod tests {
 
     test_analysis! {
         name = self_is_static_in_final_class,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /**

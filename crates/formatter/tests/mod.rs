@@ -1,3 +1,7 @@
+#![allow(clippy::unnecessary_struct_initialization)]
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::default_constructed_unit_structs)]
+
 use bumpalo::Bump;
 use std::borrow::Cow;
 use std::fs;
@@ -5,6 +9,7 @@ use std::fs;
 use mago_formatter::Formatter;
 use mago_formatter::settings::BraceStyle;
 use mago_formatter::settings::FormatSettings;
+use mago_formatter::settings::MethodChainBreakingStyle;
 use mago_formatter::settings::NullTypeHint;
 use mago_php_version::PHPVersion;
 
@@ -38,6 +43,9 @@ macro_rules! test_case {
 
 // Test cases
 test_case!(leading_comment_with_missing_prefix);
+test_case!(docblock_before_function_declaration);
+test_case!(inline_single_breaking_value_argument);
+test_case!(inline_single_breaking_value_argument_default_off);
 test_case!(dangling_block_comments);
 test_case!(opening_tag_trailing_comments);
 test_case!(opening_tag_on_own_line);
@@ -64,6 +72,10 @@ test_case!(logical_operations_within_parens);
 test_case!(simple_binaryish_operators);
 test_case!(multiple_concat_operations_in_array);
 test_case!(binary_operand_needs_parens);
+test_case!(binary_precedence_parens_noise);
+test_case!(binary_precedence_parens_noise_disabled);
+test_case!(bitwise_precedence_parens_noise);
+test_case!(bitwise_precedence_parens_noise_disabled);
 test_case!(binary_ops_wrapping);
 test_case!(parens_around_constructs);
 test_case!(interpolated_strings_vars);
@@ -133,11 +145,20 @@ test_case!(shebang);
 test_case!(arrow_return);
 test_case!(match_breaking);
 test_case!(array_alignment);
+test_case!(align_parameters);
+test_case!(align_parameters_comment_marker_false_positive);
+test_case!(align_parameters_default_off);
+test_case!(align_named_arguments);
+test_case!(align_named_arguments_default_off);
 test_case!(binary_alignment);
 test_case!(binary_alignment_before_op);
 test_case!(chain_comments);
 test_case!(literal_concat_parens);
+test_case!(method_chain_semicolon_group_scope);
+test_case!(method_chain_semicolon_group_scope_same_line_first_break);
 test_case!(preserve_breaking_member_access_chain);
+test_case!(preserve_breaking_member_access_chain_same_line_first_break);
+test_case!(preserve_breaking_member_access_chain_same_line_first_break_opt_in);
 test_case!(preserve_breaking_member_access_chain_disabled);
 test_case!(preserve_breaking_argument_list);
 test_case!(preserve_breaking_argument_list_disabled);
@@ -242,10 +263,13 @@ test_case!(align_statement_like);
 test_case!(align_array_like);
 test_case!(align_array_like_compact_inline);
 test_case!(align_variable_assignments);
+test_case!(align_variable_assignments_array_append_and_chains);
 test_case!(align_class_properties);
 test_case!(align_class_constants);
 test_case!(align_global_constants);
 test_case!(align_enum_cases);
+test_case!(align_match_arms);
+test_case!(align_match_arms_default_off);
 test_case!(align_run_breaking);
 test_case!(align_modifier_breaking);
 test_case!(inline_block_comments_in_arguments);
@@ -256,6 +280,8 @@ test_case!(heredoc_indentation);
 test_case!(heredoc_indentation_disabled);
 test_case!(drupal_preset);
 test_case!(redundant_grouping_parens);
+test_case!(preserve_logical_grouping_parens);
+test_case!(preserve_logical_grouping_parens_disabled);
 test_case!(null_type_hint_null_pipe_last);
 test_case!(comment_placement_binary);
 test_case!(comment_placement_conditional);
@@ -385,8 +411,37 @@ test_case!(issue_1350);
 test_case!(issue_1451);
 test_case!(issue_1460);
 test_case!(issue_1513);
+test_case!(issue_1623);
+test_case!(issue_1623_within_width);
+test_case!(issue_1672);
+test_case!(issue_1744);
+test_case!(member_access_chain_keeps_breaks_with_comments);
 test_case!(issue_1562);
 test_case!(bare_cr_line_endings);
+
+// Idempotency regressions found by the corpus smoke test.
+test_case!(idempotency_keyed_array_value_call);
+test_case!(idempotency_keyed_array_value_nested_array);
+test_case!(idempotency_arrow_fn_returns_keyed_array_with_call);
+test_case!(idempotency_anon_class_with_leading_docblock);
+test_case!(idempotency_null_coalesce_chain_new_expr);
+test_case!(idempotency_comment_before_call_args);
+test_case!(idempotency_mixed_breaking_logical_chain);
+test_case!(idempotency_docblock_before_parameter);
+test_case!(idempotency_html_echo_ternary_break);
+
+// Full-file idempotency fixtures sourced from the corpus. When a corpus
+// file stops being idempotent, copy it here so the formatter test suite
+// captures the regression directly and we can iterate without touching
+// the corpus tree.
+test_case!(idempotency_corpus_numeric_comparator);
+test_case!(idempotency_corpus_carbon_period);
+test_case!(idempotency_corpus_symfony_trace_html);
+test_case!(idempotency_corpus_nette_factory);
+test_case!(idempotency_corpus_phparkitect_arch_rule);
+test_case!(idempotency_corpus_apiplatform_schema_property);
+test_case!(idempotency_corpus_apiplatform_type_factory);
+test_case!(idempotency_corpus_symfony_json_streamer);
 
 #[test]
 fn test_all_test_cases_are_ran() {

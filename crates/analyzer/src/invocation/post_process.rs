@@ -63,7 +63,7 @@ pub fn post_invocation_process<'ctx, 'arena>(
     apply_assertions: bool,
 ) -> Result<(), AnalysisError> {
     update_by_reference_argument_types(context, block_context, artifacts, invoication, template_result, parameters)?;
-    clear_object_property_narrowings(context, block_context, invoication);
+    clear_object_property_narrowings(context, block_context, invoication, this_variable);
 
     let Some(identifier) = invoication.target.get_function_like_identifier() else {
         return Ok(());
@@ -74,8 +74,18 @@ pub fn post_invocation_process<'ctx, 'arena>(
     };
 
     let (callable_kind_str, full_callable_name) = match identifier {
-        FunctionLikeIdentifier::Function(name) => ("function", format!("`{name}`")),
-        FunctionLikeIdentifier::Method(class_name, method_name) => ("method", format!("`{class_name}::{method_name}`")),
+        FunctionLikeIdentifier::Function(name) => {
+            let display = metadata.original_name.unwrap_or(*name);
+
+            ("function", format!("`{display}`"))
+        }
+        FunctionLikeIdentifier::Method(class_name, method_name) => {
+            let class_display =
+                context.codebase.get_class_like(class_name).map(|m| m.original_name).unwrap_or(*class_name);
+            let method_display = metadata.original_name.unwrap_or(*method_name);
+
+            ("method", format!("`{class_display}::{method_display}`"))
+        }
         FunctionLikeIdentifier::Closure(file_id, position) => (
             "closure",
             format!(
@@ -174,6 +184,7 @@ pub fn post_invocation_process<'ctx, 'arena>(
         &metadata.if_true_assertions,
         template_result,
         parameters,
+        false,
     );
 
     for (variable, assertions) in resolved_if_true_assertions {
@@ -189,6 +200,7 @@ pub fn post_invocation_process<'ctx, 'arena>(
         &metadata.if_false_assertions,
         template_result,
         parameters,
+        false,
     );
 
     for (variable, assertions) in resolved_if_false_assertions {
@@ -224,7 +236,7 @@ pub fn post_invocation_process<'ctx, 'arena>(
 fn apply_assertion_to_call_context<'ctx, 'arena>(
     context: &mut Context<'ctx, 'arena>,
     block_context: &mut BlockContext<'ctx>,
-    artifacts: &mut AnalysisArtifacts,
+    artifacts: &AnalysisArtifacts,
     invocation: &Invocation<'ctx, '_, 'arena>,
     this_variable: Option<&str>,
     assertions: &BTreeMap<Atom, Conjunction<Assertion>>,
@@ -240,6 +252,7 @@ fn apply_assertion_to_call_context<'ctx, 'arena>(
         assertions,
         template_result,
         parameters,
+        true,
     );
 
     if type_assertions.is_empty() {
@@ -276,7 +289,7 @@ fn update_by_reference_argument_types<'ctx, 'arena>(
 ) -> Result<(), AnalysisError> {
     let constraint_type = invocation.target.is_method_call();
 
-    for (parameter_offset, parameter_ref) in invocation.target.get_parameters().into_iter().enumerate() {
+    for (parameter_offset, parameter_ref) in invocation.target.iter_parameters().enumerate() {
         if !parameter_ref.is_by_reference() {
             continue;
         }
@@ -290,6 +303,11 @@ fn update_by_reference_argument_types<'ctx, 'arena>(
         );
 
         if let Some(argument) = argument {
+            let declared_had_templates = parameter_ref
+                .get_out_type()
+                .or_else(|| parameter_ref.get_type())
+                .is_some_and(|declared| declared.has_template_types());
+
             let mut new_type = parameter_ref
                 .get_out_type()
                 .or_else(|| parameter_ref.get_type())
@@ -298,12 +316,32 @@ fn update_by_reference_argument_types<'ctx, 'arena>(
                     resolve_invocation_type(context, invocation, template_result, parameters, new_type)
                 });
 
+            // If the argument's current type is `never`, this call is unreachable
+            // its by-reference effect cannot happen, so the variable's type must
+            // remain `never`. Without this guard, calling a template-generic
+            // function (e.g. `array_pop`) on a `never` argument resolves the
+            // templates to their constraints (e.g `mixed`), and that widened
+            // out-type leaks through loop widening into reachable iterations.
+            if let Some(argument_id) = &argument_id
+                && let Some(existing_type) = block_context.locals.get(argument_id)
+                && existing_type.is_never()
+            {
+                continue;
+            }
+
+            if declared_had_templates {
+                new_type.widen_literals();
+            }
+
             new_type.set_by_reference(true);
 
+            let new_type = Rc::new(new_type);
             if constraint_type && let Some(argument_id) = argument_id {
                 if let Some(existing_type) = block_context.locals.get(&argument_id).cloned() {
                     block_context.remove_descendants(context, argument_id, &existing_type, Some(&new_type));
                 }
+
+                block_context.remove_variable_from_conflicting_clauses(context, argument_id, None);
 
                 assign_to_expression(
                     context,
@@ -312,20 +350,27 @@ fn update_by_reference_argument_types<'ctx, 'arena>(
                     argument,
                     Some(argument_id),
                     Some(argument),
-                    new_type.clone(),
+                    Rc::clone(&new_type),
                     false,
                 )?;
 
                 block_context.assigned_variable_ids.insert(argument_id, argument.start_offset());
                 block_context.by_reference_constraints.insert(
                     argument_id,
-                    ReferenceConstraint::new(argument.span(), ReferenceConstraintSource::Argument, Some(new_type)),
+                    ReferenceConstraint::new(
+                        argument.span(),
+                        ReferenceConstraintSource::Argument,
+                        Some(Rc::clone(&new_type)),
+                    ),
                 );
+
+                record_by_reference_mutation_in_loop(artifacts, argument_id, new_type);
             } else {
                 if let Some(argument_id) = &argument_id
                     && let Some(existing_type) = block_context.locals.get(argument_id).cloned()
                 {
                     block_context.remove_descendants(context, *argument_id, &existing_type, Some(&new_type));
+                    block_context.remove_variable_from_conflicting_clauses(context, *argument_id, None);
                 }
 
                 assign_to_expression(
@@ -335,18 +380,32 @@ fn update_by_reference_argument_types<'ctx, 'arena>(
                     argument,
                     argument_id,
                     Some(argument),
-                    new_type,
+                    Rc::clone(&new_type),
                     false,
                 )?;
 
                 if let Some(argument_id) = argument_id {
                     block_context.assigned_variable_ids.insert(argument_id, argument.start_offset());
+                    record_by_reference_mutation_in_loop(artifacts, argument_id, new_type);
                 }
             }
         }
     }
 
     Ok(())
+}
+
+/// Records a by-reference mutation in the enclosing loop scope so the multi-pass
+/// analysis widens the variable's type on the next pass.
+fn record_by_reference_mutation_in_loop(artifacts: &mut AnalysisArtifacts, variable_id: Atom, new_type: Rc<TUnion>) {
+    let Some(loop_scope) = artifacts.get_loop_scope_mut() else {
+        return;
+    };
+
+    if loop_scope.parent_context_variables.contains_key(&variable_id) {
+        loop_scope.possibly_redefined_loop_parent_variables.insert(variable_id, Rc::clone(&new_type));
+        loop_scope.by_reference_loop_mutations.insert(variable_id, new_type);
+    }
 }
 
 /// Clears narrowed property types after an invocation.
@@ -360,6 +419,7 @@ fn clear_object_property_narrowings<'ctx, 'arena>(
     context: &Context<'ctx, 'arena>,
     block_context: &mut BlockContext<'ctx>,
     invocation: &Invocation<'ctx, '_, 'arena>,
+    receiver_variable: Option<&str>,
 ) {
     let metadata = invocation.target.get_function_like_metadata();
 
@@ -372,59 +432,172 @@ fn clear_object_property_narrowings<'ctx, 'arena>(
         return;
     }
 
+    let this_property_is_readonly = |property_name: &str| -> bool {
+        let Some(class_metadata) = block_context.scope.get_class_like() else {
+            return false;
+        };
+
+        if class_metadata.flags.is_readonly() {
+            return true;
+        }
+
+        let Some(property_metadata) = class_metadata.properties.get(&Atom::from(property_name)) else {
+            return false;
+        };
+
+        property_metadata.flags.is_readonly()
+    };
+
+    let preserves_this_property = |var_id: Atom| -> bool {
+        let s = var_id.as_str();
+        let Some(rest) = s.strip_prefix("$this->") else {
+            return false;
+        };
+
+        if rest.contains("->") || rest.contains('[') {
+            return false;
+        }
+
+        this_property_is_readonly(rest)
+    };
+
     // When a function is marked @suspends-fiber, it can yield execution to other fibers
-    // that may modify any $this property. Always clear $this-> memoized properties.
+    // that may modify any $this property. Always clear $this-> memoized properties,
+    // except for readonly ones, readonly properties can never be reassigned by
+    // any concurrently running fiber either.
     let suspends_fiber = metadata.is_some_and(|m| m.flags.suspends_fiber());
     if suspends_fiber && block_context.scope.get_class_like_name().is_some() {
-        let keys_to_remove: Vec<_> =
-            block_context.locals.keys().copied().filter(|var_id| var_id.as_str().starts_with("$this->")).collect();
+        let keys_to_remove: Vec<_> = block_context
+            .locals
+            .keys()
+            .copied()
+            .filter(|var_id| var_id.as_str().starts_with("$this->") && !preserves_this_property(*var_id))
+            .collect();
 
         for key in &keys_to_remove {
             block_context.locals.remove(key);
         }
 
         block_context.clauses.retain(|clause| {
-            clause.wedge || !clause.possibilities.keys().copied().any(|k| k.as_str().starts_with("$this->"))
+            clause.wedge
+                || !clause
+                    .possibilities
+                    .keys()
+                    .copied()
+                    .any(|k| k.as_str().starts_with("$this->") && !preserves_this_property(k))
         });
 
         block_context.reconciled_expression_clauses.retain(|clause| {
-            clause.wedge || !clause.possibilities.keys().copied().any(|k| k.as_str().starts_with("$this->"))
+            clause.wedge
+                || !clause
+                    .possibilities
+                    .keys()
+                    .copied()
+                    .any(|k| k.as_str().starts_with("$this->") && !preserves_this_property(k))
         });
     }
 
-    // A non-pure self-method call ($this->method()) can mutate $this properties.
-    // Calls on other objects ($this->foo->method()) should NOT invalidate $this->foo
-    // since the method runs on the sub-object, not on $this.
-    let is_self_method_call =
-        if let Some(FunctionLikeIdentifier::Method(class_name, _)) = invocation.target.get_function_like_identifier() {
-            block_context
+    let is_self_method_call = matches!(receiver_variable, Some("$this"))
+        && match invocation.target.get_function_like_identifier() {
+            Some(FunctionLikeIdentifier::Method(class_name, _)) => block_context
                 .scope
                 .get_class_like_name()
-                .is_some_and(|current_class| current_class.as_str().eq_ignore_ascii_case(class_name.as_str()))
-        } else {
-            false
+                .is_some_and(|current_class| current_class.as_str().eq_ignore_ascii_case(class_name.as_str())),
+            _ => false,
         };
 
     if is_self_method_call {
-        let keys_to_remove: Vec<_> =
-            block_context.locals.keys().copied().filter(|var_id| var_id.as_str().starts_with("$this->")).collect();
+        let keys_to_remove: Vec<_> = block_context
+            .locals
+            .keys()
+            .copied()
+            .filter(|var_id| var_id.as_str().starts_with("$this->") && !preserves_this_property(*var_id))
+            .collect();
 
         for key in &keys_to_remove {
             block_context.locals.remove(key);
         }
 
         block_context.clauses.retain(|clause| {
-            clause.wedge || !clause.possibilities.keys().copied().any(|k| k.as_str().starts_with("$this->"))
+            clause.wedge
+                || !clause
+                    .possibilities
+                    .keys()
+                    .copied()
+                    .any(|k| k.as_str().starts_with("$this->") && !preserves_this_property(k))
         });
+
         block_context.reconciled_expression_clauses.retain(|clause| {
-            clause.wedge || !clause.possibilities.keys().copied().any(|k| k.as_str().starts_with("$this->"))
+            clause.wedge
+                || !clause
+                    .possibilities
+                    .keys()
+                    .copied()
+                    .any(|k| k.as_str().starts_with("$this->") && !preserves_this_property(k))
         });
     }
 
-    // When an object is passed as an argument, properties on any object could be modified.
-    let arguments = invocation.arguments_source.get_arguments();
+    // Superglobal array entries (`$_SESSION['x']`, `$_GET['y']`, ...) are reachable from
+    // every function body, so any non-pure call can mutate them whether or not it was
+    // passed any arguments. Reset each superglobal variable in locals back to its
+    // declared type (wiping the caller's narrowed known-items), and drop any clauses
+    // or separately-keyed index entries that refer to them.
+    block_context.locals.retain(|var_id, current_type| {
+        if is_superglobal_index_key(*var_id) {
+            return false;
+        }
 
-    let has_object_argument = arguments.iter().any(|argument| {
+        if is_superglobal_name(var_id.as_str()) {
+            if let Some(declared) = crate::common::global::get_global_variable_type(var_id.as_str()) {
+                *current_type = declared;
+                return true;
+            }
+
+            return false;
+        }
+
+        true
+    });
+
+    let touches_superglobal = |var: Atom| {
+        let s = var.as_str();
+        is_superglobal_index_key(var) || is_superglobal_name(s)
+    };
+    block_context
+        .clauses
+        .retain(|clause| clause.wedge || !clause.possibilities.keys().copied().any(touches_superglobal));
+    block_context
+        .reconciled_expression_clauses
+        .retain(|clause| clause.wedge || !clause.possibilities.keys().copied().any(touches_superglobal));
+
+    // If the callee imports any variables via `global $x;` anywhere in its body, it can
+    // reassign them in the caller's global scope. Widen any literal narrowings we were
+    // holding for those specific variables so later checks don't assume stale values.
+    if let Some(metadata) = metadata
+        && !metadata.globals_accessed.is_empty()
+    {
+        let mut touched_globals: foldhash::HashSet<Atom> = foldhash::HashSet::default();
+        for name in &metadata.globals_accessed {
+            if let Some(existing) = block_context.locals.get(name).cloned() {
+                let mut widened = (*existing).clone();
+                widened.widen_scalars();
+                block_context.locals.insert(*name, Rc::new(widened));
+                touched_globals.insert(*name);
+            }
+        }
+
+        if !touched_globals.is_empty() {
+            block_context.clauses.retain(|clause| {
+                clause.wedge || !clause.possibilities.keys().copied().any(|k| touched_globals.contains(&k))
+            });
+            block_context.reconciled_expression_clauses.retain(|clause| {
+                clause.wedge || !clause.possibilities.keys().copied().any(|k| touched_globals.contains(&k))
+            });
+        }
+    }
+
+    // When an object is passed as an argument, properties on any object could be modified.
+    let has_object_argument = invocation.arguments_source.iter_arguments().any(|argument| {
         let Some(expression) = argument.value() else {
             return false;
         };
@@ -446,12 +619,7 @@ fn clear_object_property_narrowings<'ctx, 'arena>(
     }
 
     // Clear ALL property and index narrowings when objects are passed as arguments.
-    let keys_to_remove: Vec<_> =
-        block_context.locals.keys().copied().filter(|var_id| is_property_or_index_key(*var_id)).collect();
-
-    for key in &keys_to_remove {
-        block_context.locals.remove(key);
-    }
+    block_context.locals.retain(|var_id, _| !is_property_or_index_key(*var_id));
 
     block_context
         .clauses
@@ -466,15 +634,35 @@ fn is_property_or_index_key(var_id: Atom) -> bool {
     s.contains("->") || (s.starts_with('$') && s.contains('['))
 }
 
+/// A variable ID like `$_SESSION['user_id']` - an index access rooted at a PHP
+/// superglobal. These are reachable from any function body, so a non-pure call
+/// might mutate them regardless of its arguments.
+fn is_superglobal_index_key(var_id: Atom) -> bool {
+    let s = var_id.as_str();
+    let Some(bracket_pos) = s.find('[') else {
+        return false;
+    };
+
+    is_superglobal_name(&s[..bracket_pos])
+}
+
+fn is_superglobal_name(name: &str) -> bool {
+    matches!(
+        name,
+        "$_SESSION" | "$_GET" | "$_POST" | "$_COOKIE" | "$_SERVER" | "$_ENV" | "$_FILES" | "$_REQUEST" | "$GLOBALS"
+    )
+}
+
 fn resolve_invocation_assertion<'ctx, 'arena>(
     context: &mut Context<'ctx, 'arena>,
     block_context: &mut BlockContext<'ctx>,
-    artifacts: &mut AnalysisArtifacts,
+    artifacts: &AnalysisArtifacts,
     invocation: &Invocation<'ctx, '_, 'arena>,
     this_variable: Option<&str>,
     assertions: &BTreeMap<Atom, Conjunction<Assertion>>,
     template_result: &TemplateResult,
     parameters: &AtomMap<TUnion>,
+    is_unconditional_assert: bool,
 ) -> IndexMap<Atom, AssertionSet> {
     let mut type_assertions: IndexMap<Atom, AssertionSet> = IndexMap::new();
     if assertions.is_empty() {
@@ -628,6 +816,8 @@ fn resolve_invocation_assertion<'ctx, 'arena>(
                                 // ignore
                             }
                         }
+                    } else {
+                        // resolved type is never and there's no asserted type to compare against; nothing to report
                     }
                 }
 
@@ -642,21 +832,50 @@ fn resolve_invocation_assertion<'ctx, 'arena>(
                         .collect::<Vec<_>>()
                         .join("|");
 
-                    if all_negated || always_redundant {
-                        context.collector.report_with_code(
-                            IssueCode::RedundantTypeComparison,
-                            Issue::warning(format!(
-                                "Redundant type assertion: `{assertion_variable}` of type `{asserted_type_id}` is always not `{expected_type_id}`."
-                            ))
-                            .with_annotation(
-                                Annotation::primary(invocation.span)
-                                    .with_message(format!("Argument `{assertion_variable}` has type `{asserted_type_id}`")),
-                            )
-                            .with_note(format!(
-                                "The assertion expects `{assertion_variable}` to not be `{expected_type_id}`, which is always true."
-                            ))
-                            .with_help("Consider removing this assertion as it has no effect."),
-                        );
+                    let suppress_redundant = is_unconditional_assert
+                        && (!invocation.target.is_pure_or_mutation_free()
+                            || invocation.target.get_return_type().is_some_and(|t| !t.is_void() && !t.is_never()));
+
+                    if all_negated {
+                        if suppress_redundant {
+                            // Side effects or a meaningful return value mean removing the call
+                            // would lose behavior. Skip the redundant warning.
+                        } else {
+                            context.collector.report_with_code(
+                                IssueCode::RedundantTypeComparison,
+                                Issue::warning(format!(
+                                    "Redundant type assertion: `{assertion_variable}` of type `{asserted_type_id}` is always not `{expected_type_id}`."
+                                ))
+                                .with_annotation(
+                                    Annotation::primary(invocation.span)
+                                        .with_message(format!("Argument `{assertion_variable}` has type `{asserted_type_id}`")),
+                                )
+                                .with_note(format!(
+                                    "The negated assertion against `{expected_type_id}` always holds because `{assertion_variable}` is `{asserted_type_id}`."
+                                ))
+                                .with_help("Consider removing this assertion as it has no effect."),
+                            );
+                        }
+                    } else if always_redundant {
+                        if suppress_redundant {
+                            // Side effects or a meaningful return value mean removing the call
+                            // would lose behavior. Skip the redundant warning.
+                        } else {
+                            context.collector.report_with_code(
+                                IssueCode::RedundantTypeComparison,
+                                Issue::warning(format!(
+                                    "Redundant type assertion: `{assertion_variable}` is already `{asserted_type_id}`."
+                                ))
+                                .with_annotation(
+                                    Annotation::primary(invocation.span)
+                                        .with_message(format!("Argument `{assertion_variable}` already has type `{asserted_type_id}`")),
+                                )
+                                .with_note(format!(
+                                    "The assertion against `{expected_type_id}` always holds because `{assertion_variable}` is `{asserted_type_id}`."
+                                ))
+                                .with_help("Consider removing this assertion or replacing it with `default` if used in a `match` arm."),
+                            );
+                        }
                     } else {
                         context.collector.report_with_code(
                             IssueCode::ImpossibleTypeComparison,
@@ -743,7 +962,7 @@ fn resolve_invocation_assertion<'ctx, 'arena>(
                         &context.settings.algebra_thresholds(),
                     );
 
-                    let (truths, _) = find_satisfying_assignments(&clauses, None, &mut Default::default());
+                    let (truths, _) = find_satisfying_assignments(&clauses, None, &mut AtomSet::default());
                     for (variable, assertions) in truths {
                         type_assertions.entry(variable).or_default().extend(assertions);
                     }
@@ -781,8 +1000,8 @@ fn resolve_invocation_assertion<'ctx, 'arena>(
 /// * If a regular argument is found, it returns the result from `get_argument_for_parameter`.
 /// * If nothing is found, it returns `(None, None)`.
 fn resolve_argument_or_special_target<'ctx, 'ast, 'arena>(
-    context: &mut Context<'ctx, 'arena>,
-    block_context: &mut BlockContext<'ctx>,
+    context: &Context<'ctx, 'arena>,
+    block_context: &BlockContext<'ctx>,
     invocation: &Invocation<'ctx, 'ast, 'arena>,
     parameter_name: Atom,
     this_variable: Option<&str>,
@@ -852,8 +1071,8 @@ fn resolve_special_assertion_target(
 /// * `Option<&'a Expression>`: The argument's expression AST node, if found.
 /// * `Option<Atom>`: The unique ID of the argument expression (e.g., a variable name), if it can be determined.
 fn get_argument_for_parameter<'ctx, 'ast, 'arena>(
-    context: &mut Context<'ctx, 'arena>,
-    block_context: &mut BlockContext<'ctx>,
+    context: &Context<'ctx, 'arena>,
+    block_context: &BlockContext<'ctx>,
     invocation: &Invocation<'ctx, 'ast, 'arena>,
     mut parameter_offset: Option<usize>,
     mut parameter_name: Option<Atom>,
@@ -863,18 +1082,20 @@ fn get_argument_for_parameter<'ctx, 'ast, 'arena>(
         return (None, None);
     }
 
-    let parameter_refs = invocation.target.get_parameters();
-
     // Step 1: Ensure we have both the name and offset for the parameter.
     if parameter_name.is_none() {
-        if let Some(parameter_ref) = parameter_offset.and_then(|offset| parameter_refs.get(offset)) {
+        if let Some(parameter_ref) = parameter_offset.and_then(|offset| invocation.target.get_parameter(offset)) {
             parameter_name = parameter_ref.get_name().map(|name| name.0);
         }
     } else if parameter_offset.is_none()
         && let Some(name) = parameter_name
     {
-        parameter_offset =
-            parameter_refs.iter().position(|p| p.get_name().is_some_and(|name_variable| name_variable.0 == name));
+        parameter_offset = invocation
+            .target
+            .iter_parameters()
+            .position(|parameter| parameter.get_name().is_some_and(|name_variable| name_variable.0 == name));
+    } else {
+        // both name and offset already known; nothing to fill in
     }
 
     // After attempting to fill in missing info, if we still lack a name or an offset,
@@ -884,14 +1105,14 @@ fn get_argument_for_parameter<'ctx, 'ast, 'arena>(
     };
 
     // Step 2: Resolve the argument with the correct precedence.
-    let arguments = invocation.arguments_source.get_arguments();
+    let arguments = invocation.arguments_source;
 
     // a. Look for a named argument first.
     let find_by_name = || {
         let variable = parameter_name?;
         let variable_name = if let Some(variable) = variable.strip_prefix('$') { variable } else { variable.as_str() };
 
-        arguments.iter().find(|argument| {
+        arguments.iter_arguments().find(|argument| {
             if let Some(named_argument) = argument.get_named_argument() {
                 named_argument.name.value == variable_name
             } else {
@@ -901,7 +1122,7 @@ fn get_argument_for_parameter<'ctx, 'ast, 'arena>(
     };
 
     // b. If not found by name, look for a positional argument at the correct offset.
-    let find_by_position = || arguments.get(offset).filter(|argument| argument.is_positional());
+    let find_by_position = || arguments.get_argument(offset).filter(|argument| argument.is_positional());
 
     let argument = find_by_name().or_else(find_by_position);
 
@@ -946,7 +1167,7 @@ fn get_argument_for_parameter<'ctx, 'ast, 'arena>(
 }
 
 fn collect_plugin_throw_types<'ctx, 'arena>(
-    context: &mut Context<'ctx, 'arena>,
+    context: &Context<'ctx, 'arena>,
     block_context: &mut BlockContext<'ctx>,
     artifacts: &AnalysisArtifacts,
     invocation: &Invocation<'ctx, '_, 'arena>,
@@ -1008,6 +1229,7 @@ fn apply_plugin_assertions<'ctx, 'arena>(
         &assertions.if_true,
         template_result,
         parameters,
+        false,
     );
 
     for (variable, assertion_set) in resolved_if_true_assertions {
@@ -1023,6 +1245,7 @@ fn apply_plugin_assertions<'ctx, 'arena>(
         &assertions.if_false,
         template_result,
         parameters,
+        false,
     );
 
     for (variable, assertion_set) in resolved_if_false_assertions {

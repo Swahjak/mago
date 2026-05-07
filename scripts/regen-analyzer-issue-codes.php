@@ -77,6 +77,10 @@ final class AnalyzerCodeModuleGenerator
         'invalid-operand',
         'mixed-operand',
         'array-append-in-read-context',
+        'array-append-overflow',
+        'possibly-array-append-overflow',
+        'list-destructure-string-key',
+        'list-destructure-negative-key',
         'missing-constructor',
         'missing-return-statement',
         'mixed-property-type-coercion',
@@ -225,6 +229,8 @@ final class AnalyzerCodeModuleGenerator
         'ambiguous-object-method-access',
         'impure-construct',
         'docblock-type-mismatch',
+        'docblock-parameter-narrowing',
+        'overly-wide-return-type',
         'invalid-destructuring-source',
         'mixed-destructuring-shape',
         'skip-in-keyed-destructuring',
@@ -326,6 +332,11 @@ final class AnalyzerCodeModuleGenerator
         'incorrect-class-like-casing',
         'incorrect-function-casing',
         'experimental-usage',
+        'side-effects-in-condition',
+        'unresolvable-class-constant',
+        'invalid-parameter-default-value',
+        'invalid-constant-value',
+        'invalid-property-default-value',
     ];
 
     /**

@@ -1,4 +1,6 @@
 use mago_atom::Atom;
+use std::collections::BTreeMap;
+
 use mago_atom::AtomMap;
 use mago_atom::AtomSet;
 use mago_atom::ascii_lowercase_atom;
@@ -21,6 +23,7 @@ use mago_syntax::ast::Hint;
 use mago_syntax::ast::Implements;
 use mago_syntax::ast::Interface;
 use mago_syntax::ast::Modifier;
+use mago_syntax::ast::ModifierSequenceExt;
 use mago_syntax::ast::Sequence;
 use mago_syntax::ast::Trait;
 use mago_syntax::ast::TraitUseAdaptation;
@@ -312,12 +315,7 @@ fn scan_class_like<'arena>(
         return None;
     }
 
-    let mut flags = MetadataFlags::empty();
-    if context.file.file_type.is_host() {
-        flags |= MetadataFlags::USER_DEFINED;
-    } else if context.file.file_type.is_builtin() {
-        flags |= MetadataFlags::BUILTIN;
-    }
+    let flags = MetadataFlags::origin_flags(context.file.file_type);
 
     let mut class_like_metadata = ClassLikeMetadata::new(name, original_name, span, name_span, flags);
 
@@ -329,7 +327,7 @@ fn scan_class_like<'arena>(
     };
 
     if kind.is_class() {
-        class_like_metadata.attribute_flags = get_attribute_flags(name, attribute_lists, context, scope);
+        class_like_metadata.attribute_flags = get_attribute_flags(name, attribute_lists, context, scope, Some(name));
     }
 
     class_like_metadata.kind = kind;
@@ -463,10 +461,28 @@ fn scan_class_like<'arena>(
         class_like_metadata.has_sealed_methods = docblock.has_sealed_methods;
         class_like_metadata.has_sealed_properties = docblock.has_sealed_properties;
 
-        for (i, template) in docblock.templates.iter().enumerate() {
+        for imported_type_alias in &docblock.imported_type_aliases {
+            let fqcn = ascii_lowercase_atom(&scope.resolve_str(NameKind::Default, &imported_type_alias.from).0);
+            let type_name = atom(&imported_type_alias.name);
+            let alias = imported_type_alias.alias.as_deref().map_or(type_name, atom);
+
+            if fqcn == name {
+                continue;
+            }
+
+            type_context = type_context.with_imported_type_alias(alias, fqcn, type_name);
+        }
+
+        for type_alias in &docblock.type_aliases {
+            type_context = type_context.with_type_alias(atom(&type_alias.name));
+        }
+
+        let mut template_variance = Vec::new();
+        for template in &docblock.templates {
             let template_name = atom(&template.name);
             let template_as_type = if let Some(type_string) = &template.type_string {
                 match builder::get_type_from_string(
+                    context.arena,
                     &type_string.value,
                     type_string.span,
                     scope,
@@ -492,7 +508,36 @@ fn scan_class_like<'arena>(
                 get_mixed()
             };
 
-            let definition = GenericTemplate::new(GenericParent::ClassLike(name), template_as_type);
+            let template_default = if let Some(type_string) = &template.default {
+                match builder::get_type_from_string(
+                    context.arena,
+                    &type_string.value,
+                    type_string.span,
+                    scope,
+                    &type_context,
+                    Some(name),
+                ) {
+                    Ok(tunion) => Some(tunion),
+                    Err(typing_error) => {
+                        class_like_metadata.issues.push(
+                            Issue::error("Could not resolve the default type for the `@template` tag.")
+                                .with_code(ScanningIssueKind::InvalidTemplateTag)
+                                .with_annotation(
+                                    Annotation::primary(typing_error.span()).with_message(typing_error.to_string()),
+                                )
+                                .with_note(typing_error.note())
+                                .with_help(typing_error.help()),
+                        );
+
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let definition =
+                GenericTemplate::new(GenericParent::ClassLike(name), template_as_type).with_default(template_default);
 
             class_like_metadata.add_template_type(template_name, definition.clone());
             type_context = type_context.with_template_definition(template_name, vec![definition]);
@@ -509,11 +554,13 @@ fn scan_class_like<'arena>(
                 class_like_metadata.template_readonly.insert(template_name);
             }
 
-            class_like_metadata.add_template_variance_parameter(i, variance);
+            template_variance.push(variance);
         }
 
-        // Process imported type aliases first so they're available when building
-        // type alias definitions AND when resolving @template-extends/@template-implements
+        class_like_metadata.set_template_variance(template_variance);
+
+        // Aliases were already registered in `type_context` above; here we
+        // record them on the class metadata and report any diagnostics.
         for imported_type_alias in docblock.imported_type_aliases {
             let fqcn = ascii_lowercase_atom(&scope.resolve_str(NameKind::Default, &imported_type_alias.from).0);
             let type_name = atom(&imported_type_alias.name);
@@ -534,16 +581,17 @@ fn scan_class_like<'arena>(
             }
 
             class_like_metadata.imported_type_aliases.insert(alias, (fqcn, type_name, imported_type_alias.span));
-            type_context = type_context.with_imported_type_alias(alias, fqcn, type_name);
-        }
-
-        for type_alias in &docblock.type_aliases {
-            type_context = type_context.with_type_alias(atom(&type_alias.name));
         }
 
         for type_alias in &docblock.type_aliases {
             let alias_name = atom(&type_alias.name);
-            match get_type_metadata_from_type_string(&type_alias.type_string, Some(name), &type_context, scope) {
+            match get_type_metadata_from_type_string(
+                context.arena,
+                &type_alias.type_string,
+                Some(name),
+                &type_context,
+                scope,
+            ) {
                 Ok(type_metadata) => {
                     class_like_metadata.type_aliases.insert(alias_name, type_metadata);
                 }
@@ -563,6 +611,7 @@ fn scan_class_like<'arena>(
 
         for extended_type in docblock.template_extends {
             let extended_union = match builder::get_type_from_string(
+                context.arena,
                 &extended_type.value,
                 extended_type.span,
                 scope,
@@ -653,6 +702,7 @@ fn scan_class_like<'arena>(
 
         for implemented_type in docblock.template_implements {
             let implemented_union = match builder::get_type_from_string(
+                context.arena,
                 &implemented_type.value,
                 implemented_type.span,
                 scope,
@@ -737,6 +787,7 @@ fn scan_class_like<'arena>(
 
         for require_extend in docblock.require_extends {
             let required_union = match builder::get_type_from_string(
+                context.arena,
                 &require_extend.value,
                 require_extend.span,
                 scope,
@@ -819,6 +870,7 @@ fn scan_class_like<'arena>(
 
         for require_implements in docblock.require_implements {
             let required_union = match builder::get_type_from_string(
+                context.arena,
                 &require_implements.value,
                 require_implements.span,
                 scope,
@@ -900,7 +952,14 @@ fn scan_class_like<'arena>(
         }
 
         if let Some(inheritors) = docblock.inheritors {
-            match builder::get_type_from_string(&inheritors.value, inheritors.span, scope, &type_context, Some(name)) {
+            match builder::get_type_from_string(
+                context.arena,
+                &inheritors.value,
+                inheritors.span,
+                scope,
+                &type_context,
+                Some(name),
+            ) {
                 Ok(inheritors_union) => {
                     for inheritor in inheritors_union.types.as_ref() {
                         match inheritor {
@@ -938,7 +997,14 @@ fn scan_class_like<'arena>(
         }
 
         for mixin in &docblock.mixins {
-            match builder::get_type_from_string(&mixin.value, mixin.span, scope, &type_context, Some(name)) {
+            match builder::get_type_from_string(
+                context.arena,
+                &mixin.value,
+                mixin.span,
+                scope,
+                &type_context,
+                Some(name),
+            ) {
                 Ok(mixin_type) => {
                     class_like_metadata.mixins.push(mixin_type);
                 }
@@ -996,7 +1062,8 @@ fn scan_class_like<'arena>(
 
                 if let Some(type_hint) = &argument.type_hint {
                     function_parameter_metadata.set_type_declaration_metadata(
-                        get_type_metadata_from_type_string(type_hint, Some(name), &type_context, scope).ok(),
+                        get_type_metadata_from_type_string(context.arena, type_hint, Some(name), &type_context, scope)
+                            .ok(),
                     );
                 }
 
@@ -1015,8 +1082,14 @@ fn scan_class_like<'arena>(
                 function_like_metadata.parameters.push(function_parameter_metadata);
             }
 
-            function_like_metadata.return_type_metadata =
-                get_type_metadata_from_type_string(&method_tag.type_string, Some(name), &type_context, scope).ok();
+            function_like_metadata.return_type_metadata = get_type_metadata_from_type_string(
+                context.arena,
+                &method_tag.type_string,
+                Some(name),
+                &type_context,
+                scope,
+            )
+            .ok();
 
             codebase.function_likes.insert(method_id, function_like_metadata);
         }
@@ -1024,7 +1097,7 @@ fn scan_class_like<'arena>(
         for property in &docblock.properties {
             let property_name = atom(&property.variable.name);
             let type_metadata = if let Some(type_string) = &property.type_string {
-                match get_type_metadata_from_type_string(type_string, Some(name), &type_context, scope) {
+                match get_type_metadata_from_type_string(context.arena, type_string, Some(name), &type_context, scope) {
                     Ok(type_metadata) => Some(type_metadata),
                     Err(typing_error) => {
                         class_like_metadata.issues.push(
@@ -1088,7 +1161,7 @@ fn scan_class_like<'arena>(
                 }
             }
             ClassLikeMember::EnumCase(enum_case) => {
-                let case_metadata = scan_enum_case(enum_case, context, scope);
+                let case_metadata = scan_enum_case(name, enum_case, context, scope);
                 if class_like_metadata.constants.contains_key(&case_metadata.name) {
                     continue;
                 }
@@ -1099,8 +1172,9 @@ fn scan_class_like<'arena>(
         }
     }
 
-    if class_like_metadata.kind.is_enum() {
-        let enum_name_span = class_like_metadata.name_span.expect("Enum name span should be present");
+    if class_like_metadata.kind.is_enum()
+        && let Some(enum_name_span) = class_like_metadata.name_span
+    {
         let mut name_types = vec![];
         let mut value_types = vec![];
         let backing_type = class_like_metadata.enum_type.clone();
@@ -1234,6 +1308,7 @@ fn scan_class_like<'arena>(
 
                 for template_use in docblock.template_use {
                     let template_use_type = match builder::get_type_from_string(
+                        context.arena,
                         &template_use.value,
                         template_use.span,
                         scope,
@@ -1464,14 +1539,16 @@ fn create_enum_from_method(enum_name: &str, enum_method_span: Span, backing_type
             is_static: true,
             is_constructor: false,
             visibility: Visibility::Public,
-            where_constraints: Default::default(),
+            where_constraints: AtomMap::default(),
         }),
         type_resolution_context: None,
         thrown_types: vec![TypeMetadata::new(get_named_object(atom("ValueError"), None), enum_method_span)],
-        issues: Default::default(),
-        assertions: Default::default(),
-        if_true_assertions: Default::default(),
-        if_false_assertions: Default::default(),
+        issues: Vec::default(),
+        assertions: BTreeMap::default(),
+        if_true_assertions: BTreeMap::default(),
+        if_false_assertions: BTreeMap::default(),
+        assertions_inferred: false,
+        globals_accessed: AtomSet::default(),
         has_docblock: false,
         flags: MetadataFlags::POPULATED,
     }
@@ -1520,14 +1597,16 @@ fn create_enum_try_from_method(enum_name: &str, enum_method_span: Span, backing_
             is_static: true,
             is_constructor: false,
             visibility: Visibility::Public,
-            where_constraints: Default::default(),
+            where_constraints: AtomMap::default(),
         }),
         type_resolution_context: None,
         thrown_types: vec![],
-        issues: Default::default(),
-        assertions: Default::default(),
-        if_true_assertions: Default::default(),
-        if_false_assertions: Default::default(),
+        issues: Vec::default(),
+        assertions: BTreeMap::default(),
+        if_true_assertions: BTreeMap::default(),
+        if_false_assertions: BTreeMap::default(),
+        assertions_inferred: false,
+        globals_accessed: AtomSet::default(),
         has_docblock: false,
         flags: MetadataFlags::POPULATED,
     }
@@ -1577,14 +1656,16 @@ fn create_enum_cases_method(enum_name: &str, enum_method_span: Span, has_cases: 
             is_static: true,
             is_constructor: false,
             visibility: Visibility::Public,
-            where_constraints: Default::default(),
+            where_constraints: AtomMap::default(),
         }),
         type_resolution_context: None,
         thrown_types: vec![],
-        issues: Default::default(),
-        assertions: Default::default(),
-        if_true_assertions: Default::default(),
-        if_false_assertions: Default::default(),
+        issues: Vec::default(),
+        assertions: BTreeMap::default(),
+        if_true_assertions: BTreeMap::default(),
+        if_false_assertions: BTreeMap::default(),
+        assertions_inferred: false,
+        globals_accessed: AtomSet::default(),
         has_docblock: false,
         flags: MetadataFlags::POPULATED,
     }

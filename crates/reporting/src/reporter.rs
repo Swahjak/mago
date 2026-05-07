@@ -67,8 +67,9 @@ pub struct ReporterConfig {
 /// including baseline filtering results and severity level information.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReportStatus {
-    /// Indicates whether the baseline contains dead issues.
-    pub baseline_dead_issues: bool,
+    /// The number of baseline entries that no longer correspond to any current
+    /// issue (i.e. dead / stale entries). Zero when the baseline is up to date.
+    pub baseline_dead_issues: usize,
 
     /// The number of issues that were filtered out by the baseline.
     pub baseline_filtered_issues: usize,
@@ -109,13 +110,15 @@ impl Reporter {
     /// # Errors
     ///
     /// Returns a [`ReportingError`] if formatting or writing the issues fails.
-    pub fn report(&self, issues: IssueCollection, baseline: Option<Baseline>) -> Result<ReportStatus, ReportingError> {
+    pub fn report(
+        &self,
+        mut issues: IssueCollection,
+        baseline: Option<Baseline>,
+    ) -> Result<ReportStatus, ReportingError> {
         let mut writer = self.config.target.resolve();
 
-        let mut issues = issues;
-
         // Apply baseline filtering
-        let mut baseline_has_dead_issues = false;
+        let mut baseline_dead_issues = 0;
         let mut baseline_filtered_issues = 0;
         if let Some(baseline) = baseline {
             let original_count = issues.len();
@@ -123,7 +126,7 @@ impl Reporter {
             let filtered_issues = baseline.filter_issues(issues, &self.database);
 
             baseline_filtered_issues = original_count - filtered_issues.len();
-            baseline_has_dead_issues = comparison.removed_issues_count > 0;
+            baseline_dead_issues = comparison.removed_issues_count;
             issues = filtered_issues;
         }
 
@@ -135,7 +138,7 @@ impl Reporter {
         // Early return if no issues to report
         if total_reported_issues == 0 {
             return Ok(ReportStatus {
-                baseline_dead_issues: baseline_has_dead_issues,
+                baseline_dead_issues,
                 baseline_filtered_issues,
                 highest_reported_level: None,
                 lowest_reported_level: None,
@@ -158,7 +161,7 @@ impl Reporter {
         writer.flush()?;
 
         Ok(ReportStatus {
-            baseline_dead_issues: baseline_has_dead_issues,
+            baseline_dead_issues,
             baseline_filtered_issues,
             highest_reported_level,
             lowest_reported_level,
@@ -190,14 +193,12 @@ impl Reporter {
     /// ```
     pub fn report_to<W: Write>(
         &self,
-        issues: IssueCollection,
+        mut issues: IssueCollection,
         baseline: Option<Baseline>,
         writer: &mut W,
     ) -> Result<ReportStatus, ReportingError> {
-        let mut issues = issues;
-
         // Apply baseline filtering
-        let mut baseline_has_dead_issues = false;
+        let mut baseline_dead_issues = 0;
         let mut baseline_filtered_issues = 0;
         if let Some(baseline) = baseline {
             let original_count = issues.len();
@@ -205,7 +206,7 @@ impl Reporter {
             let filtered_issues = baseline.filter_issues(issues, &self.database);
 
             baseline_filtered_issues = original_count - filtered_issues.len();
-            baseline_has_dead_issues = comparison.removed_issues_count > 0;
+            baseline_dead_issues = comparison.removed_issues_count;
             issues = filtered_issues;
         }
 
@@ -217,7 +218,7 @@ impl Reporter {
         // Early return if no issues to report
         if total_reported_issues == 0 {
             return Ok(ReportStatus {
-                baseline_dead_issues: baseline_has_dead_issues,
+                baseline_dead_issues,
                 baseline_filtered_issues,
                 highest_reported_level: None,
                 lowest_reported_level: None,
@@ -238,7 +239,7 @@ impl Reporter {
         dispatch_format(self.config.format, writer, &issues, &self.database, &formatter_config)?;
 
         Ok(ReportStatus {
-            baseline_dead_issues: baseline_has_dead_issues,
+            baseline_dead_issues,
             baseline_filtered_issues,
             highest_reported_level,
             lowest_reported_level,

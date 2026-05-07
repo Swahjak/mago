@@ -1,5 +1,8 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::sync::LazyLock;
 
 use foldhash::HashSet;
@@ -23,15 +26,15 @@ static PRELUDE: LazyLock<Prelude> = LazyLock::new(Prelude::build);
 static PLUGIN_REGISTRY: LazyLock<PluginRegistry> = LazyLock::new(PluginRegistry::with_library_providers);
 
 #[derive(Debug, Clone)]
-pub struct TestCase<'a> {
-    name: &'a str,
-    content: &'a str,
+pub struct TestCase<'src> {
+    name: &'src str,
+    content: &'src str,
     settings: Option<Settings>,
 }
 
-impl<'a> TestCase<'a> {
+impl<'src> TestCase<'src> {
     #[must_use]
-    pub fn new(name: &'a str, content: &'a str) -> Self {
+    pub fn new(name: &'src str, content: &'src str) -> Self {
         Self { name, content, settings: None }
     }
 
@@ -57,6 +60,35 @@ pub fn default_test_settings() -> Settings {
         check_property_initialization: true,
         ..Default::default()
     }
+}
+
+#[must_use]
+pub fn infection_like_settings() -> Settings {
+    Settings {
+        find_unused_expressions: true,
+        find_unused_definitions: true,
+        find_unused_parameters: true,
+        check_throws: true,
+        analyze_dead_code: true,
+        memoize_properties: true,
+        allow_possibly_undefined_array_keys: true,
+        ..Default::default()
+    }
+}
+
+#[must_use]
+pub fn no_boolean_literal_comparison_settings() -> Settings {
+    Settings { no_boolean_literal_comparison: true, ..Default::default() }
+}
+
+#[must_use]
+pub fn php_90_settings() -> Settings {
+    Settings::new(mago_php_version::PHPVersion::new(9, 0, 0))
+}
+
+#[must_use]
+pub fn check_name_casing_settings() -> Settings {
+    Settings { check_name_casing: true, ..Default::default() }
 }
 
 fn run_test_case_inner(config: TestCase) {
@@ -113,7 +145,7 @@ fn verify_reported_issues(test_name: &str, mut analysis_result: AnalysisResult, 
 
         let mut panic_message = format!("Test '{test_name}' failed with issue discrepancies:\n");
         for d in discrepancies {
-            panic_message.push_str(&format!("  {d}\n"));
+            let _ = writeln!(panic_message, "  {d}");
         }
 
         panic!("{}", panic_message);

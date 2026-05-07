@@ -7,6 +7,7 @@ use mago_span::Span;
 use crate::ast::ast::expression::Expression;
 use crate::ast::ast::keyword::Keyword;
 use crate::ast::sequence::TokenSeparatedSequence;
+use crate::ast::sequence::TokenSeparatedSequenceExt;
 
 /// Represents a PHP match expression.
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, PartialOrd, Ord)]
@@ -40,6 +41,7 @@ pub struct MatchExpressionArm<'arena> {
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, PartialOrd, Ord)]
 pub struct MatchDefaultArm<'arena> {
     pub default: Keyword<'arena>,
+    pub comma: Option<Span>,
     pub arrow: Span,
     pub expression: &'arena Expression<'arena>,
 }

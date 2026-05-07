@@ -38,6 +38,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::Duration;
+use std::time::Instant;
 
 use clap::ColorChoice;
 use clap::Parser;
@@ -59,6 +60,7 @@ use mago_orchestrator::Orchestrator;
 use mago_prelude::Prelude;
 
 use crate::commands::args::baseline_reporting::BaselineReportingArgs;
+use crate::commands::args::substitution::SubstitutionArgs;
 use crate::commands::stdin_input;
 use crate::config::Configuration;
 use crate::consts::PRELUDE_BYTES;
@@ -131,7 +133,7 @@ pub struct AnalyzeCommand {
     /// with the updated configuration.
     ///
     /// Press Ctrl+C to stop watching.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, conflicts_with = "substitutions")]
     pub watch: bool,
 
     /// List all available analyzer issue codes in JSON format.
@@ -147,7 +149,7 @@ pub struct AnalyzeCommand {
     /// currently staged for commit and analyze only those files.
     ///
     /// Fails if not in a git repository.
-    #[arg(long, conflicts_with_all = ["path", "list_codes", "watch"])]
+    #[arg(long, conflicts_with_all = ["path", "list_codes", "watch", "substitutions"])]
     pub staged: bool,
 
     /// Read the file content from stdin and use the given path for baseline and reporting.
@@ -164,6 +166,10 @@ pub struct AnalyzeCommand {
     /// Arguments related to reporting issues with baseline support.
     #[clap(flatten)]
     pub baseline_reporting: BaselineReportingArgs,
+
+    /// File-content substitutions (`--substitute ORIG=TEMP`).
+    #[clap(flatten)]
+    pub substitution: SubstitutionArgs,
 }
 
 impl AnalyzeCommand {
@@ -229,15 +235,29 @@ impl AnalyzeCommand {
             return self.run_watch_loop(configuration, color_choice);
         }
 
-        // 1. Establish the base prelude data.
+        let trace_enabled = tracing::enabled!(tracing::Level::TRACE);
+        let command_start = trace_enabled.then(Instant::now);
+
+        let prelude_start = trace_enabled.then(Instant::now);
         let Prelude { database, metadata, symbol_references } = if self.no_stubs {
             Prelude::default()
         } else {
             Prelude::decode(PRELUDE_BYTES).expect("Failed to decode embedded prelude")
         };
 
+        let prelude_duration = prelude_start.map(|s| s.elapsed());
+
+        let orchestrator_init_start = trace_enabled.then(Instant::now);
+        let substitutions = self.substitution.resolve()?;
+        let substitution_excludes: Vec<String> =
+            substitutions.iter().map(|s| s.original.to_string_lossy().into_owned()).collect();
+
         let mut orchestrator = create_orchestrator(&configuration, color_choice, false, true, false);
         orchestrator.add_exclude_patterns(configuration.analyzer.excludes.iter());
+        orchestrator.add_exclude_patterns(substitution_excludes.iter());
+        for substitution in &substitutions {
+            orchestrator.config.paths.push(substitution.temporary.to_string_lossy().into_owned());
+        }
 
         let stdin_override = stdin_input::resolve_stdin_override(
             self.stdin_input,
@@ -261,9 +281,12 @@ impl AnalyzeCommand {
         } else if !self.stdin_input && !self.path.is_empty() {
             stdin_input::set_source_paths_from_paths(&mut orchestrator, &self.path);
         }
+        let orchestrator_init_duration = orchestrator_init_start.map(|s| s.elapsed());
 
+        let load_database_start = trace_enabled.then(Instant::now);
         let mut database =
             orchestrator.load_database(&configuration.source.workspace, true, Some(database), stdin_override)?;
+        let load_database_duration = load_database_start.map(|s| s.elapsed());
 
         if !database.files().any(|f| f.file_type == FileType::Host) {
             tracing::warn!("No files found to analyze.");
@@ -271,14 +294,19 @@ impl AnalyzeCommand {
             return Ok(ExitCode::SUCCESS);
         }
 
+        let service_run_start = trace_enabled.then(Instant::now);
         let service = orchestrator.get_analysis_service(database.read_only(), metadata, symbol_references);
         let analysis_result = service.run()?;
+        let service_run_duration = service_run_start.map(|s| s.elapsed());
 
+        let report_start = trace_enabled.then(Instant::now);
         let mut issues = analysis_result.issues;
         let read_db = database.read_only();
-        issues.filter_out_ignored(&configuration.analyzer.ignore, |file_id| {
-            read_db.get_ref(&file_id).ok().map(|f| f.name.to_string())
-        });
+        issues.filter_out_ignored(
+            &configuration.analyzer.ignore,
+            configuration.source.glob.to_database_settings(),
+            |file_id| read_db.get_ref(&file_id).ok().map(|f| f.name.to_string()),
+        );
 
         let baseline = configuration.analyzer.baseline.as_deref();
         let baseline_variant = configuration.analyzer.baseline_variant;
@@ -291,9 +319,29 @@ impl AnalyzeCommand {
         );
 
         let (exit_code, changed_file_ids) = processor.process_issues(&orchestrator, &mut database, issues)?;
+        let report_duration = report_start.map(|s| s.elapsed());
 
         if self.staged && !changed_file_ids.is_empty() {
             git::stage_files(&configuration.source.workspace, &database, changed_file_ids)?;
+        }
+
+        let drop_database_start = trace_enabled.then(Instant::now);
+        drop(database);
+        let drop_database_duration = drop_database_start.map(|s| s.elapsed());
+
+        let drop_orchestrator_start = trace_enabled.then(Instant::now);
+        drop(orchestrator);
+        let drop_orchestrator_duration = drop_orchestrator_start.map(|s| s.elapsed());
+
+        if let Some(start) = command_start {
+            tracing::trace!("Prelude decoded in {:?}.", prelude_duration.unwrap_or_default());
+            tracing::trace!("Orchestrator initialized in {:?}.", orchestrator_init_duration.unwrap_or_default());
+            tracing::trace!("Database loaded in {:?}.", load_database_duration.unwrap_or_default());
+            tracing::trace!("Analysis service ran in {:?}.", service_run_duration.unwrap_or_default());
+            tracing::trace!("Issues filtered and reported in {:?}.", report_duration.unwrap_or_default());
+            tracing::trace!("Database dropped in {:?}.", drop_database_duration.unwrap_or_default());
+            tracing::trace!("Orchestrator dropped in {:?}.", drop_orchestrator_duration.unwrap_or_default());
+            tracing::trace!("Analyze command finished in {:?}.", start.elapsed());
         }
 
         Ok(exit_code)
@@ -341,6 +389,7 @@ impl AnalyzeCommand {
                         Some(configuration.php_version),
                         Some(configuration.threads),
                         configuration.allow_unsupported_php_version,
+                        configuration.no_version_check,
                     ) {
                         Ok(new_config) => {
                             configuration = new_config;
@@ -390,9 +439,12 @@ impl AnalyzeCommand {
 
         let mut issues = analysis_result.issues;
         let read_db = watcher.read_only_database();
-        issues.filter_out_ignored(&configuration.analyzer.ignore, |file_id| {
-            read_db.get_ref(&file_id).ok().map(|f| f.name.to_string())
-        });
+        issues.filter_out_ignored(
+            &configuration.analyzer.ignore,
+            configuration.source.glob.to_database_settings(),
+            |file_id| read_db.get_ref(&file_id).ok().map(|f| f.name.to_string()),
+        );
+
         let baseline = configuration.analyzer.baseline.as_deref();
         let baseline_variant = configuration.analyzer.baseline_variant;
 
@@ -429,9 +481,11 @@ impl AnalyzeCommand {
 
             let mut issues = analysis_result.issues;
             let read_db = watcher.read_only_database();
-            issues.filter_out_ignored(&configuration.analyzer.ignore, |file_id| {
-                read_db.get_ref(&file_id).ok().map(|f| f.name.to_string())
-            });
+            issues.filter_out_ignored(
+                &configuration.analyzer.ignore,
+                configuration.source.glob.to_database_settings(),
+                |file_id| read_db.get_ref(&file_id).ok().map(|f| f.name.to_string()),
+            );
 
             watcher.with_database_mut(|database| {
                 processor.process_issues(&orchestrator, database, issues).map(|(code, _)| code)

@@ -38,6 +38,7 @@
 
 use std::borrow::Cow;
 use std::io::Read;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -58,6 +59,8 @@ use crate::error::Error;
 use crate::utils;
 use crate::utils::create_orchestrator;
 use crate::utils::git;
+use crate::utils::git::get_staged_file;
+use crate::utils::git::update_staged_file;
 
 /// Command for formatting PHP source files according to style rules.
 ///
@@ -106,16 +109,30 @@ pub struct FormatCommand {
     #[arg(long, short = 'i', conflicts_with_all = ["dry_run", "check", "path", "staged"])]
     pub stdin_input: bool,
 
+    /// Logical filepath of the buffer being read from STDIN.
+    ///
+    /// When provided alongside `--stdin-input`, the formatter treats the
+    /// piped content as if it lived at this path. The path is used to:
+    ///
+    /// - Honor `source.excludes` and `formatter.excludes` from `mago.toml`.
+    ///   If the path matches an exclude pattern, the input is written back
+    ///   to STDOUT unchanged.
+    /// - Improve diagnostic messages by referencing the real filepath.
+    ///
+    /// Editor integrations should pass the buffer path here (for example,
+    /// Zed's `{buffer_path}` substitution).
+    #[arg(long, requires = "stdin_input", value_name = "PATH")]
+    pub stdin_filepath: Option<PathBuf>,
+
     /// Format files that are staged in git.
     ///
     /// This flag is designed for git pre-commit hooks. It will:
     /// 1. Find all PHP files currently staged for commit
-    /// 2. Format those files
-    /// 3. Re-stage them so the formatted version is committed
+    /// 2. Format those staged files in memory
+    /// 3. Update the staged files so the formatted version is committed
     ///
     /// Fails if:
     /// - Not in a git repository
-    /// - A staged file has unstaged changes (would cause data loss)
     #[arg(long, short = 's', conflicts_with_all = ["dry_run", "check", "stdin_input", "path"])]
     pub staged: bool,
 }
@@ -164,28 +181,7 @@ impl FormatCommand {
         }
 
         if self.stdin_input {
-            let file = Self::create_file_from_stdin()?;
-            let status = orchestrator.format_file(&file)?;
-
-            let exit_code = match status {
-                FileFormatStatus::Unchanged => {
-                    print!("{}", file.contents);
-
-                    ExitCode::SUCCESS
-                }
-                FileFormatStatus::Changed(new_content) => {
-                    print!("{new_content}");
-
-                    ExitCode::SUCCESS
-                }
-                FileFormatStatus::FailedToParse(parse_error) => {
-                    tracing::error!("Failed to parse input: {}", parse_error);
-
-                    ExitCode::from(EXIT_CODE_ERROR)
-                }
-            };
-
-            return Ok(exit_code);
+            return self.execute_stdin(orchestrator, &configuration);
         }
 
         let mut database = orchestrator.load_database(&configuration.source.workspace, false, None, None)?;
@@ -231,12 +227,50 @@ impl FormatCommand {
         Ok(exit_code)
     }
 
-    /// Creates an ephemeral file from standard input.
-    fn create_file_from_stdin() -> Result<File, Error> {
+    /// Executes the STDIN formatting flow.
+    ///
+    /// When `--stdin-filepath` is set, the buffer is registered with the database
+    /// loader using its real workspace-relative name. The loader honors `source`
+    /// and `formatter` exclude rules: if the path matches an exclude pattern,
+    /// the file isn't loaded and we pass the original input through unchanged.
+    ///
+    /// Without `--stdin-filepath`, the buffer is treated as an ad-hoc snippet
+    /// and formatted unconditionally.
+    fn execute_stdin(
+        self,
+        mut orchestrator: mago_orchestrator::Orchestrator<'_>,
+        configuration: &Configuration,
+    ) -> Result<ExitCode, Error> {
         let mut content = String::new();
         std::io::stdin().read_to_string(&mut content).map_err(|e| Error::Database(DatabaseError::IOError(e)))?;
 
-        Ok(File::ephemeral(Cow::Borrowed("<stdin>"), Cow::Owned(content)))
+        let Some(filepath) = self.stdin_filepath.as_deref() else {
+            let file = File::ephemeral(Cow::Borrowed("<stdin>"), Cow::Owned(content));
+            return Ok(emit_stdin_result(orchestrator.format_file(&file)?, &file));
+        };
+
+        let logical_name = stdin_logical_name(filepath, &configuration.source.workspace);
+        orchestrator.set_source_paths([filepath.to_string_lossy().to_string()]);
+
+        let database = orchestrator.load_database(
+            &configuration.source.workspace,
+            false,
+            None,
+            Some((logical_name.clone(), content.clone())),
+        )?;
+
+        let file = match database.get_by_name(&logical_name) {
+            Ok(file) => file.clone(),
+            Err(_) => {
+                // File is excluded.
+                print!("{content}");
+                return Ok(ExitCode::SUCCESS);
+            }
+        };
+
+        let status = orchestrator.get_format_service(database.read_only()).format_file(&file)?;
+
+        Ok(emit_stdin_result(status, &file))
     }
 
     /// Executes formatting for staged files.
@@ -245,9 +279,8 @@ impl FormatCommand {
     ///
     /// 1. Verifies we're in a git repository
     /// 2. Gets the list of staged PHP files
-    /// 3. Checks that no staged files have unstaged changes
-    /// 4. Formats the staged files
-    /// 5. Re-stages the formatted files
+    /// 3. Formats the staged files in memory
+    /// 4. Updates the staged file with its formatted version
     ///
     /// # Arguments
     ///
@@ -258,42 +291,46 @@ impl FormatCommand {
     ///
     /// - `Ok(ExitCode::SUCCESS)` if formatting succeeded
     /// - `Err(Error::NotAGitRepository)` if not in a git repository
-    /// - `Err(Error::StagedFileHasUnstagedChanges)` if a file has partial staging
     fn execute_staged(self, configuration: Configuration, color_choice: ColorChoice) -> Result<ExitCode, Error> {
         let workspace = &configuration.source.workspace;
 
         let mut orchestrator = create_orchestrator(&configuration, color_choice, false, true, false);
         orchestrator.add_exclude_patterns(configuration.formatter.excludes.iter());
 
-        let mut database = orchestrator.load_database(workspace, false, None, None)?;
+        let database = orchestrator.load_database(workspace, false, None, None)?;
 
-        // Get staged files that are clean (no unstaged changes), resolved to file IDs
-        let staged_file_ids = git::get_staged_clean_files(workspace, &database)?;
-        if staged_file_ids.is_empty() {
+        // Get staged files resolved to file IDs
+        let staged_file_paths = git::get_staged_file_paths(workspace)?;
+        if staged_file_paths.is_empty() {
             tracing::info!("No staged files to format.");
             return Ok(ExitCode::SUCCESS);
         }
 
-        let service = orchestrator.get_format_service(database.read_only());
-        let result = service.run_on_files(staged_file_ids)?;
+        let mut changed_files_count = 0;
+        for path in staged_file_paths {
+            let absolute_path = workspace.join(&path);
+            let canonical_path = absolute_path.canonicalize().unwrap_or(absolute_path);
 
-        for (file_id, parse_error) in result.parse_errors() {
-            let file = database.get_ref(file_id)?;
-            tracing::error!("Failed to parse file '{}': {parse_error}", file.name);
+            if database.get_by_path(&canonical_path).is_err() {
+                continue;
+            }
+            let staged_file = get_staged_file(workspace, &path)?;
+            match orchestrator.format_file(&staged_file)? {
+                FileFormatStatus::Unchanged => continue,
+                FileFormatStatus::Changed(new_content) => {
+                    update_staged_file(workspace, &path, new_content)?;
+                    changed_files_count += 1;
+                }
+                FileFormatStatus::FailedToParse(parse_error) => {
+                    tracing::error!("Failed to parse staged file '{}': {}", path.display(), parse_error);
+                }
+            };
         }
-
-        let changed_files_count = result.changed_files_count();
 
         if changed_files_count == 0 {
             tracing::info!("All staged files are already formatted.");
             return Ok(ExitCode::SUCCESS);
         }
-
-        let change_log = to_change_log(&database, &result, false, color_choice)?;
-        let changed_file_ids = change_log.changed_file_ids()?;
-        database.commit(change_log, true)?;
-
-        git::stage_files(workspace, &database, changed_file_ids)?;
 
         tracing::info!("Formatted and re-staged {changed_files_count} file(s).");
 
@@ -314,4 +351,45 @@ fn to_change_log(
     }
 
     Ok(change_log)
+}
+
+fn emit_stdin_result(status: FileFormatStatus, file: &File) -> ExitCode {
+    match status {
+        FileFormatStatus::Unchanged => {
+            print!("{}", file.contents);
+            ExitCode::SUCCESS
+        }
+        FileFormatStatus::Changed(new_content) => {
+            print!("{new_content}");
+            ExitCode::SUCCESS
+        }
+        FileFormatStatus::FailedToParse(parse_error) => {
+            tracing::error!("Failed to parse {}: {parse_error}", file.name);
+            ExitCode::from(EXIT_CODE_ERROR)
+        }
+    }
+}
+
+/// Computes a workspace-relative, forward-slash logical name for `filepath`.
+///
+/// Falls back to the path as given when it isn't a descendant of the workspace.
+fn stdin_logical_name(filepath: &Path, workspace: &Path) -> String {
+    let canonical_filepath = filepath.canonicalize();
+    let canonical_workspace = workspace.canonicalize();
+
+    let stripped: &Path = match (canonical_filepath.as_ref(), canonical_workspace.as_ref()) {
+        (Ok(fp), Ok(ws)) => fp.strip_prefix(ws).unwrap_or(fp),
+        _ => filepath.strip_prefix(workspace).unwrap_or(filepath),
+    };
+
+    #[cfg(windows)]
+    let mut name = stripped.to_string_lossy().replace('\\', "/");
+    #[cfg(not(windows))]
+    let mut name = stripped.to_string_lossy().into_owned();
+
+    while let Some(rest) = name.strip_prefix("./") {
+        name = rest.to_string();
+    }
+
+    name
 }

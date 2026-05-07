@@ -43,11 +43,19 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for ArrayAccess<'arena> {
             None
         };
 
-        let was_inside_use = block_context.flags.inside_general_use();
+        let was_inside_isset = block_context.flags.inside_isset();
+        let was_inside_general_use = block_context.flags.inside_general_use();
+        let was_inside_unset = block_context.flags.inside_unset();
+
+        block_context.flags.set_inside_isset(false);
         block_context.flags.set_inside_general_use(true);
         block_context.flags.set_inside_unset(false);
+
         self.index.analyze(context, block_context, artifacts)?;
-        block_context.flags.set_inside_general_use(was_inside_use);
+
+        block_context.flags.set_inside_isset(was_inside_isset);
+        block_context.flags.set_inside_unset(was_inside_unset);
+        block_context.flags.set_inside_general_use(was_inside_general_use);
 
         let index_type = artifacts.get_expression_type(&self.index).cloned().unwrap_or_else(get_arraykey);
 
@@ -62,7 +70,7 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for ArrayAccess<'arena> {
         {
             let is_variable_key = keyed_array_var_id.contains("[$");
             if is_variable_key || !array_access_type.possibly_undefined() {
-                artifacts.set_rc_expression_type(self, array_access_type.clone());
+                artifacts.set_rc_expression_type(self, Rc::clone(&array_access_type));
 
                 return Ok(());
             }
@@ -106,7 +114,7 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for ArrayAccess<'arena> {
                 }
             }
 
-            artifacts.set_expression_type(self, access_type.clone());
+            artifacts.set_expression_type(self, access_type);
         } else {
             artifacts.set_expression_type(self, get_mixed());
         }
@@ -124,7 +132,7 @@ mod tests {
 
     test_analysis! {
         name = using_generic_parameter_as_index,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /**
@@ -148,7 +156,7 @@ mod tests {
 
     test_analysis! {
         name = negated_isset_narrows_parent_array_type,
-        code = indoc! {r#"
+        code = indoc! {"
             <?php
 
             /**
@@ -162,7 +170,7 @@ mod tests {
                 echo $y['foo']['bar'];
                 echo $y['foo']['baz'];
             }
-        "#},
+        "},
         issues = [
             IssueCode::UndefinedStringArrayIndex,  // $y['foo']['bar']
             IssueCode::UndefinedStringArrayIndex,  // $y['foo']['baz']
@@ -171,7 +179,7 @@ mod tests {
 
     test_analysis! {
         name = variable_key_narrowing_not_null,
-        code = indoc! {r#"
+        code = indoc! {"
             <?php
 
             /**
@@ -185,6 +193,6 @@ mod tests {
 
                 return 0;
             }
-        "#},
+        "},
     }
 }

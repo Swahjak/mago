@@ -33,12 +33,7 @@ pub fn scan_function_like_parameter_with_constants<'arena>(
     scope: &NamespaceScope,
     constants: Option<&AtomMap<ConstantMetadata>>,
 ) -> FunctionLikeParameterMetadata {
-    let mut flags = MetadataFlags::empty();
-    if context.file.file_type.is_host() {
-        flags |= MetadataFlags::USER_DEFINED;
-    } else if context.file.file_type.is_builtin() {
-        flags |= MetadataFlags::BUILTIN;
-    }
+    let mut flags = MetadataFlags::origin_flags(context.file.file_type);
 
     if parameter.ellipsis.is_some() {
         flags |= MetadataFlags::VARIADIC;
@@ -66,11 +61,12 @@ pub fn scan_function_like_parameter_with_constants<'arena>(
 
     if let Some(default_value) = &parameter.default_value {
         metadata.flags |= MetadataFlags::HAS_DEFAULT;
-        metadata.default_type = infer_with_constants(context, scope, default_value.value, constants).map(|u| {
-            let mut type_metadata = TypeMetadata::new(u, default_value.span());
-            type_metadata.inferred = true;
-            type_metadata
-        });
+        metadata.default_type =
+            infer_with_constants(context, scope, default_value.value, classname, constants).map(|u| {
+                let mut type_metadata = TypeMetadata::new(u, default_value.span());
+                type_metadata.inferred = true;
+                type_metadata
+            });
     }
 
     metadata

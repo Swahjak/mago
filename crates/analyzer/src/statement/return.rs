@@ -35,6 +35,7 @@ use crate::error::AnalysisError;
 use crate::utils::docblock::check_docblock_type_incompatibility;
 use crate::utils::docblock::get_type_from_var_docblock;
 use crate::utils::get_type_diff;
+use crate::utils::names::display_function_like_identifier;
 
 impl<'ast, 'arena> Analyzable<'ast, 'arena> for Return<'arena> {
     fn analyze<'ctx>(
@@ -120,7 +121,7 @@ pub fn handle_return_value<'ctx>(
                 *finally_type =
                     Rc::new(combine_union_types(finally_type, var_type, context.codebase, CombinerOptions::default()));
             } else {
-                finally_scope.locals.insert(*var_id, var_type.clone());
+                finally_scope.locals.insert(*var_id, Rc::clone(var_type));
             }
         }
     }
@@ -183,7 +184,7 @@ pub fn handle_return_value<'ctx>(
         inferred_return_type = Rc::new(inner_union);
     }
 
-    let function_name = function_like_identifier.as_string();
+    let function_name = display_function_like_identifier(context, &function_like_identifier);
 
     if let Some(return_value) = return_value
         && function_like_metadata.flags.is_by_reference()
@@ -293,7 +294,7 @@ pub fn handle_return_value<'ctx>(
     }
 
     if return_value.is_some() {
-        artifacts.inferred_return_types.push(inferred_return_type.clone());
+        artifacts.inferred_return_types.push(Rc::clone(&inferred_return_type));
     }
 
     if let Some(return_value) = return_value {
@@ -529,6 +530,8 @@ pub fn handle_return_value<'ctx>(
                 )
             ),
         );
+    } else {
+        // a return value isn't required, the function yields, or this is a constructor; nothing to report
     }
 }
 
@@ -570,7 +573,7 @@ fn handle_property_hook_return<'ctx>(
         return;
     }
 
-    let hook_name = concat_atom!(class_like.name, "::", property_name, "::get");
+    let hook_name = concat_atom!(class_like.original_name, "::", property_name, "::get");
 
     if inferred_return_type.is_mixed() {
         context.collector.report_with_code(
@@ -806,7 +809,7 @@ mod tests {
 
     test_analysis! {
         name = empty_return_from_generator,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /**
@@ -823,7 +826,7 @@ mod tests {
 
     test_analysis! {
         name = hidden_return_from_generator,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /**
@@ -844,7 +847,7 @@ mod tests {
 
     test_analysis! {
         name = return_from_generator,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /**
@@ -888,7 +891,7 @@ mod tests {
 
     test_analysis! {
         name = invalid_return_from_generator,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /**
@@ -924,7 +927,7 @@ mod tests {
 
     test_analysis! {
         name = key_of_and_value_of,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             class A
@@ -1003,7 +1006,7 @@ mod tests {
 
     test_analysis! {
         name = return_no_value_from_untyped_functions,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             function foo() {
@@ -1014,7 +1017,7 @@ mod tests {
 
     test_analysis! {
         name = return_class_string_array,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             class A {}
@@ -1035,7 +1038,7 @@ mod tests {
 
     test_analysis! {
         name = return_no_value_from_typed_void_functions,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             function foo(): void {
@@ -1046,7 +1049,7 @@ mod tests {
 
     test_analysis! {
         name = return_no_value_from_mixed_docblock_typed_functions,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /**
@@ -1060,7 +1063,7 @@ mod tests {
 
     test_analysis! {
         name = return_no_value_from_null_docblock_typed_functions,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /**
@@ -1092,7 +1095,7 @@ mod tests {
 
     test_analysis! {
         name = expanding_this,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /**
@@ -1127,7 +1130,7 @@ mod tests {
 
     test_analysis! {
         name = complex_type_return,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             interface Foo {}
@@ -1174,7 +1177,7 @@ mod tests {
 
     test_analysis! {
         name = ignore_falsable_return,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /** @ignore-falsable-return */
@@ -1197,7 +1200,7 @@ mod tests {
 
     test_analysis! {
         name = ignore_nullable_return,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /** @ignore-nullable-return */
@@ -1220,7 +1223,7 @@ mod tests {
 
     test_analysis! {
         name = resolve_nested_generics_through_inheritance,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             declare(strict_types=1);

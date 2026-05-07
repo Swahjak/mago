@@ -3,6 +3,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use mago_database::GlobSettings;
 use mago_php_version::PHPVersion;
 
 use crate::integration::IntegrationSet;
@@ -23,6 +24,7 @@ use crate::rule::DeprecatedCastConfig;
 use crate::rule::DeprecatedShellExecuteStringConfig;
 use crate::rule::DeprecatedSwitchSemicolonConfig;
 use crate::rule::DisallowedFunctionsConfig;
+use crate::rule::DisallowedTypeInstantiationConfig;
 use crate::rule::EnumNameConfig;
 use crate::rule::ExcessiveNestingConfig;
 use crate::rule::ExcessiveParameterListConfig;
@@ -46,6 +48,7 @@ use crate::rule::LowercaseKeywordConfig;
 use crate::rule::LowercaseTypeHintConfig;
 use crate::rule::MethodNameConfig;
 use crate::rule::MiddlewareInRoutesConfig;
+use crate::rule::MissingDocsConfig;
 use crate::rule::NoAliasFunctionConfig;
 use crate::rule::NoAlternativeSyntaxConfig;
 use crate::rule::NoArrayAccumulationInLoopConfig;
@@ -54,6 +57,7 @@ use crate::rule::NoAssignInConditionConfig;
 use crate::rule::NoBooleanFlagParameterConfig;
 use crate::rule::NoClosingTagConfig;
 use crate::rule::NoDbSchemaChangeConfig;
+use crate::rule::NoDeadStoreConfig;
 use crate::rule::NoDebugSymbolsConfig;
 use crate::rule::NoDirectDbQueryConfig;
 use crate::rule::NoElseClauseConfig;
@@ -77,10 +81,13 @@ use crate::rule::NoInsecureComparisonConfig;
 use crate::rule::NoIsNullConfig;
 use crate::rule::NoIssetConfig;
 use crate::rule::NoIteratorToArrayInForeachConfig;
+use crate::rule::NoLiteralNamespaceStringConfig;
 use crate::rule::NoLiteralPasswordConfig;
 use crate::rule::NoMultiAssignmentsConfig;
+use crate::rule::NoNegatedTernaryConfig;
 use crate::rule::NoNestedTernaryConfig;
 use crate::rule::NoNoopConfig;
+use crate::rule::NoNullPropertyInitConfig;
 use crate::rule::NoOnlyConfig;
 use crate::rule::NoParameterShadowingConfig;
 use crate::rule::NoPhpTagTerminatorConfig;
@@ -88,6 +95,7 @@ use crate::rule::NoProtectedInFinalConfig;
 use crate::rule::NoRedundantBinaryStringPrefixConfig;
 use crate::rule::NoRedundantBlockConfig;
 use crate::rule::NoRedundantContinueConfig;
+use crate::rule::NoRedundantElseConfig;
 use crate::rule::NoRedundantFileConfig;
 use crate::rule::NoRedundantFinalConfig;
 use crate::rule::NoRedundantIssetConfig;
@@ -100,30 +108,39 @@ use crate::rule::NoRedundantParenthesesConfig;
 use crate::rule::NoRedundantReadonlyConfig;
 use crate::rule::NoRedundantStringConcatConfig;
 use crate::rule::NoRedundantUseConfig;
+use crate::rule::NoRedundantVariableConfig;
 use crate::rule::NoRedundantWriteVisibilityConfig;
 use crate::rule::NoRedundantYieldFromConfig;
 use crate::rule::NoRequestAllConfig;
 use crate::rule::NoRequestVariableConfig;
 use crate::rule::NoRolesAsCapabilitiesConfig;
 use crate::rule::NoSelfAssignmentConfig;
+use crate::rule::NoServiceStateMutationConfig;
 use crate::rule::NoShellExecuteStringConfig;
 use crate::rule::NoShortBoolCastConfig;
 use crate::rule::NoShortOpeningTagConfig;
 use crate::rule::NoShorthandTernaryConfig;
+use crate::rule::NoSideEffectsWithDeclarationsConfig;
 use crate::rule::NoSprintfConcatConfig;
 use crate::rule::NoTrailingSpaceConfig;
 use crate::rule::NoUnderscoreClassConfig;
 use crate::rule::NoUnescapedOutputConfig;
 use crate::rule::NoUnsafeFinallyConfig;
+use crate::rule::NoUnusedClosureCaptureConfig;
+use crate::rule::NoUnusedGlobalConfig;
+use crate::rule::NoUnusedStaticConfig;
 use crate::rule::NoVariableVariableConfig;
 use crate::rule::NoVoidReferenceReturnConfig;
 use crate::rule::OptionalParamOrderConfig;
 use crate::rule::PreferAnonymousMigrationConfig;
+use crate::rule::PreferArraySpreadConfig;
 use crate::rule::PreferArrowFunctionConfig;
 use crate::rule::PreferEarlyContinueConfig;
+use crate::rule::PreferExplodeOverPregSplitConfig;
 use crate::rule::PreferFirstClassCallableConfig;
 use crate::rule::PreferInterfaceConfig;
 use crate::rule::PreferPreIncrementConfig;
+use crate::rule::PreferSelfReturnTypeConfig;
 use crate::rule::PreferStaticClosureConfig;
 use crate::rule::PreferTestAttributeConfig;
 use crate::rule::PreferViewArrayConfig;
@@ -149,6 +166,7 @@ use crate::rule::StrStartsWithConfig;
 use crate::rule::StrictAssertionsConfig;
 use crate::rule::StrictBehaviorConfig;
 use crate::rule::StrictTypesConfig;
+use crate::rule::StringStyleConfig;
 use crate::rule::SwitchContinueToBreakConfig;
 use crate::rule::TaggedFixmeConfig;
 use crate::rule::TaggedTodoConfig;
@@ -173,6 +191,8 @@ pub struct Settings {
     pub php_version: PHPVersion,
     pub integrations: IntegrationSet,
     pub rules: RulesSettings,
+    #[schemars(skip)]
+    pub glob: GlobSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -206,6 +226,7 @@ pub struct RulesSettings {
     pub constant_name: RuleSettings<ConstantNameConfig>,
     pub cyclomatic_complexity: RuleSettings<CyclomaticComplexityConfig>,
     pub disallowed_functions: RuleSettings<DisallowedFunctionsConfig>,
+    pub disallowed_type_instantiation: RuleSettings<DisallowedTypeInstantiationConfig>,
     pub enum_name: RuleSettings<EnumNameConfig>,
     pub excessive_nesting: RuleSettings<ExcessiveNestingConfig>,
     pub excessive_parameter_list: RuleSettings<ExcessiveParameterListConfig>,
@@ -227,6 +248,8 @@ pub struct RulesSettings {
     pub deprecated_shell_execute_string: RuleSettings<DeprecatedShellExecuteStringConfig>,
     pub deprecated_switch_semicolon: RuleSettings<DeprecatedSwitchSemicolonConfig>,
     pub prefer_anonymous_migration: RuleSettings<PreferAnonymousMigrationConfig>,
+    pub prefer_array_spread: RuleSettings<PreferArraySpreadConfig>,
+    pub prefer_explode_over_preg_split: RuleSettings<PreferExplodeOverPregSplitConfig>,
     pub prefer_first_class_callable: RuleSettings<PreferFirstClassCallableConfig>,
     pub no_void_reference_return: RuleSettings<NoVoidReferenceReturnConfig>,
     pub no_underscore_class: RuleSettings<NoUnderscoreClassConfig>,
@@ -245,8 +268,14 @@ pub struct RulesSettings {
     pub no_redundant_readonly: RuleSettings<NoRedundantReadonlyConfig>,
     pub no_redundant_file: RuleSettings<NoRedundantFileConfig>,
     pub no_redundant_continue: RuleSettings<NoRedundantContinueConfig>,
+    pub no_redundant_else: RuleSettings<NoRedundantElseConfig>,
     pub no_redundant_block: RuleSettings<NoRedundantBlockConfig>,
     pub no_redundant_use: RuleSettings<NoRedundantUseConfig>,
+    pub no_redundant_variable: RuleSettings<NoRedundantVariableConfig>,
+    pub no_dead_store: RuleSettings<NoDeadStoreConfig>,
+    pub no_unused_static: RuleSettings<NoUnusedStaticConfig>,
+    pub no_unused_global: RuleSettings<NoUnusedGlobalConfig>,
+    pub no_unused_closure_capture: RuleSettings<NoUnusedClosureCaptureConfig>,
     pub no_redundant_yield_from: RuleSettings<NoRedundantYieldFromConfig>,
     pub no_self_assignment: RuleSettings<NoSelfAssignmentConfig>,
     pub no_protected_in_final: RuleSettings<NoProtectedInFinalConfig>,
@@ -254,6 +283,7 @@ pub struct RulesSettings {
     pub no_noop: RuleSettings<NoNoopConfig>,
     pub no_only: RuleSettings<NoOnlyConfig>,
     pub no_multi_assignments: RuleSettings<NoMultiAssignmentsConfig>,
+    pub no_negated_ternary: RuleSettings<NoNegatedTernaryConfig>,
     pub no_nested_ternary: RuleSettings<NoNestedTernaryConfig>,
     pub no_hash_emoji: RuleSettings<NoHashEmojiConfig>,
     pub no_hash_comment: RuleSettings<NoHashCommentConfig>,
@@ -324,6 +354,7 @@ pub struct RulesSettings {
     pub no_ini_set: RuleSettings<NoIniSetConfig>,
     pub no_parameter_shadowing: RuleSettings<NoParameterShadowingConfig>,
     pub no_inline: RuleSettings<NoInlineConfig>,
+    pub no_side_effects_with_declarations: RuleSettings<NoSideEffectsWithDeclarationsConfig>,
     pub no_insecure_comparison: RuleSettings<NoInsecureComparisonConfig>,
     pub no_literal_password: RuleSettings<NoLiteralPasswordConfig>,
     pub tainted_data_to_sink: RuleSettings<TaintedDataToSinkConfig>,
@@ -333,23 +364,29 @@ pub struct RulesSettings {
     pub strict_assertions: RuleSettings<StrictAssertionsConfig>,
     pub use_specific_assertions: RuleSettings<UseSpecificAssertionsConfig>,
     pub no_request_all: RuleSettings<NoRequestAllConfig>,
+    pub no_service_state_mutation: RuleSettings<NoServiceStateMutationConfig>,
     pub middleware_in_routes: RuleSettings<MiddlewareInRoutesConfig>,
     pub use_compound_assignment: RuleSettings<UseCompoundAssignmentConfig>,
     pub require_preg_quote_delimiter: RuleSettings<RequirePregQuoteDelimiterConfig>,
     pub require_namespace: RuleSettings<RequireNamespaceConfig>,
     pub sorted_integer_keys: RuleSettings<SortedIntegerKeysConfig>,
+    pub string_style: RuleSettings<StringStyleConfig>,
     pub single_class_per_file: RuleSettings<SingleClassPerFileConfig>,
     pub readable_literal: RuleSettings<ReadableLiteralConfig>,
     pub yoda_conditions: RuleSettings<YodaConditionsConfig>,
     pub no_short_bool_cast: RuleSettings<NoShortBoolCastConfig>,
     pub no_alternative_syntax: RuleSettings<NoAlternativeSyntaxConfig>,
     pub prefer_pre_increment: RuleSettings<PreferPreIncrementConfig>,
+    pub prefer_self_return_type: RuleSettings<PreferSelfReturnTypeConfig>,
     pub switch_continue_to_break: RuleSettings<SwitchContinueToBreakConfig>,
+    pub no_null_property_init: RuleSettings<NoNullPropertyInitConfig>,
     pub use_wp_functions: RuleSettings<UseWpFunctionsConfig>,
     pub no_direct_db_query: RuleSettings<NoDirectDbQueryConfig>,
     pub no_db_schema_change: RuleSettings<NoDbSchemaChangeConfig>,
     pub no_unescaped_output: RuleSettings<NoUnescapedOutputConfig>,
     pub no_roles_as_capabilities: RuleSettings<NoRolesAsCapabilitiesConfig>,
+    pub missing_docs: RuleSettings<MissingDocsConfig>,
+    pub no_literal_namespace_string: RuleSettings<NoLiteralNamespaceStringConfig>,
 }
 
 impl<C: Config> RuleSettings<C> {
@@ -365,7 +402,12 @@ impl<C: Config> RuleSettings<C> {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { php_version: PHPVersion::PHP80, integrations: IntegrationSet::empty(), rules: RulesSettings::default() }
+        Self {
+            php_version: PHPVersion::PHP80,
+            integrations: IntegrationSet::empty(),
+            rules: RulesSettings::default(),
+            glob: GlobSettings::default(),
+        }
     }
 }
 

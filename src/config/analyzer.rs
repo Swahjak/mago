@@ -6,6 +6,7 @@ use mago_algebra::DEFAULT_DISJUNCTION_COMPLEXITY;
 use mago_algebra::DEFAULT_NEGATION_COMPLEXITY;
 use mago_algebra::DEFAULT_SATURATION_COMPLEXITY;
 use mago_analyzer::settings::DEFAULT_FORMULA_SIZE_THRESHOLD;
+use mago_analyzer::settings::DEFAULT_LOOP_ASSIGNMENT_DEPTH_THRESHOLD;
 use mago_analyzer::settings::Settings;
 use mago_atom::ascii_lowercase_atom;
 use mago_atom::atom;
@@ -84,6 +85,10 @@ pub struct AnalyzerConfiguration {
     /// Whether to find unused definitions.
     pub find_unused_definitions: bool,
 
+    /// Whether to warn when a function's declared return type contains a branch the body never
+    /// actually returns (e.g. `: string|false` on a function that always returns a string).
+    pub find_overly_wide_return_types: bool,
+
     /// Whether to analyze dead code.
     pub analyze_dead_code: bool,
 
@@ -91,6 +96,17 @@ pub struct AnalyzerConfiguration {
     pub memoize_properties: bool,
 
     /// Allow accessing array keys that may not be defined without reporting an issue.
+    ///
+    /// **Deprecated:** prefer `strict_array_index_existence` for new configurations.
+    /// Setting this option to `false` only emits a warning on possibly-undefined
+    /// `array<K, V>` reads with a single literal key, and does not widen the result
+    /// to `T|null` — so downstream `=== null` and `??` checks behave inconsistently.
+    /// `strict_array_index_existence = true` warns more thoroughly (lists, shapes,
+    /// and `array<K, V>`), and widens the type to `T|null` so the runtime semantics
+    /// are reflected in the type system.
+    ///
+    /// This setting is retained for backwards compatibility and may be removed in
+    /// a future release.
     pub allow_possibly_undefined_array_keys: bool,
 
     /// Whether to check for thrown exceptions.
@@ -120,6 +136,26 @@ pub struct AnalyzerConfiguration {
     /// When `false` (the default), any `int` is permitted as an index, offering
     /// more flexibility at the cost of type safety.
     pub strict_list_index_checks: bool,
+
+    /// Treat array/list indices that are not provably present as `T|null` and warn on access.
+    ///
+    /// When `true`, reading an array or list key whose presence is not guaranteed emits a
+    /// `possibly-undefined-{int,string}-array-index` warning and the resulting type is
+    /// widened to include `null`. This applies to `list<T>` (non-zero indices),
+    /// optional entries of `array{...}` shapes, and `array<K, V>` lookups by arbitrary keys.
+    /// It lets `=== null`, `??`, and `??=` reflect PHP's actual runtime semantics.
+    ///
+    /// Defaults to `false` to keep existing PHP-friendly behavior, where missing keys are
+    /// merely tracked internally as possibly-undefined without emitting a warning.
+    pub strict_array_index_existence: bool,
+
+    /// Allow arrays as operands of logical operators (`&&`, `||`, `xor`).
+    ///
+    /// When `true`, the analyzer accepts arrays on either side of a logical operator
+    /// without emitting `invalid-operand`. Defaults to `false`, which mirrors the
+    /// long-standing behavior of flagging implicit `bool` coercion of arrays. Standalone
+    /// `if ($array)` is unaffected and never warns.
+    pub allow_array_truthy_operand: bool,
 
     /// Disallow comparisons where a boolean literal is used as an operand.
     ///
@@ -151,6 +187,18 @@ pub struct AnalyzerConfiguration {
     ///
     /// Defaults to `false`.
     pub check_arrow_function_missing_type_hints: bool,
+
+    /// Skip missing-type-hint checks for closures and arrow functions used
+    /// as the right-hand side of the pipe operator (`|>`).
+    ///
+    /// When `true`, an inline pipe callable like
+    /// `$x |> fn($p) => strtoupper($p)` will not warn about missing parameter
+    /// or return types, even when the closure / arrow-function checks are
+    /// otherwise enabled. The pipe operand's type is enough to derive the
+    /// parameter type, so the hint is mostly noise.
+    ///
+    /// Defaults to `false`.
+    pub allow_implicit_pipe_callable_types: bool,
 
     /// Register superglobals (e.g., `$_GET`, `$_POST`, `$_SERVER`) in the analysis context.
     ///
@@ -244,6 +292,17 @@ pub struct AnalyzerConfiguration {
     /// Defaults to `false`.
     pub require_api_or_internal: bool,
 
+    /// Whether to allow calls to impure functions inside conditions.
+    ///
+    /// When set to `false`, any call to a function not marked `@pure` or
+    /// `@mutation-free` inside an `if`, `while`, `for`, ternary, or `match`
+    /// condition is reported. This helps catch surprising evaluation-order
+    /// bugs where a side effect in one part of a condition silently alters
+    /// a variable used in another part.
+    ///
+    /// Defaults to `true` (impure calls in conditions are allowed).
+    pub allow_side_effects_in_conditions: bool,
+
     /// **Deprecated**: Use `check-missing-override` and `find-unused-parameters` instead.
     ///
     /// When set to `true`, enables both `check-missing-override` and `find-unused-parameters`.
@@ -335,8 +394,29 @@ pub struct PerformanceConfiguration {
     /// to a simpler array type. This prevents memory explosion on files with
     /// thousands of array pushes.
     ///
-    /// Defaults to `128`.
+    /// Defaults to `32`.
     pub array_combination_threshold: u16,
+
+    /// Maximum depth of the loop assignment dependency graph that the
+    /// fixed-point analyzer will explore when re-analysing loop bodies.
+    ///
+    /// The analyzer uses fixed-point iteration to propagate widened types
+    /// along loop-carried dependency chains. A chain of length `N` can
+    /// require up to `N` extra passes for the type at the end of the chain
+    /// to fully stabilise, and each pass re-analyses the entire loop body.
+    /// On large, complex loops the per-pass cost dominates file analysis
+    /// time.
+    ///
+    /// The default of `1` means each loop body is re-analysed at most once
+    /// after the initial pass; enough to stabilise virtually all real-world
+    /// code while keeping analysis cost bounded. Projects that require
+    /// maximally precise narrowing of long loop-carried chains can raise
+    /// this value (typically to `2` or `3`) at the cost of significantly
+    /// slower analysis on complex files. Setting this to `0` disables
+    /// fixed-point iteration entirely.
+    ///
+    /// Defaults to `1`.
+    pub loop_assignment_depth_threshold: u8,
 }
 
 impl Default for PerformanceConfiguration {
@@ -350,6 +430,7 @@ impl Default for PerformanceConfiguration {
             string_combination_threshold: DEFAULT_STRING_COMBINATION_THRESHOLD,
             integer_combination_threshold: DEFAULT_INTEGER_COMBINATION_THRESHOLD,
             array_combination_threshold: DEFAULT_ARRAY_COMBINATION_THRESHOLD,
+            loop_assignment_depth_threshold: DEFAULT_LOOP_ASSIGNMENT_DEPTH_THRESHOLD,
         }
     }
 }
@@ -360,10 +441,20 @@ impl AnalyzerConfiguration {
         let check_missing_override = self.perform_heuristic_checks.unwrap_or(self.check_missing_override);
         let find_unused_parameters = self.perform_heuristic_checks.unwrap_or(self.find_unused_parameters);
 
+        if !self.allow_possibly_undefined_array_keys {
+            tracing::warn!(
+                "`allow-possibly-undefined-array-keys = false` is deprecated and will be removed in a future release. \
+                 Prefer `strict-array-index-existence = true`, which warns more thoroughly (lists, shapes, and \
+                 `array<K, V>`) and widens the result type to `T|null` so `=== null` and `??` checks reflect runtime \
+                 semantics."
+            );
+        }
+
         Settings {
             version: php_version,
             analyze_dead_code: self.analyze_dead_code,
             find_unused_definitions: self.find_unused_definitions,
+            find_overly_wide_return_types: self.find_overly_wide_return_types,
             find_unused_expressions: self.find_unused_expressions,
             memoize_properties: self.memoize_properties,
             allow_possibly_undefined_array_keys: self.allow_possibly_undefined_array_keys,
@@ -373,12 +464,15 @@ impl AnalyzerConfiguration {
             check_missing_override,
             find_unused_parameters,
             strict_list_index_checks: self.strict_list_index_checks,
+            strict_array_index_existence: self.strict_array_index_existence,
+            allow_array_truthy_operand: self.allow_array_truthy_operand,
             no_boolean_literal_comparison: self.no_boolean_literal_comparison,
             enforce_class_finality: self.enforce_class_finality,
             require_api_or_internal: self.require_api_or_internal,
             check_missing_type_hints: self.check_missing_type_hints,
             check_closure_missing_type_hints: self.check_closure_missing_type_hints,
             check_arrow_function_missing_type_hints: self.check_arrow_function_missing_type_hints,
+            allow_implicit_pipe_callable_types: self.allow_implicit_pipe_callable_types,
             register_super_globals: self.register_super_globals,
             use_colors: should_use_colors(color_choice),
             diff: enable_diff,
@@ -388,6 +482,7 @@ impl AnalyzerConfiguration {
             check_use_statements: self.check_use_statements,
             check_experimental: self.check_experimental,
             check_name_casing: self.check_name_casing,
+            allow_side_effects_in_conditions: self.allow_side_effects_in_conditions,
             saturation_complexity_threshold: self.performance.saturation_complexity_threshold,
             disjunction_complexity_threshold: self.performance.disjunction_complexity_threshold,
             negation_complexity_threshold: self.performance.negation_complexity_threshold,
@@ -396,6 +491,7 @@ impl AnalyzerConfiguration {
             string_combination_threshold: self.performance.string_combination_threshold,
             integer_combination_threshold: self.performance.integer_combination_threshold,
             array_combination_threshold: self.performance.array_combination_threshold,
+            loop_assignment_depth_threshold: self.performance.loop_assignment_depth_threshold,
         }
     }
 }
@@ -414,6 +510,7 @@ impl Default for AnalyzerConfiguration {
             minimum_fail_level: Level::Error,
             find_unused_expressions: defaults.find_unused_expressions,
             find_unused_definitions: defaults.find_unused_definitions,
+            find_overly_wide_return_types: defaults.find_overly_wide_return_types,
             analyze_dead_code: defaults.analyze_dead_code,
             memoize_properties: defaults.memoize_properties,
             allow_possibly_undefined_array_keys: defaults.allow_possibly_undefined_array_keys,
@@ -423,12 +520,15 @@ impl Default for AnalyzerConfiguration {
             check_missing_override: defaults.check_missing_override,
             find_unused_parameters: defaults.find_unused_parameters,
             strict_list_index_checks: defaults.strict_list_index_checks,
+            strict_array_index_existence: defaults.strict_array_index_existence,
+            allow_array_truthy_operand: defaults.allow_array_truthy_operand,
             no_boolean_literal_comparison: defaults.no_boolean_literal_comparison,
             enforce_class_finality: defaults.enforce_class_finality,
             require_api_or_internal: defaults.require_api_or_internal,
             check_missing_type_hints: defaults.check_missing_type_hints,
             check_closure_missing_type_hints: defaults.check_closure_missing_type_hints,
             check_arrow_function_missing_type_hints: defaults.check_arrow_function_missing_type_hints,
+            allow_implicit_pipe_callable_types: defaults.allow_implicit_pipe_callable_types,
             register_super_globals: defaults.register_super_globals,
             trust_existence_checks: defaults.trust_existence_checks,
             class_initializers: vec![],
@@ -436,6 +536,7 @@ impl Default for AnalyzerConfiguration {
             check_use_statements: defaults.check_use_statements,
             check_experimental: defaults.check_experimental,
             check_name_casing: defaults.check_name_casing,
+            allow_side_effects_in_conditions: defaults.allow_side_effects_in_conditions,
             perform_heuristic_checks: None,
             performance: PerformanceConfiguration::default(),
         }

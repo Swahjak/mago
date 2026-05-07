@@ -129,6 +129,13 @@ macro_rules! define_rules {
             }
 
             #[inline]
+            pub fn default_enabled(&self) -> bool {
+                match self {
+                    $( AnyRule::$variant(_) => <$rule as LintRule>::Config::default_enabled(), )*
+                }
+            }
+
+            #[inline]
             pub fn meta(&self) -> &'static RuleMeta {
                 match self {
                     $( AnyRule::$variant(_) => $rule::meta(), )*
@@ -193,6 +200,7 @@ define_rules! {
     ConstantName(constant_name @ ConstantNameRule),
     CyclomaticComplexity(cyclomatic_complexity @ CyclomaticComplexityRule),
     DisallowedFunctions(disallowed_functions @ DisallowedFunctionsRule),
+    DisallowedTypeInstantiation(disallowed_type_instantiation @ DisallowedTypeInstantiationRule),
     EnumName(enum_name @ EnumNameRule),
     ExcessiveNesting(excessive_nesting @ ExcessiveNestingRule),
     ExcessiveParameterList(excessive_parameter_list @ ExcessiveParameterListRule),
@@ -233,14 +241,21 @@ define_rules! {
     NoRedundantReadonly(no_redundant_readonly @ NoRedundantReadonlyRule),
     NoRedundantFile(no_redundant_file @ NoRedundantFileRule),
     NoRedundantContinue(no_redundant_continue @ NoRedundantContinueRule),
+    NoRedundantElse(no_redundant_else @ NoRedundantElseRule),
     NoRedundantBlock(no_redundant_block @ NoRedundantBlockRule),
     NoRedundantUse(no_redundant_use @ NoRedundantUseRule),
+    NoRedundantVariable(no_redundant_variable @ NoRedundantVariableRule),
+    NoDeadStore(no_dead_store @ NoDeadStoreRule),
+    NoUnusedStatic(no_unused_static @ NoUnusedStaticRule),
+    NoUnusedGlobal(no_unused_global @ NoUnusedGlobalRule),
+    NoUnusedClosureCapture(no_unused_closure_capture @ NoUnusedClosureCaptureRule),
     NoRedundantYieldFrom(no_redundant_yield_from @ NoRedundantYieldFromRule),
     NoSelfAssignment(no_self_assignment @ NoSelfAssignmentRule),
     NoProtectedInFinal(no_protected_in_final @ NoProtectedInFinalRule),
     NoPhpTagTerminator(no_php_tag_terminator @ NoPhpTagTerminatorRule),
     NoNoop(no_noop @ NoNoopRule),
     NoMultiAssignments(no_multi_assignments @ NoMultiAssignmentsRule),
+    NoNegatedTernary(no_negated_ternary @ NoNegatedTernaryRule),
     NoNestedTernary(no_nested_ternary @ NoNestedTernaryRule),
     NoHashEmoji(no_hash_emoji @ NoHashEmojiRule),
     NoHashComment(no_hash_comment @ NoHashCommentRule),
@@ -308,9 +323,11 @@ define_rules! {
     VariableName(variable_name @ VariableNameRule),
     ConstantCondition(constant_condition @ ConstantConditionRule),
     NoArrayAccumulationInLoop(no_array_accumulation_in_loop @ NoArrayAccumulationInLoopRule),
+    PreferArraySpread(prefer_array_spread @ PreferArraySpreadRule),
     NoIniSet(no_ini_set @ NoIniSetRule),
     NoParameterShadowing(no_parameter_shadowing @ NoParameterShadowingRule),
     NoInline(no_inline @ NoInlineRule),
+    NoSideEffectsWithDeclarations(no_side_effects_with_declarations @ NoSideEffectsWithDeclarationsRule),
     NoInsecureComparison(no_insecure_comparison @ NoInsecureComparisonRule),
     NoLiteralPassword(no_literal_password @ NoLiteralPasswordRule),
     TaintedDataToSink(tainted_data_to_sink @ TaintedDataToSinkRule),
@@ -320,11 +337,13 @@ define_rules! {
     StrictAssertions(strict_assertions @ StrictAssertionsRule),
     UseSpecificAssertions(use_specific_assertions @ UseSpecificAssertionsRule),
     NoRequestAll(no_request_all @ NoRequestAllRule),
+    NoServiceStateMutation(no_service_state_mutation @ NoServiceStateMutationRule),
     MiddlewareInRoutes(middleware_in_routes @ MiddlewareInRoutesRule),
     UseCompoundAssignment(use_compound_assignment @ UseCompoundAssignmentRule),
     RequirePregQuoteDelimiter(require_preg_quote_delimiter @ RequirePregQuoteDelimiterRule),
     RequireNamespace(require_namespace @ RequireNamespaceRule),
     SortedIntegerKeys(sorted_integer_keys @ SortedIntegerKeysRule),
+    StringStyle(string_style @ StringStyleRule),
     SingleClassPerFile(single_class_per_file @ SingleClassPerFileRule),
     YodaConditions(yoda_conditions @ YodaConditionsRule),
     UseWpFunctions(use_wp_functions @ UseWpFunctionsRule),
@@ -332,8 +351,13 @@ define_rules! {
     NoDbSchemaChange(no_db_schema_change @ NoDbSchemaChangeRule),
     NoUnescapedOutput(no_unescaped_output @ NoUnescapedOutputRule),
     NoRolesAsCapabilities(no_roles_as_capabilities @ NoRolesAsCapabilitiesRule),
+    NoLiteralNamespaceString(no_literal_namespace_string @ NoLiteralNamespaceStringRule),
     NoShortBoolCast(no_short_bool_cast @ NoShortBoolCastRule),
     NoAlternativeSyntax(no_alternative_syntax @ NoAlternativeSyntaxRule),
     PreferPreIncrement(prefer_pre_increment @ PreferPreIncrementRule),
+    PreferSelfReturnType(prefer_self_return_type @ PreferSelfReturnTypeRule),
     SwitchContinueToBreak(switch_continue_to_break @ SwitchContinueToBreakRule),
+    MissingDocs(missing_docs @ MissingDocsRule),
+    NoNullPropertyInit(no_null_property_init @ NoNullPropertyInitRule),
+    PreferExplodeOverPregSplit(prefer_explode_over_preg_split @ PreferExplodeOverPregSplitRule),
 }

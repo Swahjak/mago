@@ -1,3 +1,12 @@
+#![allow(clippy::needless_raw_strings)]
+#![allow(clippy::needless_raw_string_hashes)]
+#![allow(clippy::wildcard_imports)]
+#![allow(clippy::exhaustive_enums)]
+#![allow(clippy::float_arithmetic)]
+#![allow(clippy::pub_use)]
+#![allow(clippy::else_if_without_else)]
+#![allow(clippy::match_wildcard_for_single_variants)]
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -19,6 +28,7 @@ use crate::settings::Settings;
 
 pub mod category;
 pub mod context;
+pub mod import_tracker;
 pub mod integration;
 pub mod registry;
 pub mod requirements;
@@ -92,8 +102,8 @@ impl<'arena> Linter<'arena> {
             .iter()
             .enumerate()
             .filter(|(idx, _)| {
-                let excludes = self.registry.excludes_for(*idx);
-                !excludes.is_empty() && is_file_excluded(file_name, excludes)
+                let matcher = self.registry.excludes_for(*idx);
+                !matcher.is_empty() && matcher.is_match(file_name)
             })
             .map(|(idx, _)| idx)
             .collect();
@@ -107,17 +117,6 @@ impl<'arena> Linter<'arena> {
     }
 }
 
-fn is_file_excluded(file_name: &str, patterns: &[String]) -> bool {
-    patterns.iter().any(|pattern| {
-        if pattern.ends_with('/') {
-            file_name.starts_with(pattern.as_str())
-        } else {
-            let dir_prefix = format!("{pattern}/");
-            file_name.starts_with(&dir_prefix) || file_name == pattern
-        }
-    })
-}
-
 fn is_constant_expression_context(kind: NodeKind) -> bool {
     matches!(
         kind,
@@ -129,40 +128,60 @@ fn is_constant_expression_context(kind: NodeKind) -> bool {
     )
 }
 
-fn walk<'arena>(node: Node<'_, 'arena>, ctx: &mut LintContext<'_, 'arena>, excluded_rules: &HashSet<usize>) {
-    let mut in_scope = false;
-    if let Some(scope) = Scope::for_node(ctx, node) {
-        ctx.scope.push(scope);
-
-        in_scope = true;
+fn walk<'ctx, 'arena>(root: Node<'ctx, 'arena>, ctx: &mut LintContext<'ctx, 'arena>, excluded_rules: &HashSet<usize>) {
+    enum Op<'ctx, 'arena> {
+        Enter(Node<'ctx, 'arena>),
+        Exit { in_scope: bool, in_constant_expression: bool },
     }
 
-    let in_constant_expression = is_constant_expression_context(node.kind());
-    if in_constant_expression {
-        ctx.constant_expression_depth += 1;
-    }
+    let mut stack = vec![Op::Enter(root)];
 
-    let rules_to_run = ctx.registry.for_kind(node.kind());
+    while let Some(op) = stack.pop() {
+        match op {
+            Op::Enter(node) => {
+                ctx.push_ancestor(node);
 
-    for &rule_index in rules_to_run {
-        if excluded_rules.contains(&rule_index) {
-            continue;
+                let in_scope = if let Some(scope) = Scope::for_node(ctx, node) {
+                    ctx.scope.push(scope);
+                    true
+                } else {
+                    false
+                };
+
+                let in_constant_expression = is_constant_expression_context(node.kind());
+                if in_constant_expression {
+                    ctx.constant_expression_depth += 1;
+                }
+
+                let rules_to_run = ctx.registry.for_kind(node.kind());
+                for &rule_index in rules_to_run {
+                    if excluded_rules.contains(&rule_index) {
+                        continue;
+                    }
+
+                    let rule = ctx.registry.rule(rule_index);
+                    rule.check(ctx, node);
+                }
+
+                // Push exit before children so teardown happens after all descendants.
+                stack.push(Op::Exit { in_scope, in_constant_expression });
+
+                // Push children in reverse so they are processed left-to-right.
+                let start = stack.len();
+                node.visit_children(|child| stack.push(Op::Enter(child)));
+                stack[start..].reverse();
+            }
+            Op::Exit { in_scope, in_constant_expression } => {
+                if in_constant_expression {
+                    ctx.constant_expression_depth -= 1;
+                }
+
+                if in_scope {
+                    ctx.scope.pop();
+                }
+
+                ctx.pop_ancestor();
+            }
         }
-
-        let rule = ctx.registry.rule(rule_index);
-
-        rule.check(ctx, node);
-    }
-
-    for child in node.children() {
-        walk(child, ctx, excluded_rules);
-    }
-
-    if in_constant_expression {
-        ctx.constant_expression_depth -= 1;
-    }
-
-    if in_scope {
-        ctx.scope.pop();
     }
 }

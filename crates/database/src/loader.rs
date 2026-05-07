@@ -4,12 +4,11 @@ use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::ffi::OsString;
 use std::path::Path;
+use std::path::PathBuf;
 
 use foldhash::HashMap;
 use foldhash::HashSet;
-use globset::GlobBuilder;
 use globset::GlobSet;
-use globset::GlobSetBuilder;
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
@@ -20,6 +19,7 @@ use crate::exclusion::Exclusion;
 use crate::file::File;
 use crate::file::FileId;
 use crate::file::FileType;
+use crate::matcher::build_glob_set;
 use crate::utils::read_file;
 
 /// Holds a file along with the specificity of the pattern that matched it.
@@ -34,35 +34,37 @@ struct FileWithSpecificity {
 }
 
 /// Builder for loading files into a Database from the filesystem and memory.
-pub struct DatabaseLoader<'a> {
-    database: Option<Database<'a>>,
-    configuration: DatabaseConfiguration<'a>,
+pub struct DatabaseLoader<'config> {
+    database: Option<Database<'config>>,
+    configuration: DatabaseConfiguration<'config>,
     memory_sources: Vec<(&'static str, &'static str, FileType)>,
-    /// When set, content for this file (by logical name) is taken from here instead of disk.
-    /// Used for editor integrations: read content from stdin but use the given path for baseline and reporting.
-    stdin_override: Option<(Cow<'a, str>, String)>,
+    stdin_override: Option<(Cow<'config, str>, String)>,
 }
 
-impl<'a> DatabaseLoader<'a> {
+impl<'config> DatabaseLoader<'config> {
+    #[inline]
     #[must_use]
-    pub fn new(configuration: DatabaseConfiguration<'a>) -> Self {
+    pub fn new(configuration: DatabaseConfiguration<'config>) -> Self {
         Self { configuration, memory_sources: vec![], database: None, stdin_override: None }
     }
 
+    #[inline]
     #[must_use]
-    pub fn with_database(mut self, database: Database<'a>) -> Self {
+    pub fn with_database(mut self, database: Database<'config>) -> Self {
         self.database = Some(database);
         self
     }
 
     /// When set, the file with this logical name (workspace-relative path) will use the given
     /// content instead of being read from disk. The logical name is used for baseline and reporting.
+    #[inline]
     #[must_use]
-    pub fn with_stdin_override(mut self, logical_name: impl Into<Cow<'a, str>>, content: String) -> Self {
+    pub fn with_stdin_override(mut self, logical_name: impl Into<Cow<'config, str>>, content: String) -> Self {
         self.stdin_override = Some((logical_name.into(), content));
         self
     }
 
+    #[inline]
     pub fn add_memory_source(&mut self, name: &'static str, contents: &'static str, file_type: FileType) {
         self.memory_sources.push((name, contents, file_type));
     }
@@ -75,7 +77,8 @@ impl<'a> DatabaseLoader<'a> {
     /// - A glob pattern is invalid
     /// - File system operations fail (reading directories, files)
     /// - File content cannot be read as valid UTF-8
-    pub fn load(mut self) -> Result<Database<'a>, DatabaseError> {
+    #[inline]
+    pub fn load(mut self) -> Result<Database<'config>, DatabaseError> {
         let mut db = self.database.take().unwrap_or_else(|| Database::new(self.configuration.clone()));
 
         // Update database configuration to use the loader's configuration
@@ -85,22 +88,30 @@ impl<'a> DatabaseLoader<'a> {
         let extensions_set: HashSet<OsString> =
             self.configuration.extensions.iter().map(|s| OsString::from(s.as_ref())).collect();
 
-        let glob_settings = &self.configuration.glob;
-        let mut glob_builder = GlobSetBuilder::new();
-        for ex in &self.configuration.excludes {
-            if let Exclusion::Pattern(pat) = ex {
-                let glob = GlobBuilder::new(pat)
-                    .case_insensitive(glob_settings.case_insensitive)
-                    .literal_separator(glob_settings.literal_separator)
-                    .backslash_escape(glob_settings.backslash_escape)
-                    .empty_alternates(glob_settings.empty_alternates)
-                    .build()?;
+        let glob_exclude_patterns: Vec<&str> = self
+            .configuration
+            .excludes
+            .iter()
+            .filter_map(|ex| match ex {
+                Exclusion::Pattern(pat) => Some(pat.as_ref()),
+                Exclusion::Path(_) => None,
+            })
+            .collect();
 
-                glob_builder.add(glob);
-            }
-        }
+        let glob_excludes = build_glob_set(glob_exclude_patterns.iter().copied(), self.configuration.glob)?;
+        let dir_prune_patterns: Vec<&str> = glob_exclude_patterns
+            .iter()
+            .filter_map(|pat| {
+                let stripped =
+                    pat.strip_suffix("/**/*").or_else(|| pat.strip_suffix("/**")).or_else(|| pat.strip_suffix("/*"))?;
+                if stripped.is_empty() || stripped == "*" || stripped == "**" {
+                    return None;
+                }
+                Some(stripped)
+            })
+            .collect();
 
-        let glob_excludes = glob_builder.build()?;
+        let dir_prune_globs = build_glob_set(dir_prune_patterns.iter().copied(), self.configuration.glob)?;
 
         let path_excludes: HashSet<_> = self
             .configuration
@@ -108,7 +119,7 @@ impl<'a> DatabaseLoader<'a> {
             .iter()
             .filter_map(|ex| match ex {
                 Exclusion::Path(p) => Some(p),
-                _ => None,
+                Exclusion::Pattern(_) => None,
             })
             .collect();
 
@@ -117,13 +128,16 @@ impl<'a> DatabaseLoader<'a> {
             FileType::Host,
             &extensions_set,
             &glob_excludes,
+            &dir_prune_globs,
             &path_excludes,
         )?;
+
         let vendored_files_with_spec = self.load_paths(
             &self.configuration.includes,
             FileType::Vendored,
             &extensions_set,
             &glob_excludes,
+            &dir_prune_globs,
             &path_excludes,
         )?;
 
@@ -140,14 +154,38 @@ impl<'a> DatabaseLoader<'a> {
         }
 
         // When stdin override is set, ensure that the file is in the database
-        // (covers new/unsaved files, not on disk)
-        if let Some((ref name, ref content)) = self.stdin_override {
-            let file = File::ephemeral(Cow::Owned(name.as_ref().to_string()), Cow::Owned(content.clone()));
-            let file_id = file.id;
-            if let Entry::Vacant(e) = all_files.entry(file_id) {
-                e.insert(file);
+        // (covers new/unsaved files, not on disk). Excluded paths are skipped
+        // so that editor integrations using `--stdin-input` honor the same
+        // exclude rules as a regular filesystem scan.
+        if let Some((name, content)) = &self.stdin_override {
+            let virtual_path = self.configuration.workspace.join(name.as_ref());
+            let virtual_path_canonical = virtual_path.canonicalize().unwrap_or_else(|_| virtual_path.clone());
+            let virtual_path_str = virtual_path_canonical.to_string_lossy();
 
-                file_decisions.insert(file_id, (FileType::Host, usize::MAX));
+            let matched_glob = !glob_excludes.is_empty()
+                && (glob_excludes.is_match(virtual_path_canonical.as_path()) || glob_excludes.is_match(name.as_ref()));
+
+            let matched_path = path_excludes.iter().any(|excl| {
+                let canonical = if Path::new(excl.as_ref()).is_absolute() {
+                    excl.as_ref().to_path_buf()
+                } else {
+                    self.configuration.workspace.join(excl.as_ref())
+                };
+                let canonical = canonical.canonicalize().unwrap_or(canonical);
+                let canonical_str = canonical.to_string_lossy();
+
+                virtual_path_str.starts_with(canonical_str.as_ref())
+                    && matches!(virtual_path_str.as_bytes().get(canonical_str.len()), None | Some(&b'/' | &b'\\'))
+            });
+
+            if !matched_glob && !matched_path {
+                let file = File::ephemeral(Cow::Owned(name.as_ref().to_string()), Cow::Owned(content.clone()));
+                let file_id = file.id;
+                if let Entry::Vacant(e) = all_files.entry(file_id) {
+                    e.insert(file);
+
+                    file_decisions.insert(file_id, (FileType::Host, usize::MAX));
+                }
             }
         }
 
@@ -166,6 +204,8 @@ impl<'a> DatabaseLoader<'a> {
                 }
             }
         }
+
+        db.reserve(file_decisions.len() + self.memory_sources.len());
 
         for (file_id, (final_type, _)) in file_decisions {
             if let Some(mut file) = all_files.remove(&file_id) {
@@ -192,13 +232,49 @@ impl<'a> DatabaseLoader<'a> {
     /// Returns files along with their pattern specificity for conflict resolution.
     fn load_paths(
         &self,
-        roots: &[Cow<'a, str>],
+        roots: &[Cow<'config, str>],
         file_type: FileType,
         extensions: &HashSet<OsString>,
         glob_excludes: &GlobSet,
-        path_excludes: &HashSet<&Cow<'a, Path>>,
+        dir_prune_globs: &GlobSet,
+        path_excludes: &HashSet<&Cow<'config, Path>>,
     ) -> Result<Vec<FileWithSpecificity>, DatabaseError> {
-        let mut paths_to_process: Vec<(std::path::PathBuf, usize)> = Vec::new();
+        // Canonicalize the workspace once.  All WalkDir roots are canonicalized
+        // before traversal so their paths inherit the canonical prefix without
+        // any per-file syscalls.
+        let canonical_workspace =
+            self.configuration.workspace.canonicalize().unwrap_or_else(|_| self.configuration.workspace.to_path_buf());
+
+        // Pre-canonicalize path excludes once as strings.  A plain byte-string
+        // prefix check is then sufficient in the parallel section, replacing the
+        // per-file canonicalize() + Path::starts_with (Components iteration).
+        let canonical_excludes: Vec<String> = path_excludes
+            .iter()
+            .filter_map(|ex| {
+                let p = if Path::new(ex.as_ref()).is_absolute() {
+                    ex.as_ref().to_path_buf()
+                } else {
+                    self.configuration.workspace.join(ex.as_ref())
+                };
+
+                p.canonicalize().ok()?.into_os_string().into_string().ok()
+            })
+            .collect();
+
+        let workspace_relative_str = |path: &Path| -> String {
+            let rel = path.strip_prefix(canonical_workspace.as_path()).unwrap_or(path);
+            let s = rel.to_string_lossy();
+            #[cfg(windows)]
+            {
+                s.replace('\\', "/")
+            }
+            #[cfg(not(windows))]
+            {
+                s.into_owned()
+            }
+        };
+
+        let mut paths_to_process: Vec<(PathBuf, usize)> = Vec::new();
 
         for root in roots {
             // Check if this is a glob pattern (contains glob metacharacters).
@@ -229,7 +305,12 @@ impl<'a> DatabaseLoader<'a> {
                             match entry {
                                 Ok(path) => {
                                     if path.is_file() {
-                                        paths_to_process.push((path, specificity));
+                                        // Canonicalize so the path shares the same prefix as
+                                        // `canonical_workspace` (important on macOS where
+                                        // TempDir / glob return /var/… but canonicalize gives
+                                        // /private/var/…).  Fall back to the original on error.
+                                        let canonical = path.canonicalize().unwrap_or(path);
+                                        paths_to_process.push((canonical, specificity));
                                     }
                                 }
                                 Err(e) => {
@@ -243,19 +324,54 @@ impl<'a> DatabaseLoader<'a> {
                     }
                 }
             } else {
-                for entry in WalkDir::new(&resolved_path).into_iter().filter_map(Result::ok) {
-                    if entry.file_type().is_file() {
+                let canonical_root = resolved_path.canonicalize().unwrap_or(resolved_path);
+                let has_dir_prunes = !dir_prune_globs.is_empty();
+                let has_path_prunes = !canonical_excludes.is_empty();
+                let walker = WalkDir::new(&canonical_root).into_iter().filter_entry(|entry| {
+                    if entry.depth() == 0 || !entry.file_type().is_dir() {
+                        return true;
+                    }
+
+                    let path = entry.path();
+
+                    if has_path_prunes
+                        && let Some(p) = path.to_str()
+                        && canonical_excludes.iter().any(|excl| {
+                            p.starts_with(excl.as_str())
+                                && matches!(p.as_bytes().get(excl.len()), None | Some(&b'/' | &b'\\'))
+                        })
+                    {
+                        return false;
+                    }
+
+                    if has_dir_prunes
+                        && (dir_prune_globs.is_match(path) || dir_prune_globs.is_match(workspace_relative_str(path)))
+                    {
+                        return false;
+                    }
+
+                    true
+                });
+
+                for entry in walker.filter_map(Result::ok) {
+                    let file_type = entry.file_type();
+                    #[allow(clippy::filetype_is_file)]
+                    let include = file_type.is_file() || file_type.is_symlink();
+                    if include {
                         paths_to_process.push((entry.into_path(), specificity));
                     }
                 }
             }
         }
 
-        let has_path_excludes = !path_excludes.is_empty();
+        let has_path_excludes = !canonical_excludes.is_empty();
+        let has_glob_excludes = !glob_excludes.is_empty();
         let files: Vec<FileWithSpecificity> = paths_to_process
             .into_par_iter()
             .filter_map(|(path, specificity)| {
-                if glob_excludes.is_match(&path) {
+                if has_glob_excludes
+                    && (glob_excludes.is_match(&path) || glob_excludes.is_match(workspace_relative_str(&path)))
+                {
                     return None;
                 }
 
@@ -264,25 +380,28 @@ impl<'a> DatabaseLoader<'a> {
                     return None;
                 }
 
-                if has_path_excludes
-                    && let Ok(canonical_path) = path.canonicalize()
-                    && path_excludes.iter().any(|excluded| canonical_path.starts_with(excluded))
-                {
-                    return None;
+                if has_path_excludes {
+                    let excluded = path.to_str().is_some_and(|s| {
+                        canonical_excludes.iter().any(|excl| {
+                            s.starts_with(excl.as_str())
+                                && matches!(s.as_bytes().get(excl.len()), None | Some(&b'/' | &b'\\'))
+                        })
+                    });
+
+                    if excluded {
+                        return None;
+                    }
                 }
 
-                let workspace = self.configuration.workspace.as_ref();
+                let workspace = canonical_workspace.as_path();
                 #[cfg(windows)]
-                let logical_name = path
-                    .strip_prefix(workspace)
-                    .unwrap_or_else(|_| path.as_path())
-                    .to_string_lossy()
-                    .replace('\\', "/");
+                let logical_name =
+                    path.strip_prefix(workspace).unwrap_or(path.as_path()).to_string_lossy().replace('\\', "/");
                 #[cfg(not(windows))]
                 let logical_name =
                     path.strip_prefix(workspace).unwrap_or(path.as_path()).to_string_lossy().into_owned();
 
-                if let Some((ref override_name, ref override_content)) = self.stdin_override
+                if let Some((override_name, override_content)) = &self.stdin_override
                     && override_name.as_ref() == logical_name
                 {
                     let file = File::new(
@@ -327,7 +446,10 @@ impl<'a> DatabaseLoader<'a> {
                 })
                 .count();
             non_wildcard_components * 10
-        } else if pattern_path.is_file() || pattern_path.extension().is_some() || pattern.ends_with(".php") {
+        } else if pattern_path.is_file()
+            || pattern_path.extension().is_some()
+            || pattern.rsplit('.').next().is_some_and(|ext| ext.eq_ignore_ascii_case("php"))
+        {
             component_count * 1000
         } else {
             component_count * 100
@@ -336,6 +458,7 @@ impl<'a> DatabaseLoader<'a> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::DatabaseReader;
@@ -521,9 +644,78 @@ mod tests {
     }
 
     #[test]
+    fn test_glob_excludes_match_workspace_relative_paths() {
+        let temp_dir = TempDir::new().unwrap();
+
+        create_test_file(&temp_dir, "src/Absences/Foo/Foo.php", "<?php");
+        create_test_file(&temp_dir, "src/Absences/Test/Faker/Provider/AbsencesProvider.php", "<?php");
+        create_test_file(&temp_dir, "src/Calendar/Test/Helper.php", "<?php");
+
+        let mut config = create_test_config(&temp_dir, vec!["src"], vec![]);
+        config.excludes = vec![Exclusion::Pattern(Cow::Borrowed("src/*/Test/**"))];
+
+        let loader = DatabaseLoader::new(config);
+        let db = loader.load().unwrap();
+
+        let names: Vec<String> = db.files().map(|f| f.name.to_string()).collect();
+        assert!(names.iter().any(|n| n.ends_with("src/Absences/Foo/Foo.php")), "non-Test file should be loaded");
+        assert!(
+            !names.iter().any(|n| n.contains("src/Absences/Test/")),
+            "files under src/*/Test/** should be excluded, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("src/Calendar/Test/")),
+            "files under src/*/Test/** should be excluded, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_glob_excludes_match_legacy_absolute_prefix_patterns() {
+        let temp_dir = TempDir::new().unwrap();
+
+        create_test_file(&temp_dir, "packages/foo/src/main.php", "<?php");
+        create_test_file(&temp_dir, "packages/foo/vendor/lib.php", "<?php");
+
+        let mut config = create_test_config(&temp_dir, vec!["packages"], vec![]);
+        config.excludes = vec![Exclusion::Pattern(Cow::Borrowed("*/packages/**/vendor/*"))];
+
+        let loader = DatabaseLoader::new(config);
+        let db = loader.load().unwrap();
+
+        let names: Vec<String> = db.files().map(|f| f.name.to_string()).collect();
+        assert!(names.iter().any(|n| n.ends_with("packages/foo/src/main.php")));
+        assert!(
+            !names.iter().any(|n| n.contains("/vendor/")),
+            "legacy `*/packages/**/vendor/*` style should still exclude vendor files, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_glob_dir_prune_skips_relative_directories() {
+        let temp_dir = TempDir::new().unwrap();
+
+        create_test_file(&temp_dir, "vendor/slevomat/coding-standard/main.php", "<?php");
+        create_test_file(&temp_dir, "vendor/slevomat/coding-standard/tests/Sniffs/Foo.php", "<?php");
+        create_test_file(&temp_dir, "vendor/another/lib.php", "<?php");
+
+        let mut config = create_test_config(&temp_dir, vec![], vec!["vendor"]);
+        config.excludes = vec![Exclusion::Pattern(Cow::Borrowed("vendor/**/tests/**"))];
+
+        let loader = DatabaseLoader::new(config);
+        let db = loader.load().unwrap();
+
+        let names: Vec<String> = db.files().map(|f| f.name.to_string()).collect();
+        assert!(names.iter().any(|n| n.ends_with("vendor/slevomat/coding-standard/main.php")));
+        assert!(names.iter().any(|n| n.ends_with("vendor/another/lib.php")));
+        assert!(
+            !names.iter().any(|n| n.contains("/tests/")),
+            "files under vendor/**/tests/** should be pruned, got {names:?}"
+        );
+    }
+
+    #[test]
     fn test_stdin_override_adds_file_when_not_on_disk() {
         let temp_dir = TempDir::new().unwrap();
-        // Do not create src/foo.php on disk
         create_test_file(&temp_dir, "src/.gitkeep", "");
 
         let config = create_test_config(&temp_dir, vec!["src/"], vec![]);

@@ -1,3 +1,5 @@
+#![allow(clippy::pub_use, clippy::exhaustive_enums)]
+
 //! Issue reporting and formatting for Mago.
 //!
 //! This crate provides functionality for reporting code issues identified by the linter and analyzer.
@@ -22,20 +24,26 @@ use serde::Serialize;
 use strum::Display;
 use strum::VariantNames;
 
+use mago_database::GlobSettings;
 use mago_database::file::FileId;
+use mago_database::matcher::ExclusionMatcher;
 use mago_span::Span;
 use mago_text_edit::TextEdit;
 
 /// Represents an entry in the analyzer's `ignore` configuration.
 ///
 /// Can be either a plain code string (ignored everywhere) or a scoped entry
-/// that only ignores a code in specific paths.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+/// that only ignores a code in specific paths. Scoped paths accept both
+/// plain directory/file prefixes (e.g. `"tests/"`, `"src/Legacy.php"`) and
+/// glob patterns (e.g. `"src/**/*.php"`); entries
+/// containing any of `*`, `?`, `[`, `{` are matched with [`ExclusionMatcher`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum IgnoreEntry {
     /// Ignore a code everywhere: `"code1"`
     Code(String),
-    /// Ignore a code in specific paths: `{ code = "code2", in = "path/" }`
+    /// Ignore a code in specific paths or glob patterns:
+    /// `{ code = "code2", in = ["tests/", "src/**/*.php"] }`
     Scoped {
         code: String,
         #[serde(rename = "in", deserialize_with = "one_or_many")]
@@ -590,7 +598,7 @@ impl IssueCollection {
         self.issues.iter().map(|issue| issue.level).min()
     }
 
-    pub fn filter_out_ignored<F>(&mut self, ignore: &[IgnoreEntry], resolve_file_name: F)
+    pub fn filter_out_ignored<F>(&mut self, ignore: &[IgnoreEntry], glob: GlobSettings, resolve_file_name: F)
     where
         F: Fn(FileId) -> Option<String>,
     {
@@ -598,19 +606,48 @@ impl IssueCollection {
             return;
         }
 
+        enum CompiledEntry<'entry> {
+            Code(&'entry str),
+            Scoped { code: &'entry str, matcher: ExclusionMatcher<&'entry str> },
+        }
+
+        let compiled: Vec<CompiledEntry<'_>> = ignore
+            .iter()
+            .filter_map(|entry| match entry {
+                IgnoreEntry::Code(code) => Some(CompiledEntry::Code(code.as_str())),
+                IgnoreEntry::Scoped { code, paths } => {
+                    match ExclusionMatcher::compile(paths.iter().map(String::as_str), glob) {
+                        Ok(matcher) => Some(CompiledEntry::Scoped { code: code.as_str(), matcher }),
+                        Err(err) => {
+                            tracing::error!(
+                                "Failed to compile ignore patterns for `{code}`: {err}. Entry will be skipped."
+                            );
+                            None
+                        }
+                    }
+                }
+            })
+            .collect();
+
         self.issues.retain(|issue| {
             let Some(code) = &issue.code else {
                 return true;
             };
 
-            for entry in ignore {
+            let mut cached_path: Option<Option<String>> = None;
+
+            for entry in &compiled {
                 match entry {
-                    IgnoreEntry::Code(ignored) if ignored == code => return false,
-                    IgnoreEntry::Scoped { code: ignored, paths } if ignored == code => {
-                        let file_name = issue.primary_span().and_then(|span| resolve_file_name(span.file_id));
+                    CompiledEntry::Code(ignored_code) if *ignored_code == code => return false,
+                    CompiledEntry::Scoped { code: ignored_code, matcher } if *ignored_code == code => {
+                        let file_name = cached_path
+                            .get_or_insert_with(|| {
+                                issue.primary_span().and_then(|span| resolve_file_name(span.file_id))
+                            })
+                            .as_deref();
 
                         if let Some(name) = file_name
-                            && is_path_match(&name, paths)
+                            && matcher.is_match(name)
                         {
                             return false;
                         }
@@ -703,10 +740,10 @@ impl IntoIterator for IssueCollection {
     }
 }
 
-impl<'a> IntoIterator for &'a IssueCollection {
-    type Item = &'a Issue;
+impl<'collection> IntoIterator for &'collection IssueCollection {
+    type Item = &'collection Issue;
 
-    type IntoIter = std::slice::Iter<'a, Issue>;
+    type IntoIter = std::slice::Iter<'collection, Issue>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.issues.iter()
@@ -732,17 +769,6 @@ impl FromIterator<Issue> for IssueCollection {
     fn from_iter<T: IntoIterator<Item = Issue>>(iter: T) -> Self {
         Self { issues: iter.into_iter().collect() }
     }
-}
-
-fn is_path_match(file_name: &str, patterns: &[String]) -> bool {
-    patterns.iter().any(|pattern| {
-        if pattern.ends_with('/') {
-            file_name.starts_with(pattern.as_str())
-        } else {
-            let dir_prefix = format!("{pattern}/");
-            file_name.starts_with(&dir_prefix) || file_name == pattern
-        }
-    })
 }
 
 #[cfg(test)]
@@ -885,13 +911,107 @@ mod tests {
     #[test]
     pub fn test_primary_span_is_deterministic() {
         let file = FileId::zero();
-        let span_later = Span::new(file, 20_u32.into(), 25_u32.into());
-        let span_earlier = Span::new(file, 5_u32.into(), 10_u32.into());
+        let span_later = Span::new(file, 20u32.into(), 25u32.into());
+        let span_earlier = Span::new(file, 5u32.into(), 10u32.into());
 
         let issue = Issue::error("x")
             .with_annotation(Annotation::primary(span_later))
             .with_annotation(Annotation::primary(span_earlier));
 
         assert_eq!(issue.primary_span(), Some(span_earlier));
+    }
+
+    fn ignore_fixture() -> (IssueCollection, std::collections::HashMap<FileId, &'static str>) {
+        let file_id = |name: &str| FileId::new(name);
+
+        let paths = ["src/App.php", "tests/Unit/FooTest.php", "modules/auth/views/login.tpl", "types/user/form.tpl"];
+
+        let mut mapping = std::collections::HashMap::new();
+        let issues: Vec<Issue> = paths
+            .iter()
+            .map(|p| {
+                let id = file_id(p);
+                mapping.insert(id, *p);
+                Issue::error("oops").with_code("invalid-global").with_annotation(Annotation::primary(Span::new(
+                    id,
+                    0u32.into(),
+                    1u32.into(),
+                )))
+            })
+            .collect();
+
+        (IssueCollection::from(issues), mapping)
+    }
+
+    #[test]
+    pub fn test_filter_out_ignored_with_plain_prefix() {
+        let (mut collection, mapping) = ignore_fixture();
+        let ignore =
+            vec![IgnoreEntry::Scoped { code: "invalid-global".to_string(), paths: vec!["tests/".to_string()] }];
+
+        collection.filter_out_ignored(&ignore, GlobSettings::default(), |id| mapping.get(&id).map(|s| s.to_string()));
+
+        let remaining: Vec<String> = collection
+            .iter()
+            .filter_map(|issue| issue.primary_span().and_then(|s| mapping.get(&s.file_id)).copied())
+            .map(String::from)
+            .collect();
+
+        assert_eq!(
+            remaining,
+            vec![
+                "src/App.php".to_string(),
+                "modules/auth/views/login.tpl".to_string(),
+                "types/user/form.tpl".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    pub fn test_filter_out_ignored_with_glob_pattern() {
+        let (mut collection, mapping) = ignore_fixture();
+        let ignore = vec![IgnoreEntry::Scoped {
+            code: "invalid-global".to_string(),
+            paths: vec!["modules/*/*/*.tpl".to_string(), "types/*/*.tpl".to_string()],
+        }];
+
+        collection.filter_out_ignored(&ignore, GlobSettings::default(), |id| mapping.get(&id).map(|s| s.to_string()));
+
+        let remaining: Vec<String> = collection
+            .iter()
+            .filter_map(|issue| issue.primary_span().and_then(|s| mapping.get(&s.file_id)).copied())
+            .map(String::from)
+            .collect();
+
+        assert_eq!(remaining, vec!["src/App.php".to_string(), "tests/Unit/FooTest.php".to_string(),]);
+    }
+
+    #[test]
+    pub fn test_filter_out_ignored_mixes_plain_and_glob() {
+        let (mut collection, mapping) = ignore_fixture();
+        let ignore = vec![IgnoreEntry::Scoped {
+            code: "invalid-global".to_string(),
+            paths: vec!["tests/".to_string(), "modules/*/*/*.tpl".to_string(), "types/*/*.tpl".to_string()],
+        }];
+
+        collection.filter_out_ignored(&ignore, GlobSettings::default(), |id| mapping.get(&id).map(|s| s.to_string()));
+
+        let remaining: Vec<String> = collection
+            .iter()
+            .filter_map(|issue| issue.primary_span().and_then(|s| mapping.get(&s.file_id)).copied())
+            .map(String::from)
+            .collect();
+
+        assert_eq!(remaining, vec!["src/App.php".to_string()]);
+    }
+
+    #[test]
+    pub fn test_filter_out_ignored_respects_code_scope() {
+        let (mut collection, mapping) = ignore_fixture();
+        let ignore = vec![IgnoreEntry::Scoped { code: "different-code".to_string(), paths: vec!["**/*".to_string()] }];
+
+        collection.filter_out_ignored(&ignore, GlobSettings::default(), |id| mapping.get(&id).map(|s| s.to_string()));
+
+        assert_eq!(collection.len(), 4);
     }
 }

@@ -43,7 +43,9 @@ fn should_inherit_docblock_type(
     has_explicit_inheritdoc: bool,
     codebase: &CodebaseMetadata,
 ) -> bool {
-    if child_docblock.is_some() {
+    // Allow re-inheritance when the existing child type was itself inherited (not user-written).
+    // Inherited types are marked `inferred: true`; user-written docblock types are `inferred: false`.
+    if child_docblock.is_some_and(|m| !m.inferred) {
         return false;
     }
 
@@ -332,7 +334,7 @@ fn apply_inheritance_work(codebase: &mut CodebaseMetadata, mut inheritance_work:
 
         let substituted_return_type = if let Some(parent_return) = parent_return_type.as_ref() {
             let mut return_type = parent_return.type_union.clone();
-            if let Some(ref template_result) = template_result {
+            if let Some(template_result) = template_result.as_ref() {
                 return_type = inferred_type_replacer::replace(&return_type, template_result, codebase);
             }
             Some((return_type, parent_return.span, parent_return.from_docblock))
@@ -345,7 +347,7 @@ fn apply_inheritance_work(codebase: &mut CodebaseMetadata, mut inheritance_work:
             .map(|parent_param| {
                 if let Some(parent_param_type) = parent_param.type_metadata.as_ref() {
                     let mut param_type = parent_param_type.type_union.clone();
-                    if let Some(ref template_result) = template_result {
+                    if let Some(template_result) = template_result.as_ref() {
                         param_type = inferred_type_replacer::replace(&param_type, template_result, codebase);
                     }
                     Some((param_type, parent_param_type.span, parent_param_type.from_docblock))
@@ -359,7 +361,7 @@ fn apply_inheritance_work(codebase: &mut CodebaseMetadata, mut inheritance_work:
             .iter()
             .map(|throw_type| {
                 let mut throw_type_union = throw_type.type_union.clone();
-                if let Some(ref template_result) = template_result {
+                if let Some(template_result) = template_result.as_ref() {
                     throw_type_union = inferred_type_replacer::replace(&throw_type_union, template_result, codebase);
                 }
 
@@ -375,6 +377,7 @@ fn apply_inheritance_work(codebase: &mut CodebaseMetadata, mut inheritance_work:
             should_inherit_assertions,
             should_inherit_if_true_assertions,
             should_inherit_if_false_assertions,
+            should_clear_inferred_assertions,
         ) = {
             let Some(child_method) = codebase.function_likes.get(&child_method_id) else {
                 continue;
@@ -413,11 +416,23 @@ fn apply_inheritance_work(codebase: &mut CodebaseMetadata, mut inheritance_work:
 
             let should_inherit_templates = child_method.template_types.is_empty() && !parent_template_types.is_empty();
             let should_inherit_thrown = child_method.thrown_types.is_empty() && !substituted_thrown_types.is_empty();
-            let should_inherit_assertions = child_method.assertions.is_empty() && !parent_assertions.is_empty();
+
+            let parent_has_any_assertions = !parent_assertions.is_empty()
+                || !parent_if_true_assertions.is_empty()
+                || !parent_if_false_assertions.is_empty();
+            let child_assertions_are_inferred = child_method.assertions_inferred;
+
+            let child_assertions_overridable =
+                |child: &BTreeMap<Atom, Vec<Assertion>>| -> bool { child.is_empty() || child_assertions_are_inferred };
+
+            let should_inherit_assertions =
+                child_assertions_overridable(&child_method.assertions) && !parent_assertions.is_empty();
             let should_inherit_if_true_assertions =
-                child_method.if_true_assertions.is_empty() && !parent_if_true_assertions.is_empty();
-            let should_inherit_if_false_assertions =
-                child_method.if_false_assertions.is_empty() && !parent_if_false_assertions.is_empty();
+                child_assertions_overridable(&child_method.if_true_assertions) && !parent_if_true_assertions.is_empty();
+            let should_inherit_if_false_assertions = child_assertions_overridable(&child_method.if_false_assertions)
+                && !parent_if_false_assertions.is_empty();
+
+            let should_clear_inferred_assertions = parent_has_any_assertions && child_assertions_are_inferred;
 
             (
                 should_inherit_return,
@@ -427,6 +442,7 @@ fn apply_inheritance_work(codebase: &mut CodebaseMetadata, mut inheritance_work:
                 should_inherit_assertions,
                 should_inherit_if_true_assertions,
                 should_inherit_if_false_assertions,
+                should_clear_inferred_assertions,
             )
         };
 
@@ -438,7 +454,7 @@ fn apply_inheritance_work(codebase: &mut CodebaseMetadata, mut inheritance_work:
             assertions
                 .iter()
                 .map(|(name, assertions)| {
-                    let resolved = if let Some(ref template_result) = template_result {
+                    let resolved = if let Some(template_result) = template_result.as_ref() {
                         assertions.iter().flat_map(|a| a.resolve_templates(codebase, template_result)).collect()
                     } else {
                         assertions.clone()
@@ -487,7 +503,7 @@ fn apply_inheritance_work(codebase: &mut CodebaseMetadata, mut inheritance_work:
                 type_union
             };
 
-            Some(TypeMetadata { type_union: narrowed_type, span, from_docblock, inferred: false })
+            Some(TypeMetadata { type_union: narrowed_type, span, from_docblock, inferred: true })
         } else {
             None
         };
@@ -501,11 +517,11 @@ fn apply_inheritance_work(codebase: &mut CodebaseMetadata, mut inheritance_work:
         }
 
         for (i, substituted_param) in substituted_param_types.into_iter().enumerate() {
-            if let Some(true) = params_to_inherit.get(i).copied()
+            if params_to_inherit.get(i).copied() == Some(true)
                 && let Some(child_param) = child_method.parameters.get_mut(i)
                 && let Some((type_union, span, from_docblock)) = substituted_param
             {
-                child_param.type_metadata = Some(TypeMetadata { type_union, span, from_docblock, inferred: false });
+                child_param.type_metadata = Some(TypeMetadata { type_union, span, from_docblock, inferred: true });
             }
         }
 
@@ -515,6 +531,13 @@ fn apply_inheritance_work(codebase: &mut CodebaseMetadata, mut inheritance_work:
 
         if let Some(parent_thrown) = parent_thrown_to_apply {
             child_method.thrown_types = parent_thrown;
+        }
+
+        if should_clear_inferred_assertions {
+            child_method.assertions.clear();
+            child_method.if_true_assertions.clear();
+            child_method.if_false_assertions.clear();
+            child_method.assertions_inferred = false;
         }
 
         if let Some(parent_asserts) = parent_assertions_to_apply {

@@ -75,6 +75,7 @@ pub struct CodebaseEntryKeys {
 /// their members, inheritance, dependencies, and associated types.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 #[non_exhaustive]
+#[allow(clippy::unsafe_derive_deserialize)]
 pub struct CodebaseMetadata {
     /// Configuration flag: Should types be inferred based on usage patterns?
     pub infer_types_from_usage: bool,
@@ -431,7 +432,7 @@ impl CodebaseMetadata {
 
     /// Gets the type of a class constant, considering both type hints and inferred types.
     #[must_use]
-    pub fn get_class_constant_type<'a>(&'a self, class: &str, constant: &str) -> Option<Cow<'a, TUnion>> {
+    pub fn get_class_constant_type<'meta>(&'meta self, class: &str, constant: &str) -> Option<Cow<'meta, TUnion>> {
         let lowercase_class = ascii_lowercase_atom(class);
         let constant_name = atom(constant);
         let class_meta = self.class_likes.get(&lowercase_class)?;
@@ -743,11 +744,11 @@ impl CodebaseMetadata {
 
     /// Gets thrown types for a function-like, including inherited throws.
     #[must_use]
-    pub fn get_function_like_thrown_types<'a>(
-        &'a self,
-        class_like: Option<&'a ClassLikeMetadata>,
-        function_like: &'a FunctionLikeMetadata,
-    ) -> &'a [TypeMetadata] {
+    pub fn get_function_like_thrown_types<'meta>(
+        &'meta self,
+        class_like: Option<&'meta ClassLikeMetadata>,
+        function_like: &'meta FunctionLikeMetadata,
+    ) -> &'meta [TypeMetadata] {
         if !function_like.thrown_types.is_empty() {
             return function_like.thrown_types.as_slice();
         }
@@ -830,19 +831,25 @@ impl CodebaseMetadata {
 
     /// Generates a unique name for an anonymous class based on its span.
     #[must_use]
+    #[allow(clippy::semicolon_outside_block)]
     pub fn get_anonymous_class_name(span: mago_span::Span) -> Atom {
         use std::io::Write;
 
         let mut buffer = [0u8; 64];
         let mut writer = &mut buffer[..];
 
+        // SAFETY: writing into a 64-byte buffer with three small numeric values (FileId
+        // and two u32 offsets formatted as decimal) cannot exceed the buffer; the
+        // `Write` impl for `&mut [u8]` only fails when the slice is full.
         unsafe {
             write!(writer, "class@anonymous:{}-{}:{}", span.file_id, span.start.offset, span.end.offset)
                 .unwrap_unchecked();
-        };
+        }
 
         let written_len = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
 
+        // SAFETY: every byte written above was ASCII (digits, '@', ':', '-', alphabet),
+        // so the prefix `&buffer[..written_len]` is valid UTF-8.
         atom(unsafe { std::str::from_utf8(&buffer[..written_len]).unwrap_unchecked() })
     }
 
@@ -908,14 +915,11 @@ impl CodebaseMetadata {
     /// * `references` - Symbol reference graph from previous run
     ///
     /// # Returns
-    ///
-    /// `true` if safe symbols were successfully marked, or `false` if the cascade was too large to compute.
-    pub fn mark_safe_symbols(&mut self, diff: &CodebaseDiff, references: &SymbolReferences) -> bool {
-        // Get invalid symbols with propagation through reference graph
-        let Some((invalid_symbols, partially_invalid)) = references.get_invalid_symbols(diff) else {
-            // Propagation too expensive (>5000 steps)
-            return false;
-        };
+    /// Returns `Some(global_scope_invalid)` on success, where `global_scope_invalid`
+    /// is `true` when global-scope code (the `(empty, empty)` pseudo-symbol) references
+    /// something that changed. Returns `None` if the cascade was too large to compute.
+    pub fn mark_safe_symbols(&mut self, diff: &CodebaseDiff, references: &SymbolReferences) -> Option<bool> {
+        let (invalid_symbols, partially_invalid) = references.get_invalid_symbols(diff)?;
 
         // Mark all symbols in 'keep' set as safe (unless invalidated by cascade)
         for keep_symbol in diff.get_keep() {
@@ -932,7 +936,7 @@ impl CodebaseMetadata {
             }
         }
 
-        true
+        Some(invalid_symbols.contains(&(empty_atom(), empty_atom())))
     }
 
     /// Merges information from another `CodebaseMetadata` into this one.
@@ -1054,7 +1058,7 @@ impl CodebaseMetadata {
             self.file_signatures.insert(*k, v.clone());
         }
         self.safe_symbols.extend(other.safe_symbols.iter().copied());
-        self.safe_symbol_members.extend(other.safe_symbol_members.iter().cloned());
+        self.safe_symbol_members.extend(other.safe_symbol_members.iter().copied());
         self.infer_types_from_usage |= other.infer_types_from_usage;
     }
 
@@ -1096,6 +1100,7 @@ impl CodebaseMetadata {
     ///
     /// This is much cheaper than keeping a full `CodebaseMetadata` clone — it only stores
     /// the keys needed to undo an `extend_ref()` operation.
+    #[must_use]
     pub fn extract_keys(&self) -> CodebaseEntryKeys {
         CodebaseEntryKeys {
             class_like_names: self.class_likes.keys().copied().collect(),
@@ -1103,6 +1108,50 @@ impl CodebaseMetadata {
             constant_names: self.constants.keys().copied().collect(),
             file_ids: self.file_signatures.keys().copied().collect(),
         }
+    }
+
+    /// Extracts only the keys that this per-file metadata currently "owns" in the given
+    /// merged codebase; i.e. keys whose span in `merged` matches this metadata's span.
+    ///
+    /// This is what you want for incremental fingerprints. [`extract_keys`](Self::extract_keys)
+    /// captures *every* key the scan produced, including ones that lost the tiebreak in
+    /// [`extend`](Self::extend) / [`extend_ref`](Self::extend_ref) when another file defined
+    /// the same FQN. Using `extract_keys` as a removal fingerprint then causes a nasty
+    /// cross-file bug: touching file *B* can remove an entry that file *A* actually owns,
+    /// because [`remove_entries_by_keys`](Self::remove_entries_by_keys) deletes by FQN
+    /// without checking who the current owner is. The analyzer then reports a spurious
+    /// "duplicate definition" when it walks *A* and finds *B*'s span in the codebase.
+    ///
+    /// By only recording the keys whose spans still match *this* metadata, removing the
+    /// fingerprint later becomes a safe no-op when another file won the merge. The
+    /// removal only drops the entries this file genuinely put into the merged codebase.
+    #[must_use]
+    pub fn extract_owned_keys(&self, merged: &CodebaseMetadata) -> CodebaseEntryKeys {
+        let class_like_names = self
+            .class_likes
+            .iter()
+            .filter(|(name, meta)| merged.class_likes.get(*name).is_some_and(|m| m.span == meta.span))
+            .map(|(name, _)| *name)
+            .collect();
+
+        let function_like_keys = self
+            .function_likes
+            .iter()
+            .filter(|(key, meta)| merged.function_likes.get(*key).is_some_and(|m| m.span == meta.span))
+            .map(|(key, _)| *key)
+            .collect();
+
+        let constant_names = self
+            .constants
+            .iter()
+            .filter(|(name, meta)| merged.constants.get(*name).is_some_and(|m| m.span == meta.span))
+            .map(|(name, _)| *name)
+            .collect();
+
+        // A file signature is always owned by its file (there is at most one per file).
+        let file_ids = self.file_signatures.keys().copied().collect();
+
+        CodebaseEntryKeys { class_like_names, function_like_keys, constant_names, file_ids }
     }
 
     /// Removes entries whose keys match the given [`CodebaseEntryKeys`].
@@ -1185,7 +1234,13 @@ impl Default for CodebaseMetadata {
 
 /// Determines which metadata value to keep when merging duplicates.
 ///
-/// Priority: user-defined > built-in > other. Uses smaller span as tie-breaker.
+/// Priority:
+///   1. user-defined > built-in > other.
+///   2. non-polyfill > polyfill — tools like rector/phpstan/psalm ship
+///      skeleton stubs gated by `if (!class_exists('X'))` that should never
+///      shadow a concrete definition.
+///   3. smaller span wins as a deterministic tie-breaker.
+///
 /// Returns `true` if the new value should replace the existing one.
 fn should_replace_metadata(
     existing_flags: MetadataFlags,
@@ -1207,5 +1262,56 @@ fn should_replace_metadata(
         return new_is_built_in;
     }
 
+    let new_is_polyfill = new_flags.is_polyfill();
+    let existing_is_polyfill = existing_flags.is_polyfill();
+
+    if new_is_polyfill != existing_is_polyfill {
+        return !new_is_polyfill;
+    }
+
     new_span < existing_span
+}
+
+#[cfg(test)]
+mod should_replace_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn non_polyfill_replaces_polyfill() {
+        let polyfill = MetadataFlags::POLYFILL;
+        let real = MetadataFlags::empty();
+        assert!(should_replace_metadata(polyfill, Span::dummy(0, 100), real, Span::dummy(0, 100)));
+        assert!(!should_replace_metadata(real, Span::dummy(0, 100), polyfill, Span::dummy(0, 100)));
+    }
+
+    #[test]
+    fn polyfill_does_not_replace_non_polyfill_even_with_smaller_span() {
+        let real = MetadataFlags::empty();
+        let polyfill = MetadataFlags::POLYFILL;
+        assert!(!should_replace_metadata(real, Span::dummy(500, 600), polyfill, Span::dummy(0, 10)));
+    }
+
+    #[test]
+    fn user_defined_beats_polyfill_flag() {
+        let polyfill_user = MetadataFlags::POLYFILL | MetadataFlags::USER_DEFINED;
+        let plain = MetadataFlags::empty();
+        assert!(!should_replace_metadata(polyfill_user, Span::dummy(0, 10), plain, Span::dummy(0, 10)));
+        assert!(should_replace_metadata(plain, Span::dummy(0, 10), polyfill_user, Span::dummy(0, 10)));
+    }
+
+    #[test]
+    fn two_user_defined_fall_through_to_polyfill_check() {
+        let a = MetadataFlags::POLYFILL | MetadataFlags::USER_DEFINED;
+        let b = MetadataFlags::USER_DEFINED;
+        assert!(should_replace_metadata(a, Span::dummy(0, 10), b, Span::dummy(0, 10)));
+        assert!(!should_replace_metadata(b, Span::dummy(0, 10), a, Span::dummy(0, 10)));
+    }
+
+    #[test]
+    fn two_non_polyfills_fall_through_to_priority_rules() {
+        let user = MetadataFlags::USER_DEFINED;
+        let builtin = MetadataFlags::BUILTIN;
+        assert!(!should_replace_metadata(user, Span::dummy(0, 10), builtin, Span::dummy(0, 10)));
+        assert!(should_replace_metadata(builtin, Span::dummy(0, 10), user, Span::dummy(0, 10)));
+    }
 }

@@ -7,7 +7,7 @@ use crate::error::ParseError;
 use crate::parser::Parser;
 use crate::token::GetPrecedence;
 
-impl<'input, 'arena> Parser<'input, 'arena> {
+impl<'arena> Parser<'_, 'arena> {
     pub(crate) fn parse_unary_prefix_operation(&mut self) -> Result<UnaryPrefix<'arena>, ParseError> {
         let token = self.stream.consume()?;
 
@@ -32,7 +32,6 @@ impl<'input, 'arena> Parser<'input, 'arena> {
             T!["+"] => UnaryPrefixOperator::Plus(token.span_for(self.stream.file_id())),
             T!["++"] => UnaryPrefixOperator::PreIncrement(token.span_for(self.stream.file_id())),
             T!["--"] => UnaryPrefixOperator::PreDecrement(token.span_for(self.stream.file_id())),
-            T!["&"] => UnaryPrefixOperator::Reference(token.span_for(self.stream.file_id())),
             _ => {
                 return Err(self.stream.unexpected(
                     Some(token),
@@ -55,8 +54,7 @@ impl<'input, 'arena> Parser<'input, 'arena> {
                         "-",
                         "+",
                         "++",
-                        "--",
-                        "&"
+                        "--"
                     ],
                 ));
             }

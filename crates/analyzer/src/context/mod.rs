@@ -15,7 +15,7 @@ use mago_span::HasSpan;
 use mago_span::Span;
 use mago_syntax::ast::Identifier;
 use mago_syntax::ast::Trivia;
-use mago_syntax::comments;
+use mago_syntax::comments::docblock::PrecedingDocblocks;
 
 use crate::analysis_result::AnalysisResult;
 use crate::artifacts::AnalysisArtifacts;
@@ -32,6 +32,8 @@ pub mod scope;
 pub mod utils;
 
 #[derive(Debug)]
+#[allow(clippy::field_scoped_visibility_modifiers)]
+#[allow(clippy::struct_field_names)]
 pub struct Context<'ctx, 'arena> {
     pub(super) arena: &'arena Bump,
     pub(super) codebase: &'ctx CodebaseMetadata,
@@ -140,10 +142,7 @@ impl<'ctx, 'arena> Context<'ctx, 'arena> {
 
     pub fn get_parsed_docblocks(&mut self) -> Vec<Element<'arena>> {
         let mut elements = vec![];
-        let mut start = self.statement_span.start.offset;
-        while let Some(trivia) =
-            comments::docblock::get_docblock_before_position(self.source_file, self.comments, start)
-        {
+        for trivia in PrecedingDocblocks::new(self.comments, self.statement_span.start.offset) {
             match mago_docblock::parse_trivia(self.arena, trivia) {
                 Ok(document) => elements.extend(document.elements),
                 Err(error) => {
@@ -172,7 +171,6 @@ impl<'ctx, 'arena> Context<'ctx, 'arena> {
                     self.collector.report_with_code(IssueCode::InvalidDocblock, issue);
                 }
             }
-            start = trivia.span.start.offset;
         }
 
         elements
@@ -189,5 +187,13 @@ impl<'ctx, 'arena> Context<'ctx, 'arena> {
     pub fn finish(self, artifacts: AnalysisArtifacts, analysis_result: &mut AnalysisResult) {
         analysis_result.issues.extend(self.collector.finish());
         analysis_result.symbol_references.extend(artifacts.symbol_references);
+    }
+
+    /// Drain the collector into the analysis result and return any
+    /// unreported issues. Used by [`crate::Analyzer::analyze_with_artifacts`]
+    /// when the caller needs to retain ownership of [`AnalysisArtifacts`]
+    /// after analysis completes.
+    pub fn finish_collector(self, analysis_result: &mut AnalysisResult) {
+        analysis_result.issues.extend(self.collector.finish());
     }
 }

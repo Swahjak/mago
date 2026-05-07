@@ -13,8 +13,11 @@ use mago_span::Span;
 pub use crate::ast::ast::*;
 pub use crate::ast::node::*;
 pub use crate::ast::sequence::Sequence;
+pub use crate::ast::sequence::TokenSeparatedSequence;
+pub use crate::ast::sequence::TokenSeparatedSequenceExt;
 pub use crate::ast::trivia::Trivia;
 pub use crate::ast::trivia::TriviaKind;
+pub use crate::ast::trivia::TriviaSequenceExt;
 use crate::error::ParseError;
 
 pub mod ast;
@@ -34,6 +37,7 @@ pub struct Program<'arena> {
 impl Program<'_> {
     /// Returns `true` if the program contains any parsing errors.
     #[inline]
+    #[must_use]
     pub fn has_errors(&self) -> bool {
         !self.errors.is_empty()
     }

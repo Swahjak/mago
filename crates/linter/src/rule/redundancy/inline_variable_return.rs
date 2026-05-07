@@ -130,6 +130,10 @@ impl LintRule for InlineVariableReturnRule {
     }
 
     fn check<'arena>(&self, ctx: &mut LintContext<'_, 'arena>, node: Node<'_, 'arena>) {
+        if ctx.scope.get_function_like_scope().is_some_and(|function_like| function_like.is_by_ref()) {
+            return;
+        }
+
         let statements = match node {
             Node::Program(program) => program.statements.as_slice(),
             Node::Block(block) => block.statements.as_slice(),
@@ -216,8 +220,8 @@ fn involves_references(expr: &Expression<'_>, var_name: &str) -> bool {
         return true;
     }
 
-    struct RefCaptureChecker<'a> {
-        var_name: &'a str,
+    struct RefCaptureChecker<'name> {
+        var_name: &'name str,
         found: bool,
     }
 
@@ -378,13 +382,29 @@ mod tests {
     }
 
     test_lint_success! {
-        name = valid_by_ref,
+        name = valid_by_ref_function_with_variable_return,
         rule = InlineVariableReturnRule,
         code = indoc! {r"
             <?php
 
-            function &get_category_by_path(string $path): ?array {
-                return &find_node();
+            function &test(): string {
+                $string = '42';
+                return $string;
+            }
+        "}
+    }
+
+    test_lint_success! {
+        name = valid_by_ref_method_with_variable_return,
+        rule = InlineVariableReturnRule,
+        code = indoc! {r"
+            <?php
+
+            class Foo {
+                public function &getRef(): string {
+                    $val = 'hello';
+                    return $val;
+                }
             }
         "}
     }

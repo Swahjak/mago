@@ -25,10 +25,10 @@ use crate::internal::format::alignment::has_blank_line_between;
 use crate::internal::format::alignment::has_comment_between;
 use crate::internal::format::assignment::AssignmentAlignment;
 use crate::internal::format::misc;
+use crate::internal::format::misc::get_document_width;
 use crate::internal::format::misc::is_expandable_expression;
 use crate::internal::format::misc::is_string_word_type;
 use crate::internal::utils::get_expression_width;
-use crate::internal::utils::string_width;
 
 #[derive(Debug, Clone, Copy)]
 pub enum ArrayLike<'arena> {
@@ -250,7 +250,8 @@ fn has_floating_comments<'arena>(f: &mut FormatterState<'_, 'arena>, array_like:
     };
 
     for element in array_like.elements().windows(2) {
-        if has_comments(element[0], element[1]) {
+        let [prev, next] = element else { continue };
+        if has_comments(prev, next) {
             return true;
         }
     }
@@ -270,13 +271,30 @@ fn inline_single_element<'arena>(
 
     match elements[0] {
         ArrayElement::KeyValue(element) => {
-            if (element.key.is_literal() || is_string_word_type(element.key))
-                && is_expandable_expression(element.value, true)
+            if !((element.key.is_literal() || is_string_word_type(element.key))
+                && is_expandable_expression(element.value, true))
             {
-                Some(element.format(f))
-            } else {
-                None
+                return None;
             }
+
+            if has_nested_array_like_value(element.value) {
+                return None;
+            }
+
+            if !value_has_internal_break_point(element.value) {
+                return None;
+            }
+
+            let key = element.key.format(f);
+            let value = element.value.format(f);
+            Some(Document::Group(Group::new(vec![
+                in f.arena;
+                key,
+                Document::space(),
+                Document::String("=>"),
+                Document::space(),
+                value,
+            ])))
         }
         ArrayElement::Value(element) => {
             if is_expandable_expression(element.value, true) {
@@ -293,6 +311,53 @@ fn inline_single_element<'arena>(
             }
         }
         ArrayElement::Missing(_) => None,
+    }
+}
+
+#[inline]
+fn value_has_internal_break_point<'arena>(expression: &'arena Expression<'arena>) -> bool {
+    match expression {
+        Expression::Parenthesized(inner) => value_has_internal_break_point(inner.expression),
+        Expression::UnaryPrefix(op) => value_has_internal_break_point(op.operand),
+        Expression::Throw(throw) => value_has_internal_break_point(throw.exception),
+        Expression::Array(_) | Expression::LegacyArray(_) | Expression::List(_) => true,
+        Expression::Closure(_) | Expression::AnonymousClass(_) | Expression::Match(_) => true,
+        Expression::PartialApplication(_) => true,
+        Expression::Call(call) => argument_list_is_substantial(call.get_argument_list()),
+        Expression::Instantiation(instantiation) => {
+            instantiation.argument_list.as_ref().is_some_and(argument_list_is_substantial)
+        }
+        _ => false,
+    }
+}
+
+#[inline]
+fn argument_list_is_substantial<'arena>(argument_list: &'arena mago_syntax::ast::ArgumentList<'arena>) -> bool {
+    if argument_list.arguments.len() >= 2 {
+        return true;
+    }
+    argument_list.arguments.first().is_some_and(|arg| value_has_internal_break_point(arg.value()))
+}
+
+#[inline]
+fn has_nested_array_like_value(expression: &Expression<'_>) -> bool {
+    fn element_contains_array_like(element: &ArrayElement<'_>) -> bool {
+        let value = match element {
+            ArrayElement::KeyValue(key_value) => key_value.value,
+            ArrayElement::Value(value) => value.value,
+            ArrayElement::Variadic(value) => value.value,
+            ArrayElement::Missing(_) => return false,
+        };
+
+        matches!(value, Expression::Array(_) | Expression::LegacyArray(_) | Expression::List(_))
+            || has_nested_array_like_value(value)
+    }
+
+    match expression {
+        Expression::Array(array) => array.elements.iter().any(element_contains_array_like),
+        Expression::LegacyArray(array) => array.elements.iter().any(element_contains_array_like),
+        Expression::List(list) => list.elements.iter().any(element_contains_array_like),
+        _ => false,
     }
 }
 
@@ -330,7 +395,7 @@ fn format_row_with_alignment<'arena>(
                 Document::Group(group)
             }
         }
-        document => document,
+        other => other,
     }
 }
 
@@ -346,16 +411,16 @@ fn extract_array_elements<'arena>(
 
     for doc in contents {
         match doc {
-            delimiter @ Document::Array(arr) => {
+            Document::Array(arr) => {
                 // Check if this array contains the left delimiter
                 for item in arr {
                     if let Document::String(s) = item {
                         if *s == "[" || *s == "(" {
-                            opening_delimiter = Some(clone_in_arena(f.arena, delimiter));
+                            opening_delimiter = Some(clone_in_arena(f.arena, doc));
                             in_elements = true;
                             break;
                         } else if !in_elements && *s == "]" || *s == ")" {
-                            closing_delimiter = Some(clone_in_arena(f.arena, delimiter));
+                            closing_delimiter = Some(clone_in_arena(f.arena, doc));
                             break;
                         }
                     }
@@ -561,21 +626,6 @@ fn calculate_column_widths<'arena>(
     }
 
     Some(column_maximum_widths)
-}
-
-fn get_document_width(doc: &Document<'_>) -> usize {
-    match doc {
-        Document::String(s) => string_width(s),
-        Document::Array(docs) => docs.iter().map(get_document_width).sum(),
-        Document::Group(group) => group.contents.iter().map(get_document_width).sum(),
-        Document::Indent(docs) => docs.iter().map(get_document_width).sum(),
-        Document::Line(_) => 1,
-        Document::IfBreak(if_break) => {
-            get_document_width(if_break.break_contents).max(get_document_width(if_break.flat_content))
-        }
-        Document::IndentIfBreak(indent_if_break) => indent_if_break.contents.iter().map(get_document_width).sum(),
-        _ => 0,
-    }
 }
 
 /// Detect alignment runs in array elements for key-value pairs.

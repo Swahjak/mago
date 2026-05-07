@@ -79,6 +79,7 @@ impl File {
     /// Creates a new `File` instance from its name, type, path, and contents.
     ///
     /// It automatically calculates the size, and line start offsets.
+    #[inline]
     #[must_use]
     pub fn new(
         name: Cow<'static, str>,
@@ -118,6 +119,7 @@ impl File {
     /// This is a convenience method for situations like testing or formatting where
     /// a full file context (e.g., a real path) is not required. It defaults to
     /// `FileType::Host` and a `path` of `None`.
+    #[inline]
     #[must_use]
     pub fn ephemeral(name: Cow<'static, str>, contents: Cow<'static, str>) -> Self {
         Self::new(name, FileType::Host, None, contents)
@@ -147,6 +149,7 @@ impl File {
     /// # Returns
     ///
     /// The byte offset for the start of the given line (0-based index).
+    #[inline]
     #[must_use]
     pub fn get_line_start_offset(&self, line: u32) -> Option<u32> {
         self.lines.get(line as usize).copied()
@@ -161,6 +164,7 @@ impl File {
     /// # Returns
     ///
     /// The byte offset for the end of the given line (0-based index).
+    #[inline]
     #[must_use]
     pub fn get_line_end_offset(&self, line: u32) -> Option<u32> {
         match self.lines.get(line as usize + 1) {
@@ -182,27 +186,29 @@ impl File {
     #[inline]
     #[must_use]
     pub fn column_number(&self, offset: u32) -> u32 {
-        let line_start =
-            self.lines.binary_search(&offset).unwrap_or_else(|next_line| self.lines[next_line - 1] as usize);
+        let line = self.line_number(offset) as usize;
 
-        offset - line_start as u32
+        offset - self.lines[line]
     }
 }
 
 impl FileType {
     /// Returns `true` if the file is a host file, meaning it is part of the project's source code.
+    #[inline]
     #[must_use]
     pub const fn is_host(self) -> bool {
         matches!(self, FileType::Host)
     }
 
     /// Returns `true` if the file is a vendored file, meaning it comes from an external library or dependency.
+    #[inline]
     #[must_use]
     pub const fn is_vendored(self) -> bool {
         matches!(self, FileType::Vendored)
     }
 
     /// Returns `true` if the file is a built-in file, meaning it represents a core language construct.
+    #[inline]
     #[must_use]
     pub const fn is_builtin(self) -> bool {
         matches!(self, FileType::Builtin)
@@ -210,6 +216,7 @@ impl FileType {
 }
 
 impl FileId {
+    #[inline]
     #[must_use]
     pub fn new(logical_name: &str) -> Self {
         let mut hasher = DefaultHasher::new();
@@ -217,16 +224,19 @@ impl FileId {
         Self(hasher.finish())
     }
 
+    #[inline]
     #[must_use]
     pub const fn zero() -> Self {
         Self(0)
     }
 
+    #[inline]
     #[must_use]
     pub const fn is_zero(self) -> bool {
         self.0 == 0
     }
 
+    #[inline]
     #[must_use]
     pub fn as_u64(self) -> u64 {
         self.0
@@ -234,12 +244,14 @@ impl FileId {
 }
 
 impl HasFileId for File {
+    #[inline]
     fn file_id(&self) -> FileId {
         self.id
     }
 }
 
 impl std::fmt::Display for FileId {
+    #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -248,8 +260,10 @@ impl std::fmt::Display for FileId {
 /// Returns a vec over the starting byte offsets of each line in `source`.
 #[inline]
 pub(crate) fn line_starts(source: &str) -> Vec<u32> {
-    // Heuristic: Average line of code is ~40 bytes.
-    const LINE_WIDTH_HEURISTIC: usize = 40;
+    // Heuristic: On the test corpus, the mean length is about 30 bytes, the median is 23.
+    // Since the whole vec will be small, we prefer slight over-allocation to avoid re-allocations
+    // in the common case
+    const LINE_WIDTH_HEURISTIC: usize = 20;
 
     let bytes = source.as_bytes();
 
@@ -257,23 +271,23 @@ pub(crate) fn line_starts(source: &str) -> Vec<u32> {
     let mut lines = Vec::with_capacity(bytes.len() / LINE_WIDTH_HEURISTIC);
     lines.push(0);
 
-    // Find all line terminators: \n, \r\n (as one), and bare \r.
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\n' {
-            lines.push((i + 1) as u32);
-        } else if bytes[i] == b'\r' {
-            if bytes.get(i + 1) == Some(&b'\n') {
-                // \r\n — next line starts after the \n
-                lines.push((i + 2) as u32);
-                i += 1; // skip the \n
-            } else {
-                // bare \r — next line starts after the \r
-                lines.push((i + 1) as u32);
+    // Detect line ending style from the first \r or \n.  Real files use one
+    // convention throughout, so we never need to handle mixed \r\n / bare \r.
+    match memchr::memchr2(b'\r', b'\n', bytes) {
+        // No line endings: single-line file, nothing more to push.
+        None => {}
+        // Old Mac (\r only): first line-ending char is a bare \r.
+        Some(cr) if bytes[cr] == b'\r' && bytes.get(cr + 1) != Some(&b'\n') => {
+            for pos in memchr::memchr_iter(b'\r', bytes) {
+                lines.push((pos + 1) as u32);
             }
         }
-
-        i += 1;
+        // Unix (\n only) or Windows (\r\n): \n marks every line start.
+        _ => {
+            for pos in memchr::memchr_iter(b'\n', bytes) {
+                lines.push((pos + 1) as u32);
+            }
+        }
     }
 
     lines

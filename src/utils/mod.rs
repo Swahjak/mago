@@ -24,8 +24,10 @@ pub mod version;
 ///
 /// This function considers:
 /// - The explicit color choice (Always/Never/Auto)
-/// - The FORCE_COLOR environment variable (if Auto) - forces colors when set to non-empty value
-/// - The NO_COLOR environment variable (if Auto) - disables colors when set
+/// - The FORCE_COLOR environment variable (if Auto) — any non-empty value forces
+///   colors, except `FORCE_COLOR=0` which explicitly disables them.
+/// - The NO_COLOR environment variable (if Auto) — any non-empty value (including
+///   `"0"`) disables colors. An empty value has no effect.
 /// - Whether stdout is a terminal (if Auto)
 ///
 /// Priority (for Auto mode): FORCE_COLOR > NO_COLOR > TTY check
@@ -37,13 +39,19 @@ pub fn should_use_colors(color_choice: ColorChoice) -> bool {
         ColorChoice::Always => true,
         ColorChoice::Never => false,
         ColorChoice::Auto => {
-            // FORCE_COLOR takes precedence - any non-empty value forces colors
-            if let Some(force_color) = std::env::var_os("FORCE_COLOR") {
-                return !force_color.is_empty();
+            // FORCE_COLOR takes precedence.
+            if let Some(force_color) = std::env::var_os("FORCE_COLOR")
+                && !force_color.is_empty()
+            {
+                return force_color != "0";
             }
 
-            // Then check NO_COLOR and TTY
-            std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+            // Then NO_COLOR: any non-empty value disables colors.
+            if std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()) {
+                return false;
+            }
+
+            std::io::stdout().is_terminal()
         }
     }
 }
@@ -65,17 +73,20 @@ pub(crate) fn create_orchestrator<'a>(
     use_progress_bars: bool,
     enable_diff: bool,
 ) -> Orchestrator<'a> {
+    let glob = configuration.source.glob.to_database_settings();
     let linter_settings = if pedantic_linter {
         Settings {
             php_version: configuration.php_version,
             integrations: IntegrationSet::all(),
             rules: RulesSettings::default(),
+            glob,
         }
     } else {
         Settings {
             php_version: configuration.php_version,
             integrations: IntegrationSet::from_slice(&configuration.linter.integrations),
             rules: configuration.linter.rules.clone(),
+            glob,
         }
     };
 
@@ -89,12 +100,12 @@ pub(crate) fn create_orchestrator<'a>(
         disable_default_analyzer_plugins: configuration.analyzer.disable_default_plugins,
         analyzer_plugins: configuration.analyzer.plugins.clone(),
         use_progress_bars,
-        use_colors: color_choice != ColorChoice::Never,
+        use_colors: should_use_colors(color_choice),
         paths: configuration.source.paths.clone(),
         excludes: configuration.source.excludes.iter().map(|p| p.as_ref()).collect(),
         extensions: configuration.source.extensions.iter().map(|e| e.as_ref()).collect(),
         includes: configuration.source.includes.clone(),
-        glob: configuration.source.glob.to_database_settings(),
+        glob,
     };
 
     Orchestrator::new(orchestrator_config)

@@ -86,23 +86,17 @@ pub fn analyze_and_store_argument_type<'ctx, 'arena>(
             .filter_map(|(parameter_index, parameter)| {
                 parameter.get_type_signature().map(|param_type| (parameter_index, param_type.clone()))
             })
-            .for_each(|(parameter_index, parameter_type)| {
-                match inferred_parameters.entry(parameter_index) {
-                    Entry::Occupied(occupied_entry) => {
-                        let existing_type: TUnion = occupied_entry.remove();
-                        let updated_type = add_union_type(
-                            existing_type,
-                            &parameter_type,
-                            context.codebase,
-                            CombinerOptions::default(),
-                        );
+            .for_each(|(parameter_index, parameter_type)| match inferred_parameters.entry(parameter_index) {
+                Entry::Occupied(occupied_entry) => {
+                    let existing_type: TUnion = occupied_entry.remove();
+                    let updated_type =
+                        add_union_type(existing_type, &parameter_type, context.codebase, CombinerOptions::default());
 
-                        inferred_parameters.insert(parameter_index, updated_type);
-                    }
-                    Entry::Vacant(vacant_entry) => {
-                        vacant_entry.insert(parameter_type);
-                    }
-                };
+                    inferred_parameters.insert(parameter_index, updated_type);
+                }
+                Entry::Vacant(vacant_entry) => {
+                    vacant_entry.insert(parameter_type);
+                }
             });
 
         inferred_parameters
@@ -129,7 +123,7 @@ pub fn analyze_and_store_argument_type<'ctx, 'arena>(
 
     if referenced_parameter && !is_argument_referenceable(argument_expression, &argument_type) {
         let target_kind_str = invocation_target.guess_kind();
-        let target_name_str = invocation_target.guess_name();
+        let target_name_str = invocation_target.guess_name(context);
 
         context.collector.report_with_code(
             IssueCode::InvalidPassByReference,
@@ -167,7 +161,7 @@ pub fn verify_argument_type<'arena>(
     invocation_target: &InvocationTarget<'_>,
 ) {
     let target_kind_str = invocation_target.guess_kind();
-    let target_name_str = invocation_target.guess_name();
+    let target_name_str = invocation_target.guess_name(context);
 
     if input_type.is_never() {
         context.collector.report_with_code(
@@ -183,7 +177,7 @@ pub fn verify_argument_type<'arena>(
                     .with_message("This argument expression results in type `never`")
             )
             .with_note(
-                "The `never` type indicates this expression will not complete to produce a value."
+                "The `never` type means no value can reach this point at runtime - this code path is unreachable."
             )
             .with_note(
                 "This often occurs in unreachable code, due to impossible conditional logic, or if an expression always exits (e.g., `throw`, `exit()`)."
@@ -330,9 +324,8 @@ pub fn verify_argument_type<'arena>(
             issue_kind = IssueCode::LessSpecificArgument;
             annotation_msg = format!("Provided type `{input_type_str}` is too general.");
             note_msg = format!(
-                    "The provided type `{input_type_str}` can be assigned to `{parameter_type_str}`, but is wider (less specific)."
-                )
-                .to_string();
+                "The provided type `{input_type_str}` can be assigned to `{parameter_type_str}`, but is wider (less specific)."
+            );
         }
 
         let mut issue = Issue::error(format!(
@@ -355,10 +348,19 @@ pub fn verify_argument_type<'arena>(
 
         context.collector.report_with_code(issue_kind, issue);
     } else if !union_comparison_result.type_coerced.unwrap_or(false) {
-        let types_can_be_identical =
-            can_expression_types_be_identical(context.codebase, input_type, parameter_type, false, false);
+        let parameter_requires_closure = parameter_type.types.iter().all(
+            |atomic| matches!(atomic, TAtomic::Callable(TCallable::Signature(signature)) if signature.is_closure()),
+        );
 
-        if types_can_be_identical && parameter_type.is_callable() {
+        let input_can_be_closure = input_type
+            .types
+            .iter()
+            .any(|atomic| matches!(atomic, TAtomic::Callable(TCallable::Signature(s)) if s.is_closure()));
+
+        let types_can_be_identical = (!parameter_requires_closure || input_can_be_closure)
+            && can_expression_types_be_identical(context.codebase, input_type, parameter_type, false, false);
+
+        if types_can_be_identical && parameter_type.is_callable() && !parameter_requires_closure {
             let all_inputs_are_resolvable_aliases = input_type.types.iter().all(|atomic| {
                 if matches!(atomic, TAtomic::Callable(_)) {
                     false
@@ -426,6 +428,8 @@ pub fn verify_argument_type<'arena>(
         }
 
         context.collector.report_with_code(kind, issue);
+    } else {
+        // type was coerced from mixed/empty container; already reported above, nothing more to do
     }
 }
 

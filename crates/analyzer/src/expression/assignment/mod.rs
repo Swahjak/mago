@@ -5,11 +5,15 @@ use indexmap::IndexMap;
 use mago_algebra::clause::Clause;
 use mago_algebra::disjoin_clauses;
 use mago_atom::Atom;
+use mago_atom::AtomSet;
 use mago_codex::assertion::Assertion;
 use mago_codex::identifier::function_like::FunctionLikeIdentifier;
 use mago_codex::ttype::TType;
 use mago_codex::ttype::atomic::TAtomic;
+use mago_codex::ttype::atomic::array::TArray;
+use mago_codex::ttype::atomic::array::key::ArrayKey;
 use mago_codex::ttype::atomic::callable::TCallable;
+use mago_codex::ttype::atomic::scalar::TScalar;
 use mago_codex::ttype::comparator::ComparisonResult;
 use mago_codex::ttype::comparator::union_comparator;
 use mago_codex::ttype::get_literal_int;
@@ -84,7 +88,7 @@ pub fn analyze_assignment<'ctx, 'ast, 'arena>(
     target_expression: &'ast Expression<'arena>,
     mut assignment_operator: Option<&AssignmentOperator>,
     source_expression: Option<&'ast Expression<'arena>>,
-    source_type: Option<&TUnion>,
+    source_type: Option<TUnion>,
 ) -> Result<(), AnalysisError> {
     if let Some(AssignmentOperator::Assign(_)) = assignment_operator {
         assignment_operator = None;
@@ -145,6 +149,7 @@ pub fn analyze_assignment<'ctx, 'ast, 'arena>(
                         AssignmentOperator::LeftShift(span) => BinaryOperator::LeftShift(*span),
                         AssignmentOperator::RightShift(span) => BinaryOperator::RightShift(*span),
                         AssignmentOperator::Coalesce(span) => BinaryOperator::NullCoalesce(*span),
+                        #[allow(clippy::unreachable)]
                         AssignmentOperator::Assign(_) => unreachable!(),
                     },
                     rhs: context.arena.alloc(source_expression.clone()),
@@ -158,7 +163,9 @@ pub fn analyze_assignment<'ctx, 'ast, 'arena>(
                     None
                 };
 
-                artifacts.expression_types = previous_expression_types;
+                let new_expression_types =
+                    std::mem::replace(&mut artifacts.expression_types, previous_expression_types);
+                artifacts.expression_types.extend(new_expression_types);
                 if let Some(expression_type) = assignment_type {
                     artifacts.expression_types.insert(get_expression_range(source_expression), expression_type);
                 }
@@ -172,16 +179,16 @@ pub fn analyze_assignment<'ctx, 'ast, 'arena>(
         block_context.flags.set_inside_general_use(was_inside_general_use);
     }
 
-    let source_type = if let Some(source_type) = source_type {
-        source_type.clone()
+    let source_type: Rc<TUnion> = if let Some(source_type) = source_type {
+        Rc::new(source_type)
     } else if let Some(source_expression) = source_expression {
-        if let Some(source_type) = artifacts.get_expression_type(&source_expression) {
-            source_type.clone()
+        if let Some(source_type) = artifacts.get_rc_expression_type(&source_expression) {
+            Rc::clone(source_type)
         } else {
-            get_mixed()
+            Rc::new(get_mixed())
         }
     } else {
-        get_mixed()
+        Rc::new(get_mixed())
     };
 
     if let (Some(target_variable_id), None) = (&target_variable_id, assignment_operator)
@@ -233,7 +240,7 @@ pub fn analyze_assignment<'ctx, 'ast, 'arena>(
         target_expression,
         target_variable_id,
         source_expression,
-        source_type.clone(),
+        Rc::clone(&source_type),
         false,
     )?;
 
@@ -271,7 +278,7 @@ pub fn analyze_assignment<'ctx, 'ast, 'arena>(
     }
 
     if let Some(assignment_span) = assignment_span {
-        artifacts.set_expression_type(&assignment_span, source_type);
+        artifacts.set_rc_expression_type(&assignment_span, source_type);
     }
 
     Ok(())
@@ -284,11 +291,13 @@ pub(crate) fn assign_to_expression<'ctx, 'ast, 'arena>(
     target_expression: &'ast Expression<'arena>,
     target_expression_id: Option<Atom>,
     source_expression: Option<&'ast Expression<'arena>>,
-    mut source_type: TUnion,
+    mut source_type: Rc<TUnion>,
     destructuring: bool,
 ) -> Result<bool, AnalysisError> {
     if let Some(source_expression) = source_expression {
-        source_type.set_by_reference(source_expression.is_reference());
+        if source_expression.is_reference() != source_type.by_reference() {
+            Rc::make_mut(&mut source_type).set_by_reference(source_expression.is_reference());
+        }
 
         analyze_reference_assignment(context, block_context, target_expression, source_expression);
     }
@@ -358,7 +367,7 @@ pub(crate) fn assign_to_expression<'ctx, 'ast, 'arena>(
 }
 
 fn analyze_reference_assignment<'ctx, 'ast, 'arena>(
-    context: &mut Context<'ctx, 'arena>,
+    context: &Context<'ctx, 'arena>,
     block_context: &mut BlockContext<'ctx>,
     target_expression: &'ast Expression<'arena>,
     source_expression: &'ast Expression<'arena>,
@@ -413,7 +422,7 @@ pub fn analyze_assignment_to_variable<'ctx, 'arena>(
     artifacts: &mut AnalysisArtifacts,
     variable_span: Span,
     source_expression: Option<&Expression<'arena>>,
-    mut assigned_type: TUnion,
+    mut assigned_type: Rc<TUnion>,
     variable_id: Atom,
     destructuring: bool,
 ) {
@@ -507,7 +516,9 @@ pub fn analyze_assignment_to_variable<'ctx, 'arena>(
             context.collector.report_with_code(IssueCode::ReferenceConstraintViolation, issue);
         }
 
-        assigned_type.set_by_reference(true);
+        if !assigned_type.by_reference() {
+            Rc::make_mut(&mut assigned_type).set_by_reference(true);
+        }
     }
 
     if block_context.references_possibly_from_confusing_scope.contains(&variable_id) {
@@ -577,7 +588,7 @@ pub fn analyze_assignment_to_variable<'ctx, 'arena>(
             source_expression,
         );
 
-        assigned_type = variable_type;
+        assigned_type = Rc::new(variable_type);
         from_docblock = true;
     }
 
@@ -622,7 +633,8 @@ pub fn analyze_assignment_to_variable<'ctx, 'arena>(
 
     block_context.locals.retain(|var_id, _| !var_references_dynamic(*var_id, variable_id));
 
-    block_context.locals.insert(variable_id, Rc::new(assigned_type));
+    block_context.locals.insert(variable_id, assigned_type);
+    block_context.variables_possibly_in_scope.insert(variable_id);
 }
 
 fn analyze_destructuring<'ctx, 'ast, 'arena>(
@@ -759,6 +771,10 @@ fn analyze_destructuring<'ctx, 'ast, 'arena>(
         }
     }
 
+    if !has_keyed_elements && has_non_keyed_elements && !impossible {
+        check_list_destructure_keys(context, target_span, source_expression, array_type);
+    }
+
     for target_element in target_elements {
         match target_element {
             ArrayElement::KeyValue(key_value_element) => {
@@ -797,7 +813,7 @@ fn analyze_destructuring<'ctx, 'ast, 'arena>(
                     key_value_element.value,
                     None,
                     Some(key_value_element.key),
-                    Some(&access_type),
+                    Some(access_type),
                 )?;
             }
             ArrayElement::Value(value_element) => {
@@ -833,7 +849,7 @@ fn analyze_destructuring<'ctx, 'ast, 'arena>(
                     value_element.value,
                     None,
                     None,
-                    Some(&access_type),
+                    Some(access_type),
                 )?;
             }
             ArrayElement::Variadic(variadic_element) => {
@@ -853,7 +869,7 @@ fn analyze_destructuring<'ctx, 'ast, 'arena>(
                     variadic_element.value,
                     None,
                     None,
-                    Some(&get_never()),
+                    Some(get_never()),
                 )?;
 
                 continue;
@@ -865,6 +881,116 @@ fn analyze_destructuring<'ctx, 'ast, 'arena>(
     }
 
     Ok(())
+}
+
+fn check_list_destructure_keys<'arena>(
+    context: &mut Context<'_, 'arena>,
+    target_span: Span,
+    source_expression: Option<&Expression<'arena>>,
+    array_type: &TUnion,
+) {
+    let mut has_string_signal = false;
+    let mut has_negative_signal = false;
+
+    for atomic in array_type.types.iter() {
+        let TAtomic::Array(array) = atomic else {
+            continue;
+        };
+
+        let TArray::Keyed(keyed) = array else {
+            continue;
+        };
+
+        let mut local_string_signal = false;
+        let mut local_negative_signal = false;
+        let mut has_non_negative_int_known_item = false;
+
+        if let Some(known_items) = &keyed.known_items {
+            for key in known_items.keys() {
+                match key {
+                    ArrayKey::String(_) => local_string_signal = true,
+                    ArrayKey::Integer(i) if *i < 0 => local_negative_signal = true,
+                    ArrayKey::Integer(_) => has_non_negative_int_known_item = true,
+                    ArrayKey::ClassLikeConstant { .. } => {}
+                }
+            }
+        }
+
+        if let Some((key_type, _)) = &keyed.parameters {
+            if key_type.has_string() {
+                local_string_signal = true;
+            }
+
+            for key_atomic in key_type.types.iter() {
+                if let TAtomic::Scalar(TScalar::Integer(int)) = key_atomic
+                    && int.is_negative()
+                {
+                    local_negative_signal = true;
+                }
+            }
+        }
+
+        if !has_non_negative_int_known_item {
+            has_string_signal |= local_string_signal;
+            has_negative_signal |= local_negative_signal;
+        }
+    }
+
+    if has_string_signal {
+        let assigned_type_str = array_type.get_id();
+        let mut issue = Issue::warning(format!(
+            "List-style destructuring of a value with non-integer keys (`{assigned_type_str}`).",
+        ))
+        .with_annotation(
+            Annotation::primary(target_span)
+                .with_message("This list-style destructuring only reads keys `0`, `1`, `2`, ..."),
+        );
+
+        if let Some(source_expression) = source_expression {
+            issue = issue.with_annotation(
+                Annotation::secondary(source_expression.span())
+                    .with_message(format!("...but this expression has type `{assigned_type_str}`")),
+            );
+        }
+
+        issue = issue
+            .with_note(
+                "PHP list destructuring (`[$a, $b]`) reads only sequential integer keys; string keys are silently ignored and trigger \"undefined array key\" warnings at runtime.",
+            )
+            .with_help(
+                "Use a keyed pattern like `['name' => $a, 'age' => $b]`, or convert the source to a list with `array_values(...)`.",
+            );
+
+        context.collector.report_with_code(IssueCode::ListDestructureStringKey, issue);
+    }
+
+    if has_negative_signal {
+        let assigned_type_str = array_type.get_id();
+        let mut issue = Issue::warning(format!(
+            "List-style destructuring of a value with negative integer keys (`{assigned_type_str}`).",
+        ))
+        .with_annotation(
+            Annotation::primary(target_span)
+                .with_message("This list-style destructuring only reads keys `0`, `1`, `2`, ..."),
+        );
+
+        if let Some(source_expression) = source_expression {
+            issue = issue.with_annotation(
+                Annotation::secondary(source_expression.span())
+                    .with_message(format!("...but this expression has type `{assigned_type_str}`")),
+            );
+        }
+
+        issue = issue
+            .with_note(
+                "PHP list destructuring starts at key `0`; negative keys present in the source are silently ignored.",
+            )
+            .with_help(
+                "Use a keyed pattern like `[-1 => $a, 0 => $b]` to capture the negative entry, or convert the source to a list with `array_values(...)`.",
+            );
+
+        context.collector.report_with_code(IssueCode::ListDestructureNegativeKey, issue);
+    }
 }
 
 fn analyze_assignment_target<'ctx, 'arena>(
@@ -918,7 +1044,7 @@ fn analyze_assignment_target<'ctx, 'arena>(
 fn handle_assignment_with_boolean_logic<'ctx, 'arena>(
     context: &mut Context<'ctx, 'arena>,
     block_context: &mut BlockContext<'ctx>,
-    artifacts: &mut AnalysisArtifacts,
+    artifacts: &AnalysisArtifacts,
     variable_expression_id: Span,
     source_expression: &Expression<'arena>,
     variable_id: Atom,
@@ -938,6 +1064,16 @@ fn handle_assignment_with_boolean_logic<'ctx, 'arena>(
 
     let right_clauses =
         BlockContext::filter_clauses(context, variable_id, right_clauses.into_iter().map(Rc::new).collect(), None);
+
+    let mut covered_variable_ids: AtomSet = AtomSet::default();
+    covered_variable_ids.insert(variable_id);
+    for clause in &right_clauses {
+        for var in clause.possibilities.keys() {
+            covered_variable_ids.insert(*var);
+        }
+    }
+
+    block_context.parent_conflicting_clause_variables.retain(|var| !covered_variable_ids.contains(var));
 
     let mut possibilities = IndexMap::default();
     possibilities.insert(variable_id, IndexMap::from([(Assertion::Falsy.to_hash(), Assertion::Falsy)]));
@@ -989,7 +1125,7 @@ mod tests {
 
     test_analysis! {
         name = test_var_docblock,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             namespace Example;
@@ -1039,7 +1175,7 @@ mod tests {
 
     test_analysis! {
         name = test_var_docblock_override_narrow,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             namespace Example;
@@ -1058,7 +1194,7 @@ mod tests {
 
     test_analysis! {
         name = test_var_docblock_override_widen,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /**
@@ -1075,7 +1211,7 @@ mod tests {
 
     test_analysis! {
         name = test_var_docblock_overridei,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /**
@@ -1095,7 +1231,7 @@ mod tests {
 
     test_analysis! {
         name = list_assignment,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /**
@@ -1126,7 +1262,7 @@ mod tests {
 
     test_analysis! {
         name = destructuring_shape,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /**
@@ -1166,7 +1302,7 @@ mod tests {
 
     test_analysis! {
         name = destructuring_keyed_shape_to_variables,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
             /** @return array{name: string, age: int, hobbies: list<string>} */
             function get_user_shape(): array {
@@ -1190,7 +1326,7 @@ mod tests {
 
     test_analysis! {
         name = destructuring_list_to_variables,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
             /** @return list<string> */
             function get_simple_list(): array { return ['a', 'b', 'c']; }
@@ -1207,7 +1343,7 @@ mod tests {
 
     test_analysis! {
         name = destructuring_list_with_skipped_elements,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
             /** @param 'one' $_s */
             function i_take_one(string $_s): void {}
@@ -1224,7 +1360,7 @@ mod tests {
 
     test_analysis! {
         name = destructuring_list_with_trailing_comma_skip,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
             /** @param 10 $_i */
             function i_take_ten(int $_i): void {}
@@ -1236,7 +1372,7 @@ mod tests {
 
     test_analysis! {
         name = destructuring_nested_list_within_keyed,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
             /** @return array{name: string, data: list<int>} */
             function get_shape_with_list(): array { return ['name' => 'test', 'data' => [10, 20]]; }
@@ -1255,7 +1391,7 @@ mod tests {
 
     test_analysis! {
         name = destructuring_nested_keyed_within_list,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
             /** @return list<array{id: int}> */
             function get_list_of_shapes(): array { return [['id' => 1], ['id' => 2]]; }
@@ -1271,7 +1407,7 @@ mod tests {
 
     test_analysis! {
         name = destructuring_empty_array_results_in_null,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
             /** @param null $_n */
             function i_take_null($_n): void {}
@@ -1287,7 +1423,7 @@ mod tests {
 
     test_analysis! {
         name = destructuring_missing_keyed_element_results_in_null,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
             /** @param null $_n */
             function i_take_null($_n): void {}
@@ -1304,7 +1440,7 @@ mod tests {
 
     test_analysis! {
         name = destructuring_list_with_fewer_elements_results_in_null,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
             /** @param null $_n */
             function i_take_null($_n): void {}
@@ -1322,7 +1458,7 @@ mod tests {
 
     test_analysis! {
         name = destructuring_list_syntax_basic,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
             /** @param string $_s */
             function i_take_string(string $_s): void {}
@@ -1335,7 +1471,7 @@ mod tests {
 
     test_analysis! {
         name = destructuring_list_syntax_with_skipped_elements,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
             /** @param string $_s */
             function i_take_string(string $_s): void {}
@@ -1348,7 +1484,7 @@ mod tests {
 
     test_analysis! {
         name = destructuring_list_syntax_with_keyed_source,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
             /** @param string $_s */
             function i_take_string(string $_s): void {}
@@ -1362,7 +1498,7 @@ mod tests {
 
     test_analysis! {
         name = destructuring_keyed_with_integer_keys,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
             /** @param string $_s */
             function i_take_string(string $_s): void {}
@@ -1376,7 +1512,7 @@ mod tests {
 
     test_analysis! {
         name = destructuring_empty_target_is_valid,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
             [] = [1, 2, 3]; // This is valid syntax, should produce no errors.
         "},
@@ -1404,7 +1540,7 @@ mod tests {
             allow_possibly_undefined_array_keys: false,
             ..Default::default()
         },
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /** @param array<int, float> $source */
@@ -1428,7 +1564,7 @@ mod tests {
             allow_possibly_undefined_array_keys: true,
             ..Default::default()
         },
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             /** @param array<int, float> $source */
@@ -1444,7 +1580,7 @@ mod tests {
 
     test_analysis! {
         name = expression_is_too_complex,
-        code = indoc! {r"
+        code = indoc! {"
             <?php
 
             function is_special_case(int $id, int $count, float $score, float $threshold, bool $is_active, bool $is_admin, string $name, string $role, string $permission, string $category): bool {

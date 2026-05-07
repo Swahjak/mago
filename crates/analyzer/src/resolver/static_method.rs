@@ -35,7 +35,10 @@ use crate::resolver::method::ResolvedMethod;
 use crate::resolver::method::report_magic_call_without_call_method;
 use crate::resolver::method::report_non_documented_method;
 use crate::resolver::method::report_non_existent_method;
+use crate::resolver::method::report_possibly_missing_magic_call;
 use crate::resolver::selector::resolve_member_selector;
+use crate::utils::names::display_class_like_name;
+use crate::utils::names::display_method_name;
 use crate::visibility::check_method_visibility;
 
 /// Resolves all possible static method targets from a class expression and a member selector.
@@ -117,7 +120,7 @@ pub fn resolve_static_method_targets<'ctx, 'ast, 'arena>(
 
 fn resolve_method_from_classname<'ctx, 'arena>(
     context: &mut Context<'ctx, 'arena>,
-    block_context: &mut BlockContext<'ctx>,
+    block_context: &BlockContext<'ctx>,
     current_class_metadata: Option<&'ctx ClassLikeMetadata>,
     method_name: Atom,
     class_span: Span,
@@ -334,7 +337,7 @@ fn resolve_method_from_classname<'ctx, 'arena>(
 
 fn resolve_method_from_metadata<'ctx, 'arena>(
     context: &mut Context<'ctx, 'arena>,
-    block_context: &mut BlockContext<'ctx>,
+    block_context: &BlockContext<'ctx>,
     current_class_metadata: Option<&'ctx ClassLikeMetadata>,
     method_name: Atom,
     fq_class_id: Atom,
@@ -383,17 +386,28 @@ fn resolve_method_from_metadata<'ctx, 'arena>(
         result.has_invalid_target = true;
     }
 
-    if function_like.flags.is_magic_method() && !has_magic_static_call {
+    if function_like.flags.is_magic_method() && !has_magic_static_call && !defining_class_metadata.kind.is_interface() {
         let is_static = !classname.is_parent();
 
-        report_magic_call_without_call_method(
-            context,
-            class_span,
-            selector.span(),
-            method_id.get_class_name(),
-            method_name,
-            is_static,
-        );
+        if defining_class_metadata.flags.is_final() && !defining_class_metadata.flags.is_abstract() {
+            report_magic_call_without_call_method(
+                context,
+                class_span,
+                selector.span(),
+                method_id.get_class_name(),
+                method_name,
+                is_static,
+            );
+        } else {
+            report_possibly_missing_magic_call(
+                context,
+                class_span,
+                selector.span(),
+                method_id.get_class_name(),
+                method_name,
+                is_static,
+            );
+        }
     }
 
     let static_class_type = if let Some(current_class_metadata) = current_class_metadata
@@ -521,8 +535,10 @@ fn get_metadata_object<'ctx>(
 }
 
 fn report_non_static_access(context: &mut Context, method_id: &MethodIdentifier, span: Span) {
-    let method_name = method_id.get_method_name();
-    let class_name = method_id.get_class_name();
+    let class_lower = method_id.get_class_name();
+    let method_lower = method_id.get_method_name();
+    let class_name = display_class_like_name(context, class_lower);
+    let method_name = display_method_name(context, class_lower, method_lower);
 
     context.collector.report_with_code(
         IssueCode::InvalidStaticMethodAccess,
@@ -533,6 +549,7 @@ fn report_non_static_access(context: &mut Context, method_id: &MethodIdentifier,
 }
 
 fn report_static_call_on_interface(context: &mut Context, name: Atom, span: Span, from_class_string: bool) {
+    let name = display_class_like_name(context, name);
     if from_class_string {
         context.collector.report_with_code(
             IssueCode::PossiblyStaticAccessOnInterface,
@@ -560,6 +577,7 @@ fn report_static_call_on_interface(context: &mut Context, name: Atom, span: Span
 }
 
 fn report_deprecated_static_access_on_trait(context: &mut Context, name: Atom, span: Span) {
+    let name = display_class_like_name(context, name);
     context.collector.report_with_code(
         IssueCode::DeprecatedFeature,
         Issue::warning(format!("Calling static methods directly on traits (`{name}`) is deprecated."))
@@ -578,6 +596,9 @@ fn report_possibly_non_existent_mixin_static_method(
     method_name: Atom,
     mixin_classname: Atom,
 ) {
+    let mixin_classname = display_class_like_name(context, mixin_classname);
+    let method_name = display_method_name(context, classname, method_name);
+    let classname = display_class_like_name(context, classname);
     context.collector.report_with_code(
         IssueCode::PossiblyNonExistentMethod,
         Issue::warning(format!(
@@ -611,6 +632,9 @@ fn report_non_existent_mixin_static_method(
     method_name: Atom,
     mixin_classname: Atom,
 ) {
+    let mixin_classname = display_class_like_name(context, mixin_classname);
+    let method_name = display_method_name(context, classname, method_name);
+    let classname = display_class_like_name(context, classname);
     context.collector.report_with_code(
         IssueCode::NonExistentMethod,
         Issue::error(format!(
@@ -639,7 +663,7 @@ fn report_non_existent_mixin_static_method(
 /// In such cases, we fall back to using the constraint type.
 fn find_static_method_in_mixins<'ctx, 'arena>(
     context: &mut Context<'ctx, 'arena>,
-    block_context: &mut BlockContext<'ctx>,
+    block_context: &BlockContext<'ctx>,
     mixins: &[TUnion],
     method_name: Atom,
     selector: &ClassLikeMemberSelector<'arena>,
@@ -705,7 +729,7 @@ fn find_static_method_in_mixins<'ctx, 'arena>(
 /// Searches for a static method in a single mixin class.
 fn find_static_method_in_single_mixin<'ctx, 'arena>(
     context: &mut Context<'ctx, 'arena>,
-    block_context: &mut BlockContext<'ctx>,
+    block_context: &BlockContext<'ctx>,
     mixin_class_name: Atom,
     method_name: Atom,
     selector: &ClassLikeMemberSelector<'arena>,

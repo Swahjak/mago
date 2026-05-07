@@ -20,14 +20,13 @@ use crate::ttype::combiner;
 use crate::ttype::get_never;
 use crate::ttype::template::TemplateBound;
 use crate::ttype::template::TemplateResult;
-use crate::ttype::template::standin_type_replacer;
-use crate::ttype::template::standin_type_replacer::get_most_specific_type_from_bounds;
+use crate::ttype::template::bounds::get_most_specific_type_from_bounds;
+use crate::ttype::template::bounds::get_root_template_type;
 use crate::ttype::union::TUnion;
 use crate::ttype::wrap_atomic;
 
 #[must_use]
 pub fn replace(union: &TUnion, template_result: &TemplateResult, codebase: &CodebaseMetadata) -> TUnion {
-    let mut keys_to_unset = HashSet::default();
     let mut new_types = Vec::new();
 
     for atomic_type in union.types.as_ref() {
@@ -49,13 +48,12 @@ pub fn replace(union: &TUnion, template_result: &TemplateResult, codebase: &Code
                     defining_entity,
                     codebase,
                     constraint,
-                    intersection_types,
+                    intersection_types.as_ref(),
                     template_result,
                     *key,
                 );
 
                 if let Some(template_type) = template_type {
-                    keys_to_unset.insert(*key);
                     new_types.extend(template_type.types.into_owned());
                 } else {
                     new_types.push(atomic_type);
@@ -106,7 +104,6 @@ pub fn replace(union: &TUnion, template_result: &TemplateResult, codebase: &Code
                     }
 
                     if !class_template_types.is_empty() {
-                        keys_to_unset.insert(*parameter_name);
                         new_types.extend(class_template_types);
                     } else {
                         new_types.push(atomic_type);
@@ -135,24 +132,19 @@ fn replace_template_parameter(
     defining_entity: &GenericParent,
     codebase: &CodebaseMetadata,
     constraint: &TUnion,
-    intersection_types: &Option<Vec<TAtomic>>,
+    intersection_types: Option<&Vec<TAtomic>>,
     template_result: &TemplateResult,
     key: Atom,
 ) -> Option<TUnion> {
     let mut template_type = None;
-    let traversed_type = standin_type_replacer::get_root_template_type(
-        inferred_lower_bounds,
-        parameter_name,
-        defining_entity,
-        HashSet::default(),
-        codebase,
-    );
+    let traversed_type =
+        get_root_template_type(inferred_lower_bounds, parameter_name, defining_entity, HashSet::default(), codebase);
 
     if let Some(traversed_type) = traversed_type {
         let mut template_type_inner = if !constraint.is_mixed() && traversed_type.is_mixed() {
             if constraint.is_array_key() { wrap_atomic(TAtomic::Scalar(TScalar::ArrayKey)) } else { constraint.clone() }
         } else {
-            traversed_type.clone()
+            traversed_type
         };
 
         if let Some(intersection_types) = intersection_types
@@ -208,7 +200,7 @@ fn replace_template_parameter(
                     && let Some(bounds_map) = inferred_lower_bounds.get(parameter_name)
                     && let Some(bounds) = bounds_map.get(defining_entity)
                 {
-                    template_type = Some(standin_type_replacer::get_most_specific_type_from_bounds(bounds, codebase));
+                    template_type = Some(get_most_specific_type_from_bounds(bounds, codebase));
                 }
             }
         }
@@ -317,6 +309,20 @@ fn replace_atomic(mut atomic: TAtomic, template_result: &TemplateResult, codebas
             TDerived::IntMaskOf(int_mask_of) => {
                 let replaced_target_type = replace(int_mask_of.get_target_type(), template_result, codebase);
                 *int_mask_of.get_target_type_mut() = replaced_target_type;
+            }
+            TDerived::New(new_type) => {
+                let replaced_target_type = replace(new_type.get_target_type(), template_result, codebase);
+                *new_type.get_target_type_mut() = replaced_target_type;
+            }
+            TDerived::TemplateType(template_type) => {
+                let replaced_object = replace(template_type.get_object(), template_result, codebase);
+                *template_type.get_object_mut() = replaced_object;
+
+                let replaced_class_name = replace(template_type.get_class_name(), template_result, codebase);
+                *template_type.get_class_name_mut() = replaced_class_name;
+
+                let replaced_template_name = replace(template_type.get_template_name(), template_result, codebase);
+                *template_type.get_template_name_mut() = replaced_template_name;
             }
         },
         _ => (),

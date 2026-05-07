@@ -4,6 +4,7 @@ use std::hash::Hasher;
 use foldhash::fast::FixedState;
 
 use mago_names::ResolvedNames;
+use mago_syntax::ast::Trivia;
 
 pub mod access;
 pub mod argument;
@@ -56,6 +57,7 @@ pub mod r#yield;
 const DEFAULT_IMPORTANT_COMMENT_PATTERNS: &[&str] = &["@mago-", "@"];
 
 pub trait Fingerprintable {
+    #[inline]
     fn fingerprint(&self, resolved_names: &ResolvedNames, options: &FingerprintOptions<'_>) -> u64 {
         let mut hasher = FixedState::default().build_hasher();
         self.fingerprint_with_hasher(&mut hasher, resolved_names, options);
@@ -71,6 +73,7 @@ pub trait Fingerprintable {
 }
 
 impl<T: Fingerprintable> Fingerprintable for Option<T> {
+    #[inline]
     fn fingerprint_with_hasher<H: std::hash::Hasher>(
         &self,
         hasher: &mut H,
@@ -87,6 +90,7 @@ impl<T> Fingerprintable for &T
 where
     T: Fingerprintable,
 {
+    #[inline]
     fn fingerprint_with_hasher<H: std::hash::Hasher>(
         &self,
         hasher: &mut H,
@@ -98,45 +102,65 @@ where
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FingerprintOptions<'a> {
+pub struct FingerprintOptions<'opts> {
     pub include_use_statements: bool,
-    pub important_comment_patterns: &'a [&'a str],
+    pub important_comment_patterns: &'opts [&'opts str],
     pub signature_only: bool,
+    pub trivia_context: Option<&'opts [Trivia<'opts>]>,
 }
 
 impl Default for FingerprintOptions<'_> {
+    #[inline]
     fn default() -> Self {
         Self {
             include_use_statements: false,
             important_comment_patterns: DEFAULT_IMPORTANT_COMMENT_PATTERNS,
             signature_only: false,
+            trivia_context: None,
         }
     }
 }
 
-impl<'a> FingerprintOptions<'a> {
+impl<'opts> FingerprintOptions<'opts> {
+    #[inline]
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    #[inline]
     #[must_use]
     pub fn strict() -> Self {
-        Self { include_use_statements: true, important_comment_patterns: &[], signature_only: false }
+        Self {
+            include_use_statements: true,
+            important_comment_patterns: &[],
+            signature_only: false,
+            trivia_context: None,
+        }
     }
 
+    #[inline]
+    #[must_use]
+    pub fn with_trivia_context(mut self, trivia: &'opts [Trivia<'opts>]) -> Self {
+        self.trivia_context = Some(trivia);
+        self
+    }
+
+    #[inline]
     #[must_use]
     pub fn with_use_statements(mut self, include: bool) -> Self {
         self.include_use_statements = include;
         self
     }
 
+    #[inline]
     #[must_use]
-    pub fn with_comment_patterns(mut self, patterns: &'a [&'a str]) -> Self {
+    pub fn with_comment_patterns(mut self, patterns: &'opts [&'opts str]) -> Self {
         self.important_comment_patterns = patterns;
         self
     }
 
+    #[inline]
     #[must_use]
     pub fn is_important_comment(&self, comment: &str) -> bool {
         for pattern in self.important_comment_patterns {

@@ -2,6 +2,7 @@ use serde::Serialize;
 use strum::Display;
 
 use mago_database::file::FileId;
+use mago_span::HasPosition;
 use mago_span::Position;
 use mago_span::Span;
 
@@ -268,10 +269,17 @@ pub enum TokenKind {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, PartialOrd, Ord)]
-pub struct Token<'a> {
+pub struct Token<'src> {
     pub kind: TokenKind,
     pub start: Position,
-    pub value: &'a str,
+    pub value: &'src str,
+}
+
+impl HasPosition for Token<'_> {
+    #[inline]
+    fn position(&self) -> Position {
+        self.start
+    }
 }
 
 impl Precedence {
@@ -727,7 +735,7 @@ impl TokenKind {
             return true;
         }
 
-        matches!(self, T!["@" | "!" | "~" | "-" | "+" | "++" | "--" | "&"])
+        matches!(self, T!["@" | "!" | "~" | "-" | "+" | "++" | "--"])
     }
 
     #[inline]

@@ -1,6 +1,3 @@
-use mago_database::file::HasFileId;
-
-use crate::ast::Keyword;
 use crate::ast::ShapeField;
 use crate::ast::ShapeFieldKey;
 use crate::ast::Type;
@@ -13,8 +10,8 @@ use crate::parser::internal::stream::TypeTokenStream;
 use crate::token::TypeTokenKind;
 
 #[inline]
-pub fn parse_object_type<'input>(stream: &mut TypeTokenStream<'input>) -> Result<Type<'input>, ParseError> {
-    let keyword = Keyword::from_token(stream.eat(TypeTokenKind::Object)?, stream.file_id());
+pub fn parse_object_type<'arena>(stream: &mut TypeTokenStream<'arena>) -> Result<Type<'arena>, ParseError> {
+    let keyword = stream.eat_keyword(TypeTokenKind::Object)?;
     if !stream.is_at(TypeTokenKind::LeftBrace)? {
         return Ok(Type::Object(ObjectType { keyword, properties: None }));
     }
@@ -22,74 +19,25 @@ pub fn parse_object_type<'input>(stream: &mut TypeTokenStream<'input>) -> Result
     Ok(Type::Object(ObjectType {
         keyword,
         properties: Some(ObjectProperties {
-            left_brace: stream.eat(TypeTokenKind::LeftBrace)?.span_for(stream.file_id()),
+            left_brace: stream.eat_span(TypeTokenKind::LeftBrace)?,
             fields: {
-                let mut fields = Vec::new();
+                let mut fields = stream.new_bvec::<ShapeField<'arena>>();
                 while !stream.is_at(TypeTokenKind::RightBrace)? && !stream.is_at(TypeTokenKind::Ellipsis)? {
-                    let has_key = {
-                        let mut found_key = false;
-                        // Scan ahead to determine if a key is present before the value type.
-                        for i in 0.. {
-                            let Some(token) = stream.lookahead(i)? else {
-                                // Reached the end of the stream, so no key was found.
-                                break;
-                            };
+                    let has_key = crate::parser::internal::array_like::scan_for_shape_field_key(stream)?;
 
-                            match token.kind {
-                                // If we find a colon, we know a key is present.
-                                TypeTokenKind::Colon => {
-                                    found_key = true;
-                                    break;
-                                }
-                                // If we find a question mark, it could indicate a key,
-                                // if the following token is a colon.
-                                TypeTokenKind::Question
-                                    if stream.lookahead(i + 1)?.is_some_and(|t| t.kind == TypeTokenKind::Colon) =>
-                                {
-                                    found_key = true;
-                                    break;
-                                }
-                                // If we find any of these tokens, what came before must have
-                                // been a full value type, not a key.
-                                TypeTokenKind::Comma
-                                | TypeTokenKind::RightBrace
-                                | TypeTokenKind::LeftBrace
-                                | TypeTokenKind::LeftParenthesis
-                                | TypeTokenKind::RightParenthesis
-                                | TypeTokenKind::LeftBracket
-                                | TypeTokenKind::RightBracket
-                                | TypeTokenKind::Ellipsis => {
-                                    break;
-                                }
-                                // Any other token is part of a potential key, so keep scanning.
-                                _ => {}
-                            }
-                        }
-
-                        found_key
+                    let key = if has_key {
+                        let shape_key = parse_shape_field_key(stream)?;
+                        let question_mark =
+                            if stream.is_at(TypeTokenKind::Question)? { Some(stream.consume_span()?) } else { None };
+                        let colon = stream.eat_span(TypeTokenKind::Colon)?;
+                        Some(ShapeFieldKey { key: shape_key, question_mark, colon })
+                    } else {
+                        None
                     };
-
-                    let field = ShapeField {
-                        key: if has_key {
-                            Some(ShapeFieldKey {
-                                key: parse_shape_field_key(stream)?,
-                                question_mark: if stream.is_at(TypeTokenKind::Question)? {
-                                    Some(stream.consume()?.span_for(stream.file_id()))
-                                } else {
-                                    None
-                                },
-                                colon: stream.eat(TypeTokenKind::Colon)?.span_for(stream.file_id()),
-                            })
-                        } else {
-                            None
-                        },
-                        value: Box::new(parse_type(stream)?),
-                        comma: if stream.is_at(TypeTokenKind::Comma)? {
-                            Some(stream.consume()?.span_for(stream.file_id()))
-                        } else {
-                            None
-                        },
-                    };
+                    let value_ty = parse_type(stream)?;
+                    let value = stream.alloc(value_ty);
+                    let comma = if stream.is_at(TypeTokenKind::Comma)? { Some(stream.consume_span()?) } else { None };
+                    let field = ShapeField { key, value, comma };
 
                     if field.comma.is_none() {
                         fields.push(field);
@@ -99,14 +47,10 @@ pub fn parse_object_type<'input>(stream: &mut TypeTokenStream<'input>) -> Result
                     fields.push(field);
                 }
 
-                fields
+                mago_syntax_core::ast::Sequence::new(fields)
             },
-            ellipsis: if stream.is_at(TypeTokenKind::Ellipsis)? {
-                Some(stream.consume()?.span_for(stream.file_id()))
-            } else {
-                None
-            },
-            right_brace: stream.eat(TypeTokenKind::RightBrace)?.span_for(stream.file_id()),
+            ellipsis: if stream.is_at(TypeTokenKind::Ellipsis)? { Some(stream.consume_span()?) } else { None },
+            right_brace: stream.eat_span(TypeTokenKind::RightBrace)?,
         }),
     }))
 }

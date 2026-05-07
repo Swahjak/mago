@@ -20,12 +20,28 @@ pub mod keyed;
 pub mod list;
 
 /// Represents the type of a PHP array, distinguishing between list-like and keyed/associative usage.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Eq, Hash, PartialOrd, Ord)]
+#[allow(clippy::derived_hash_with_manual_eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, Hash, PartialOrd, Ord)]
 pub enum TArray {
     /// Represents an array used as a list (sequential, zero-based integer keys). `list<T>`.
     List(TList),
     /// Represents an array used as a map (string keys or non-standard integer keys). `array<Tk, Tv>`.
     Keyed(TKeyedArray),
+}
+
+impl PartialEq for TArray {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        if std::ptr::eq(self, other) {
+            return true;
+        }
+
+        match (self, other) {
+            (TArray::List(a), TArray::List(b)) => a == b,
+            (TArray::Keyed(a), TArray::Keyed(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 impl TArray {
@@ -299,17 +315,17 @@ impl TArray {
         match self {
             Self::Keyed(keyed_array) => {
                 if let Some(parameters) = keyed_array.parameters.as_mut() {
-                    if let TAtomic::Placeholder = parameters.0.get_single() {
+                    if matches!(parameters.0.get_single(), TAtomic::Placeholder) {
                         *Arc::make_mut(&mut parameters.0) = get_arraykey();
                     }
 
-                    if let TAtomic::Placeholder = parameters.1.get_single() {
+                    if matches!(parameters.1.get_single(), TAtomic::Placeholder) {
                         *Arc::make_mut(&mut parameters.1) = get_mixed();
                     }
                 }
             }
             Self::List(list) => {
-                if let TAtomic::Placeholder = list.element_type.get_single() {
+                if matches!(list.element_type.get_single(), TAtomic::Placeholder) {
                     *Arc::make_mut(&mut list.element_type) = get_mixed();
                 }
             }

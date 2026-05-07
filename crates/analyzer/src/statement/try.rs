@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
+use std::hash::BuildHasherDefault;
 use std::rc::Rc;
 
 use mago_atom::Atom;
@@ -82,7 +83,19 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Try<'arena> {
         block_context.assigned_variable_ids.extend(assigned_variable_ids);
         block_context.assigned_variable_ids.extend(newly_assigned_variable_ids.iter().map(|(v, u)| (*v, *u)));
 
-        for (variable_id, variable_type) in std::mem::take(&mut block_context.locals) {
+        let post_try_locals = std::mem::take(&mut block_context.locals);
+
+        let invalidated_during_try: Vec<Atom> = old_block_context_locals
+            .keys()
+            .copied()
+            .filter(|variable_id| !post_try_locals.contains_key(variable_id))
+            .collect();
+
+        for variable_id in &invalidated_during_try {
+            try_block_context.locals.remove(variable_id);
+        }
+
+        for (variable_id, variable_type) in post_try_locals {
             match try_block_context.locals.entry(variable_id) {
                 Entry::Occupied(mut occupied_entry) => {
                     let combined_type = ttype::combine_union_types(
@@ -109,7 +122,7 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Try<'arena> {
         if let Some(try_scope) = &try_block_context.finally_scope {
             let mut mutable_try_scope = try_scope.borrow_mut();
 
-            for (variable_id, variable_type) in &block_context.locals {
+            for (variable_id, variable_type) in &try_block_context.locals {
                 if let Some(existing_type) = mutable_try_scope.locals.get_mut(variable_id) {
                     let combined_type = ttype::combine_union_types(
                         existing_type,
@@ -120,7 +133,7 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Try<'arena> {
 
                     *existing_type = Rc::new(combined_type);
                 } else {
-                    mutable_try_scope.locals.insert(*variable_id, variable_type.clone());
+                    mutable_try_scope.locals.insert(*variable_id, Rc::clone(variable_type));
                 }
             }
         }
@@ -248,7 +261,7 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Try<'arena> {
 
                 for (variable_id, variable_type) in &catch_block_context.locals {
                     if end_action_only {
-                        block_context.locals.insert(*variable_id, variable_type.clone());
+                        block_context.locals.insert(*variable_id, Rc::clone(variable_type));
                     } else if let Some(existing_type) = block_context.locals.get(variable_id) {
                         block_context.locals.insert(
                             *variable_id,
@@ -259,12 +272,16 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Try<'arena> {
                                 CombinerOptions::default(),
                             )),
                         );
+                    } else {
+                        // variable from catch isn't in the parent scope and try doesn't always end; drop it
                     }
                 }
 
                 block_context.variables_possibly_in_scope.extend(catch_block_context.variables_possibly_in_scope);
             } else if self.finally_clause.is_some() {
                 block_context.variables_possibly_in_scope.extend(catch_block_context.variables_possibly_in_scope);
+            } else {
+                // catch leaves the parent scope and there's no finally; nothing to merge back
             }
 
             if let Some(mut finally_scope) = try_block_context.finally_scope.as_ref().map(|s| s.borrow_mut()) {
@@ -294,6 +311,9 @@ impl<'ast, 'arena> Analyzable<'ast, 'arena> for Try<'arena> {
 
         let mut finally_has_returned = false;
         if let Some(finally_clause) = self.finally_clause.as_ref() {
+            // SAFETY: when a try statement has a `finally_clause`, the finally scope is always
+            // initialized on `try_block_context` before reaching this point, so the `Option` is
+            // guaranteed to be `Some`.
             let finally_scope = unsafe {
                 try_block_context
                     .finally_scope
@@ -433,7 +453,7 @@ fn get_caught_classes<'arena>(context: &mut Context<'_, 'arena>, hint: &Hint<'ar
     walk(context, hint, &mut caught_identifiers);
 
     let throwable = atom("Throwable");
-    let mut caught_classes = AtomSet::with_capacity_and_hasher(caught_identifiers.len(), Default::default());
+    let mut caught_classes = AtomSet::with_capacity_and_hasher(caught_identifiers.len(), BuildHasherDefault::default());
     for (caught_type, caught_span) in caught_identifiers {
         if caught_type.eq_ignore_ascii_case("throwable")
             || caught_type.eq_ignore_ascii_case("exception")

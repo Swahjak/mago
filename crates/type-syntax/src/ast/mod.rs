@@ -18,11 +18,13 @@ pub use crate::ast::iterable::*;
 pub use crate::ast::key_of::*;
 pub use crate::ast::keyword::*;
 pub use crate::ast::literal::*;
+pub use crate::ast::new::*;
 use crate::ast::object::ObjectType;
 pub use crate::ast::properties_of::*;
 pub use crate::ast::reference::*;
 pub use crate::ast::shape::*;
 pub use crate::ast::slice::*;
+pub use crate::ast::template_type::*;
 pub use crate::ast::unary::*;
 pub use crate::ast::value_of::*;
 pub use crate::ast::variable::*;
@@ -43,11 +45,13 @@ pub mod iterable;
 pub mod key_of;
 pub mod keyword;
 pub mod literal;
+pub mod new;
 pub mod object;
 pub mod properties_of;
 pub mod reference;
 pub mod shape;
 pub mod slice;
+pub mod template_type;
 pub mod unary;
 pub mod value_of;
 pub mod variable;
@@ -56,80 +60,85 @@ pub mod wildcard;
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, PartialOrd, Ord)]
 #[serde(tag = "type", content = "value")]
 #[non_exhaustive]
-pub enum Type<'input> {
-    Parenthesized(ParenthesizedType<'input>),
-    Union(UnionType<'input>),
-    Intersection(IntersectionType<'input>),
-    Nullable(NullableType<'input>),
-    Array(ArrayType<'input>),
-    NonEmptyArray(NonEmptyArrayType<'input>),
-    AssociativeArray(AssociativeArrayType<'input>),
-    List(ListType<'input>),
-    NonEmptyList(NonEmptyListType<'input>),
-    Iterable(IterableType<'input>),
-    ClassString(ClassStringType<'input>),
-    InterfaceString(InterfaceStringType<'input>),
-    EnumString(EnumStringType<'input>),
-    TraitString(TraitStringType<'input>),
-    Reference(ReferenceType<'input>),
-    Mixed(Keyword<'input>),
-    NonEmptyMixed(Keyword<'input>),
-    Null(Keyword<'input>),
-    Void(Keyword<'input>),
-    Never(Keyword<'input>),
-    Resource(Keyword<'input>),
-    ClosedResource(Keyword<'input>),
-    OpenResource(Keyword<'input>),
-    True(Keyword<'input>),
-    False(Keyword<'input>),
-    Bool(Keyword<'input>),
-    Float(Keyword<'input>),
-    Int(Keyword<'input>),
-    PositiveInt(Keyword<'input>),
-    NegativeInt(Keyword<'input>),
-    NonPositiveInt(Keyword<'input>),
-    NonNegativeInt(Keyword<'input>),
-    String(Keyword<'input>),
-    StringableObject(Keyword<'input>),
-    ArrayKey(Keyword<'input>),
-    Object(ObjectType<'input>),
-    Numeric(Keyword<'input>),
-    Scalar(Keyword<'input>),
-    CallableString(Keyword<'input>),
-    LowercaseCallableString(Keyword<'input>),
-    UppercaseCallableString(Keyword<'input>),
-    NumericString(Keyword<'input>),
-    NonEmptyString(Keyword<'input>),
-    NonEmptyLowercaseString(Keyword<'input>),
-    LowercaseString(Keyword<'input>),
-    NonEmptyUppercaseString(Keyword<'input>),
-    UppercaseString(Keyword<'input>),
-    TruthyString(Keyword<'input>),
-    NonFalsyString(Keyword<'input>),
-    UnspecifiedLiteralInt(Keyword<'input>),
-    UnspecifiedLiteralString(Keyword<'input>),
-    UnspecifiedLiteralFloat(Keyword<'input>),
-    NonEmptyUnspecifiedLiteralString(Keyword<'input>),
-    LiteralFloat(LiteralFloatType<'input>),
-    LiteralInt(LiteralIntType<'input>),
-    LiteralString(LiteralStringType<'input>),
-    MemberReference(MemberReferenceType<'input>),
-    AliasReference(AliasReferenceType<'input>),
-    Shape(ShapeType<'input>),
-    Callable(CallableType<'input>),
-    Variable(VariableType<'input>),
-    Conditional(ConditionalType<'input>),
-    KeyOf(KeyOfType<'input>),
-    ValueOf(ValueOfType<'input>),
-    IntMask(IntMaskType<'input>),
-    IntMaskOf(IntMaskOfType<'input>),
-    IndexAccess(IndexAccessType<'input>),
-    Negated(NegatedType<'input>),
-    Posited(PositedType<'input>),
-    IntRange(IntRangeType<'input>),
-    PropertiesOf(PropertiesOfType<'input>),
-    Slice(SliceType<'input>),
+pub enum Type<'arena> {
+    Parenthesized(ParenthesizedType<'arena>),
+    Union(UnionType<'arena>),
+    Intersection(IntersectionType<'arena>),
+    Nullable(NullableType<'arena>),
+    Array(ArrayType<'arena>),
+    NonEmptyArray(NonEmptyArrayType<'arena>),
+    AssociativeArray(AssociativeArrayType<'arena>),
+    List(ListType<'arena>),
+    NonEmptyList(NonEmptyListType<'arena>),
+    Iterable(IterableType<'arena>),
+    ClassString(ClassStringType<'arena>),
+    InterfaceString(InterfaceStringType<'arena>),
+    EnumString(EnumStringType<'arena>),
+    TraitString(TraitStringType<'arena>),
+    Reference(ReferenceType<'arena>),
+    Mixed(Keyword<'arena>),
+    NonEmptyMixed(Keyword<'arena>),
+    Null(Keyword<'arena>),
+    Void(Keyword<'arena>),
+    Never(Keyword<'arena>),
+    Resource(Keyword<'arena>),
+    ClosedResource(Keyword<'arena>),
+    OpenResource(Keyword<'arena>),
+    True(Keyword<'arena>),
+    False(Keyword<'arena>),
+    Bool(Keyword<'arena>),
+    Float(Keyword<'arena>),
+    Int(Keyword<'arena>),
+    PositiveInt(Keyword<'arena>),
+    NegativeInt(Keyword<'arena>),
+    NonPositiveInt(Keyword<'arena>),
+    NonNegativeInt(Keyword<'arena>),
+    NonZeroInt(Keyword<'arena>),
+    String(Keyword<'arena>),
+    StringableObject(Keyword<'arena>),
+    ArrayKey(Keyword<'arena>),
+    Object(ObjectType<'arena>),
+    Numeric(Keyword<'arena>),
+    Scalar(Keyword<'arena>),
+    CallableString(Keyword<'arena>),
+    LowercaseCallableString(Keyword<'arena>),
+    UppercaseCallableString(Keyword<'arena>),
+    NumericString(Keyword<'arena>),
+    NonEmptyString(Keyword<'arena>),
+    NonEmptyLowercaseString(Keyword<'arena>),
+    LowercaseString(Keyword<'arena>),
+    NonEmptyUppercaseString(Keyword<'arena>),
+    UppercaseString(Keyword<'arena>),
+    TruthyString(Keyword<'arena>),
+    NonFalsyString(Keyword<'arena>),
+    UnspecifiedLiteralInt(Keyword<'arena>),
+    UnspecifiedLiteralString(Keyword<'arena>),
+    UnspecifiedLiteralFloat(Keyword<'arena>),
+    NonEmptyUnspecifiedLiteralString(Keyword<'arena>),
+    LiteralFloat(LiteralFloatType<'arena>),
+    LiteralInt(LiteralIntType<'arena>),
+    LiteralString(LiteralStringType<'arena>),
+    MemberReference(MemberReferenceType<'arena>),
+    AliasReference(AliasReferenceType<'arena>),
+    Shape(ShapeType<'arena>),
+    Callable(CallableType<'arena>),
+    Variable(VariableType<'arena>),
+    Conditional(ConditionalType<'arena>),
+    KeyOf(KeyOfType<'arena>),
+    ValueOf(ValueOfType<'arena>),
+    IntMask(IntMaskType<'arena>),
+    IntMaskOf(IntMaskOfType<'arena>),
+    New(NewType<'arena>),
+    TemplateType(TemplateTypeType<'arena>),
+    IndexAccess(IndexAccessType<'arena>),
+    Negated(NegatedType<'arena>),
+    Posited(PositedType<'arena>),
+    IntRange(IntRangeType<'arena>),
+    PropertiesOf(PropertiesOfType<'arena>),
+    Slice(SliceType<'arena>),
     Wildcard(WildcardType),
+    TrailingPipe(TrailingPipeType<'arena>),
+    GlobalWildcardReference(GlobalWildcardType<'arena>),
 }
 
 impl HasSpan for Type<'_> {
@@ -167,6 +176,7 @@ impl HasSpan for Type<'_> {
             Type::NegativeInt(ty) => ty.span(),
             Type::NonPositiveInt(ty) => ty.span(),
             Type::NonNegativeInt(ty) => ty.span(),
+            Type::NonZeroInt(ty) => ty.span(),
             Type::String(ty) => ty.span(),
             Type::ArrayKey(ty) => ty.span(),
             Type::Scalar(ty) => ty.span(),
@@ -201,6 +211,8 @@ impl HasSpan for Type<'_> {
             Type::ValueOf(ty) => ty.span(),
             Type::IntMask(ty) => ty.span(),
             Type::IntMaskOf(ty) => ty.span(),
+            Type::New(ty) => ty.span(),
+            Type::TemplateType(ty) => ty.span(),
             Type::IndexAccess(ty) => ty.span(),
             Type::Negated(ty) => ty.span(),
             Type::Posited(ty) => ty.span(),
@@ -208,6 +220,8 @@ impl HasSpan for Type<'_> {
             Type::PropertiesOf(ty) => ty.span(),
             Type::Slice(ty) => ty.span(),
             Type::Wildcard(ty) => ty.span(),
+            Type::TrailingPipe(ty) => ty.span(),
+            Type::GlobalWildcardReference(ty) => ty.span(),
         }
     }
 }
@@ -247,6 +261,7 @@ impl std::fmt::Display for Type<'_> {
             Type::NegativeInt(ty) => write!(f, "{ty}"),
             Type::NonPositiveInt(ty) => write!(f, "{ty}"),
             Type::NonNegativeInt(ty) => write!(f, "{ty}"),
+            Type::NonZeroInt(ty) => write!(f, "{ty}"),
             Type::String(ty) => write!(f, "{ty}"),
             Type::ArrayKey(ty) => write!(f, "{ty}"),
             Type::Scalar(ty) => write!(f, "{ty}"),
@@ -281,6 +296,8 @@ impl std::fmt::Display for Type<'_> {
             Type::ValueOf(ty) => write!(f, "{ty}"),
             Type::IntMask(ty) => write!(f, "{ty}"),
             Type::IntMaskOf(ty) => write!(f, "{ty}"),
+            Type::New(ty) => write!(f, "{ty}"),
+            Type::TemplateType(ty) => write!(f, "{ty}"),
             Type::IndexAccess(ty) => write!(f, "{ty}"),
             Type::Negated(ty) => write!(f, "{ty}"),
             Type::Posited(ty) => write!(f, "{ty}"),
@@ -288,6 +305,8 @@ impl std::fmt::Display for Type<'_> {
             Type::PropertiesOf(ty) => write!(f, "{ty}"),
             Type::Slice(ty) => write!(f, "{ty}"),
             Type::Wildcard(ty) => write!(f, "{ty}"),
+            Type::TrailingPipe(ty) => write!(f, "{ty}"),
+            Type::GlobalWildcardReference(ty) => write!(f, "{ty}"),
         }
     }
 }

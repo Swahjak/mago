@@ -3,6 +3,7 @@ use mago_atom::Atom;
 use crate::metadata::CodebaseMetadata;
 use crate::ttype::atomic::TAtomic;
 use crate::ttype::atomic::object::TObject;
+use crate::ttype::atomic::object::named::TNamedObject;
 use crate::ttype::comparator::ComparisonResult;
 use crate::ttype::comparator::union_comparator;
 use crate::ttype::get_specialized_template_type;
@@ -66,7 +67,10 @@ pub(crate) fn is_contained_by(
 
         let mut parameter_comparison_result = ComparisonResult::new();
 
-        if !union_comparator::is_contained_by(
+        let variance =
+            container_metadata.template_variance.get(parameter_offset).copied().unwrap_or(Variance::Invariant);
+
+        let forward_ok = union_comparator::is_contained_by(
             codebase,
             &specialized_template_type,
             container_type_parameter,
@@ -74,8 +78,10 @@ pub(crate) fn is_contained_by(
             specialized_template_type.ignore_falsable_issues(),
             false,
             &mut parameter_comparison_result,
-        ) {
-            if let Some(Variance::Contravariant) = container_metadata.template_variance.get(&parameter_offset)
+        );
+
+        if !forward_ok {
+            if matches!(variance, Variance::Contravariant)
                 && union_comparator::is_contained_by(
                     codebase,
                     container_type_parameter,
@@ -91,13 +97,79 @@ pub(crate) fn is_contained_by(
 
             update_failed_result_from_nested(atomic_comparison_result, &parameter_comparison_result);
 
-            if !parameter_comparison_result.type_coerced_from_as_mixed.unwrap_or(false) {
+            // The `type_coerced_from_as_mixed` escape hatch lets a `mixed`
+            // input slip past a more specific container with a coercion
+            // warning. That's appropriate for variance-driven contexts
+            // (assignments, parameter passing) but not for invariant
+            // generics, where strict equality is the whole point.
+            let allow_mixed_coercion = !matches!(variance, Variance::Invariant)
+                && parameter_comparison_result.type_coerced_from_as_mixed.unwrap_or(false);
+
+            if !allow_mixed_coercion {
                 all_parameters_match = false;
             }
+
+            continue;
+        }
+
+        if matches!(variance, Variance::Invariant)
+            && !specialized_template_type.from_template_default()
+            && !container_type_parameter.from_template_default()
+        {
+            let mut reverse_result = ComparisonResult::new();
+            let reverse_ok = union_comparator::is_contained_by(
+                codebase,
+                container_type_parameter,
+                &specialized_template_type,
+                false,
+                container_type_parameter.ignore_falsable_issues(),
+                inside_assertion,
+                &mut reverse_result,
+            );
+
+            if !reverse_ok {
+                update_failed_result_from_nested(atomic_comparison_result, &reverse_result);
+
+                // Same rationale as the forward branch above: invariance
+                // means equality both ways, and a `type_coerced_from_as_mixed`
+                // signal indicates we needed a non-equal coercion to get
+                // here, which is incompatible with an invariant parameter.
+                all_parameters_match = false;
+            }
+        }
+
+        if all_parameters_match
+            && !specialized_template_type.has_template()
+            && !container_type_parameter.has_template()
+            && (specialized_template_type.is_never()
+                || specialized_template_type.is_literal_of(container_type_parameter))
+        {
+            widen_input_param(atomic_comparison_result, input_type_part, parameter_offset, container_type_parameter);
         }
     }
 
     all_parameters_match
+}
+
+fn widen_input_param(
+    atomic_comparison_result: &mut ComparisonResult,
+    input_type_part: &TAtomic,
+    parameter_offset: usize,
+    container_type_parameter: &TUnion,
+) {
+    if atomic_comparison_result.replacement_atomic_type.is_none() {
+        atomic_comparison_result.replacement_atomic_type = Some(input_type_part.clone());
+    }
+
+    let Some(TAtomic::Object(TObject::Named(TNamedObject { type_parameters: Some(type_parameters), .. }))) =
+        atomic_comparison_result.replacement_atomic_type.as_mut()
+    else {
+        return;
+    };
+
+    if let Some(slot) = type_parameters.get_mut(parameter_offset) {
+        *slot = container_type_parameter.clone();
+    }
 }
 
 pub(crate) fn update_failed_result_from_nested(
@@ -122,12 +194,5 @@ pub(crate) fn update_failed_result_from_nested(
             val
         } else {
             param_comparison_result.type_coerced_from_as_mixed.unwrap_or(false)
-        });
-
-    atomic_comparison_result.type_coerced_to_literal =
-        Some(if let Some(val) = atomic_comparison_result.type_coerced_to_literal {
-            val
-        } else {
-            param_comparison_result.type_coerced_to_literal.unwrap_or(false)
         });
 }

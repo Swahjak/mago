@@ -16,6 +16,10 @@ use crate::ttype::atomic::object::r#enum::TEnum;
 use crate::ttype::atomic::object::named::TNamedObject;
 use crate::ttype::atomic::reference::TReference;
 use crate::ttype::atomic::scalar::TScalar;
+use crate::ttype::atomic::scalar::class_like_string::TClassLikeString;
+use crate::ttype::atomic::scalar::string::TString;
+use crate::ttype::atomic::scalar::string::TStringCasing;
+use crate::ttype::atomic::scalar::string::TStringLiteral;
 use crate::ttype::comparator::ComparisonResult;
 use crate::ttype::comparator::array_comparator;
 use crate::ttype::comparator::callable_comparator;
@@ -227,7 +231,7 @@ pub fn is_contained_by(
         return false;
     }
 
-    if let TAtomic::Null = input_type_part {
+    if matches!(input_type_part, TAtomic::Null) {
         if let TAtomic::GenericParameter(TGenericParameter { constraint, .. }) = container_type_part
             && (constraint.is_nullable() || constraint.is_mixed())
         {
@@ -276,7 +280,7 @@ pub fn is_contained_by(
         );
     }
 
-    if let TAtomic::Object(TObject::Any) = container_type_part
+    if matches!(container_type_part, TAtomic::Object(TObject::Any))
         && let TAtomic::Object(_) = input_type_part
     {
         return true;
@@ -394,7 +398,7 @@ pub fn is_contained_by(
         };
     }
 
-    if let TAtomic::Object(TObject::Any) = input_type_part
+    if matches!(input_type_part, TAtomic::Object(TObject::Any))
         && let TAtomic::Object(TObject::Named(_) | TObject::Enum(_)) = container_type_part
     {
         atomic_comparison_result.type_coerced = Some(true);
@@ -459,8 +463,8 @@ pub fn is_contained_by(
         return true;
     }
 
-    if let TAtomic::Object(TObject::Any) = input_type_part
-        && let TAtomic::Object(TObject::Any) = container_type_part
+    if matches!(input_type_part, TAtomic::Object(TObject::Any))
+        && matches!(container_type_part, TAtomic::Object(TObject::Any))
     {
         return true;
     }
@@ -541,10 +545,10 @@ pub fn is_contained_by(
     false
 }
 
-pub(crate) fn can_be_identical<'a>(
-    codebase: &'a CodebaseMetadata,
-    first_part: &'a TAtomic,
-    second_part: &'a TAtomic,
+pub(crate) fn can_be_identical(
+    codebase: &CodebaseMetadata,
+    first_part: &TAtomic,
+    second_part: &TAtomic,
     inside_assertion: bool,
     allow_type_coercion: bool,
 ) -> bool {
@@ -555,14 +559,8 @@ pub(crate) fn can_be_identical<'a>(
             | (_, TAtomic::Variable(_) | TAtomic::Mixed(_))
             | (TAtomic::Iterable(_), TAtomic::Iterable(_) | TAtomic::Array(_) | TAtomic::Object(_))
             | (TAtomic::Array(_) | TAtomic::Object(_), TAtomic::Iterable(_))
-            | (
-                TAtomic::Scalar(TScalar::Numeric | TScalar::ArrayKey | TScalar::ClassLikeString(_)),
-                TAtomic::Scalar(TScalar::String(_))
-            )
-            | (
-                TAtomic::Scalar(TScalar::String(_)),
-                TAtomic::Scalar(TScalar::Numeric | TScalar::ArrayKey | TScalar::ClassLikeString(_))
-            )
+            | (TAtomic::Scalar(TScalar::Numeric | TScalar::ArrayKey), TAtomic::Scalar(TScalar::String(_)))
+            | (TAtomic::Scalar(TScalar::String(_)), TAtomic::Scalar(TScalar::Numeric | TScalar::ArrayKey))
             | (
                 TAtomic::Scalar(TScalar::Integer(_) | TScalar::Float(_) | TScalar::ArrayKey),
                 TAtomic::Scalar(TScalar::Numeric)
@@ -573,6 +571,18 @@ pub(crate) fn can_be_identical<'a>(
             )
     ) {
         return true;
+    }
+
+    // (class-string, string) overlap: when both sides are literal, the exact
+    // class name must equal the exact string; otherwise they can overlap.
+    if let (TAtomic::Scalar(TScalar::ClassLikeString(class_string)), TAtomic::Scalar(TScalar::String(string)))
+    | (TAtomic::Scalar(TScalar::String(string)), TAtomic::Scalar(TScalar::ClassLikeString(class_string))) =
+        (first_part, second_part)
+    {
+        return match (class_string, string.get_known_literal_value()) {
+            (TClassLikeString::Literal { value }, Some(str_value)) => value.eq_ignore_ascii_case(str_value),
+            _ => true,
+        };
     }
 
     if matches!(first_part, TAtomic::Callable(_))
@@ -641,8 +651,11 @@ pub(crate) fn can_be_identical<'a>(
         let list_element_is_never = list.element_type.is_never();
 
         if let Some((_, keyed_val_type)) = keyed_array.parameters.as_ref() {
-            if list_has_known_elements && list_element_is_never {
-                for (_, list_elem_type) in list.known_elements.as_ref().unwrap().values() {
+            if list_has_known_elements
+                && list_element_is_never
+                && let Some(known_elements) = list.known_elements.as_ref()
+            {
+                for (_, list_elem_type) in known_elements.values() {
                     if union_comparator::can_expression_types_be_identical(
                         codebase,
                         keyed_val_type.as_ref(),
@@ -727,6 +740,13 @@ pub(crate) fn can_be_identical<'a>(
         return true;
     }
 
+    if let (TAtomic::Scalar(TScalar::String(first_string)), TAtomic::Scalar(TScalar::String(second_string))) =
+        (first_part, second_part)
+        && strings_can_be_identical(first_string, second_string)
+    {
+        return true;
+    }
+
     let mut first_comparison_result = ComparisonResult::new();
     let mut second_comparison_result = ComparisonResult::new();
 
@@ -776,6 +796,41 @@ pub(crate) fn can_be_identical<'a>(
     }
 
     false
+}
+
+/// Checks whether two string types can share at least one concrete value.
+///
+/// PHP string flags (casing, non-emptiness, numeric-ness, callable-ness) live
+/// on independent dimensions, so types like `non-empty-string` and
+/// `lowercase-string` are not in a subtype relation yet still overlap
+/// (`"abc"` is both). Subtype-based comparison misses this; we enumerate the
+/// conflicts instead and return `true` whenever none apply.
+fn strings_can_be_identical(lhs: &TString, rhs: &TString) -> bool {
+    if let (Some(TStringLiteral::Value(l)), Some(TStringLiteral::Value(r))) = (&lhs.literal, &rhs.literal) {
+        return l == r;
+    }
+
+    let literal_value = match (&lhs.literal, &rhs.literal) {
+        (Some(TStringLiteral::Value(v)), _) => Some((v.as_str(), rhs)),
+        (_, Some(TStringLiteral::Value(v))) => Some((v.as_str(), lhs)),
+        _ => None,
+    };
+
+    if let Some((value, constraints)) = literal_value {
+        if constraints.is_non_empty && value.is_empty() {
+            return false;
+        }
+
+        match constraints.casing {
+            TStringCasing::Lowercase if value.chars().any(|c| c.is_ascii_uppercase()) => return false,
+            TStringCasing::Uppercase if value.chars().any(|c| c.is_ascii_lowercase()) => return false,
+            _ => {}
+        }
+
+        return true;
+    }
+
+    true
 }
 
 #[must_use]
@@ -860,6 +915,7 @@ fn keyed_arrays_can_be_identical(
                             return false;
                         }
                     }
+                    #[allow(clippy::unreachable)]
                     (None, None) => {
                         unreachable!("key {key:?} should exist in at least one map, but found in neither");
                     }
@@ -920,5 +976,85 @@ fn keyed_arrays_can_be_identical(
                 false,
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mago_atom::atom;
+
+    use crate::ttype::atomic::TAtomic;
+    use crate::ttype::atomic::scalar::TScalar;
+    use crate::ttype::atomic::scalar::class_like_string::TClassLikeString;
+    use crate::ttype::atomic::scalar::class_like_string::TClassLikeStringKind;
+    use crate::ttype::atomic::scalar::string::TString;
+    use crate::ttype::comparator::tests::create_test_codebase;
+
+    use super::can_be_identical;
+
+    fn class_string_literal(name: &str) -> TAtomic {
+        TAtomic::Scalar(TScalar::ClassLikeString(TClassLikeString::literal(atom(name))))
+    }
+
+    fn class_string_any() -> TAtomic {
+        TAtomic::Scalar(TScalar::ClassLikeString(TClassLikeString::any(TClassLikeStringKind::Class)))
+    }
+
+    fn string_literal(value: &str) -> TAtomic {
+        TAtomic::Scalar(TScalar::String(TString::known_literal(atom(value))))
+    }
+
+    fn general_string() -> TAtomic {
+        TAtomic::Scalar(TScalar::String(TString::general()))
+    }
+
+    #[test]
+    fn literal_class_string_and_mismatching_literal_string_cannot_be_identical() {
+        let codebase = create_test_codebase("<?php");
+        let class_string = class_string_literal("Baz");
+        let string = string_literal("foo");
+
+        assert!(!can_be_identical(&codebase, &class_string, &string, false, false));
+        assert!(!can_be_identical(&codebase, &string, &class_string, false, false));
+    }
+
+    #[test]
+    fn literal_class_string_and_matching_literal_string_can_be_identical() {
+        let codebase = create_test_codebase("<?php");
+        let class_string = class_string_literal("Baz");
+        let string = string_literal("Baz");
+
+        assert!(can_be_identical(&codebase, &class_string, &string, false, false));
+        assert!(can_be_identical(&codebase, &string, &class_string, false, false));
+    }
+
+    #[test]
+    fn literal_class_string_and_literal_string_match_case_insensitively() {
+        let codebase = create_test_codebase("<?php");
+        let class_string = class_string_literal("Baz");
+        let string = string_literal("bAZ");
+
+        assert!(can_be_identical(&codebase, &class_string, &string, false, false));
+        assert!(can_be_identical(&codebase, &string, &class_string, false, false));
+    }
+
+    #[test]
+    fn literal_class_string_and_general_string_can_be_identical() {
+        let codebase = create_test_codebase("<?php");
+        let class_string = class_string_literal("Baz");
+        let string = general_string();
+
+        assert!(can_be_identical(&codebase, &class_string, &string, false, false));
+        assert!(can_be_identical(&codebase, &string, &class_string, false, false));
+    }
+
+    #[test]
+    fn any_class_string_and_literal_string_can_be_identical() {
+        let codebase = create_test_codebase("<?php");
+        let class_string = class_string_any();
+        let string = string_literal("foo");
+
+        assert!(can_be_identical(&codebase, &class_string, &string, false, false));
+        assert!(can_be_identical(&codebase, &string, &class_string, false, false));
     }
 }

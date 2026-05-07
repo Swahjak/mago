@@ -1,67 +1,100 @@
 //! Configuration management for Mago CLI.
 //!
-//! This module provides a comprehensive configuration system that supports multiple
-//! sources and precedence levels. Configuration can be loaded from TOML files,
-//! environment variables, and command-line arguments, with each source overriding
-//! the previous one.
+//! Configuration is loaded by reading at most one config file (TOML/YAML/JSON), recursively
+//! resolving its `extends` chain, merging the layers, and finally applying environment
+//! variable + CLI overrides for the small set of top-level scalars.
 //!
-//! # Configuration Sources
+//! # File discovery
 //!
-//! Configuration is loaded and merged from the following sources, in order of precedence
-//! (highest to lowest):
+//! - When `--config <path>` is given, that exact file is loaded. Format is detected from the
+//!   extension; unrecognised extensions are an error.
+//! - Otherwise, the loader looks for `mago.{toml,yaml,yml,json}` (then `mago.dist.{...}`) in:
+//!   1. The workspace directory.
+//!   2. `$XDG_CONFIG_HOME`.
+//!   3. `~/.config`.
+//!   4. `~`.
+//!      The first match wins; workspace beats global. If nothing is found, built-in defaults
+//!      are used.
+//! - Within a directory, format precedence is `toml > yaml > yml > json`.
 //!
-//! 1. **Environment Variables**: Prefixed with `MAGO_` (e.g., `MAGO_THREADS=4`)
-//! 2. **Workspace Config**: `mago.toml` in the workspace directory
-//! 3. **Global Config**: `mago.toml` in `$XDG_CONFIG_HOME` or `$HOME`
-//! 4. **Explicit File**: Specified via `--config` flag (bypasses workspace/global)
-//! 5. **Defaults**: Built-in defaults for all settings
+//! # `extends`
 //!
-//! # Configuration Structure
+//! A config file may opt to inherit from one or more other files via a top-level `extends`
+//! directive:
 //!
-//! The configuration is organized into several sub-configurations:
+//! ```toml
+//! extends = "vendor/some-org/some-pkg/mago.toml"        # single file
+//! extends = ["base.toml", "configs/strict.json"]         # multiple, applied in order
+//! extends = ["../shared"]                                # directory: looks for mago.{toml,yaml,yml,json}
+//! ```
 //!
-//! - **Source**: Defines workspace paths and file discovery patterns
-//! - **Linter**: Controls linting behavior and rule sets
-//! - **Formatter**: Defines code formatting style preferences
-//! - **Analyzer**: Controls static type analysis settings
-//! - **Guard**: Configures the guard service for continuous monitoring
+//! - Paths are absolute or relative; relative paths resolve **against the directory of the
+//!   file declaring the `extends`**, not against cwd. This is important when `--config
+//!   path/to/foo.toml` declares `extends = "bar.toml"` — `bar.toml` is resolved next to
+//!   `foo.toml`.
+//! - File entries must exist and have a recognised extension.
+//! - Directory entries are searched for a `mago.{toml,yaml,yml,json}` file; if none is
+//!   found, the entry is skipped with a warning.
+//! - Cycles are detected via canonical-path tracking and surface as a clean error.
 //!
-//! # Normalization and Validation
+//! # Merge semantics
 //!
-//! After loading, configurations are normalized to ensure valid values:
+//! Layers are merged later-wins. For each top-level key:
+//! - **Tables / objects**: deep-merged recursively.
+//! - **Arrays** (e.g. `source.excludes`): concatenated, parent first.
+//! - **Scalars**: child overwrites parent.
 //!
-//! - Thread count defaults to logical CPU count if zero
-//! - Stack size is clamped between minimum and maximum bounds
-//! - PHP version compatibility is validated
-//! - Source paths are resolved and validated
+//! All layers parse into a generic `serde_json::Value` tree. The merged tree is deserialized
+//! into [`Configuration`] exactly once, so schema validation runs a single time regardless
+//! of chain depth.
 //!
-//! # Environment Variables
+//! # Effective precedence (lowest → highest)
 //!
-//! All configuration options can be set via environment variables using the
-//! `MAGO_` prefix and kebab-case conversion. For nested options, use underscores:
+//! 1. Built-in defaults (via `#[serde(default)]` on every field).
+//! 2. Each layer reachable through `extends`, applied in declared order; transitively
+//!    each parent's own `extends` is fully resolved before the parent's keys apply.
+//! 3. The owning file's own keys.
+//! 4. Environment variables (top-level scalars only — see below).
+//! 5. CLI overrides (e.g. `--php-version`, `--threads`).
 //!
+//! # Environment variables
+//!
+//! Mago officially recognises only the following top-level overrides. Anything else
+//! prefixed `MAGO_` is reserved for internal use and may be silently ignored:
+//!
+//! - `MAGO_PHP_VERSION` → `php-version`
 //! - `MAGO_THREADS` → `threads`
-//! - `MAGO_PHP_VERSION` → `php_version`
-//! - `MAGO_SOURCE_WORKSPACE` → `source.workspace`
+//! - `MAGO_STACK_SIZE` → `stack-size`
+//! - `MAGO_ALLOW_UNSUPPORTED_PHP_VERSION` → `allow-unsupported-php-version`
+//! - `MAGO_NO_VERSION_CHECK` → `no-version-check`
+//! - `MAGO_EDITOR_URL` → `editor-url`
+//!
+//! For anything deeper, edit the config file.
+//!
+//! # Normalization and validation
+//!
+//! After loading, the configuration is normalized:
+//!
+//! - Thread count defaults to logical CPU count if zero.
+//! - Stack size is clamped between minimum and maximum bounds.
+//! - PHP version compatibility is validated against the supported range.
+//! - Source paths are resolved and validated.
 
+use std::collections::HashSet;
 use std::env::home_dir;
 use std::fmt::Debug;
 use std::path::Path;
 use std::path::PathBuf;
 
-use config::Case;
-use config::Config;
-use config::Environment;
-use config::File;
-use config::FileFormat;
-use config::FileStoredFormat;
-use config::Value;
-use config::ValueKind;
+// Note: format detection + parsing is handled by `ConfigFormat` below; we no longer route
+// through the `config` crate, which added ~1.5ms of intermediate-Value-tree overhead.
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 
 use mago_php_version::PHPVersion;
+use serde::de::IgnoredAny;
+use serde_json::Value;
 
 use crate::config::analyzer::AnalyzerConfiguration;
 use crate::config::formatter::FormatterConfiguration;
@@ -99,25 +132,69 @@ fn default_source_configuration() -> SourceConfiguration {
     SourceConfiguration::from_workspace(CURRENT_DIR.clone())
 }
 
+// Pre-baked env-var names. Keeps the prefix in sync with `ENVIRONMENT_PREFIX` (see assertion
+// below) without paying for `format!` allocations on every load.
+const ENV_PHP_VERSION: &str = "MAGO_PHP_VERSION";
+const ENV_THREADS: &str = "MAGO_THREADS";
+const ENV_STACK_SIZE: &str = "MAGO_STACK_SIZE";
+const ENV_ALLOW_UNSUPPORTED_PHP_VERSION: &str = "MAGO_ALLOW_UNSUPPORTED_PHP_VERSION";
+const ENV_NO_VERSION_CHECK: &str = "MAGO_NO_VERSION_CHECK";
+const ENV_EDITOR_URL: &str = "MAGO_EDITOR_URL";
+
+const _: () = {
+    // Compile-time guard: if anyone changes `ENVIRONMENT_PREFIX`, this file must be updated
+    // too. We do a byte-by-byte comparison since `&str` equality isn't const-stable yet.
+    let bytes = ENVIRONMENT_PREFIX.as_bytes();
+
+    assert!(bytes.len() == 4 && bytes[0] == b'M' && bytes[1] == b'A' && bytes[2] == b'G' && bytes[3] == b'O');
+};
+
 /// The main configuration structure for Mago CLI.
 ///
-/// This struct aggregates all configuration settings for Mago, including global options
-/// like threading and PHP version, as well as specialized configurations for each service
-/// (linter, analyzer, formatter, guard).
+/// Aggregates all settings: top-level scalars (`php-version`, `threads`, …) plus
+/// service-specific sub-configurations (linter, analyzer, formatter, guard, parser).
 ///
-/// Configuration values are loaded from multiple sources with the following precedence
-/// (from highest to lowest):
-///
-/// 1. Environment variables (`MAGO_*`)
-/// 2. Workspace `mago.toml` file
-/// 3. Global `mago.toml` file (`$XDG_CONFIG_HOME` or `$HOME`)
-/// 4. Built-in defaults
-///
-/// The struct uses serde for deserialization from TOML files and environment variables,
-/// with strict validation via `deny_unknown_fields` to catch configuration errors early.
+/// Loaded by [`Configuration::load`]; see the [module-level documentation](self) for the
+/// full precedence order and `extends` semantics. Strict validation via
+/// `deny_unknown_fields` catches typos early (note that the `extends` directive itself is
+/// stripped from each layer before deserialization, so it never trips the strict check).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Configuration {
+    #[serde(rename = "$schema", skip_serializing)]
+    #[schemars(rename = "$schema", with = "Option<String>", !skip_serializing)]
+    _schema: Option<IgnoredAny>,
+    /// The mago version this project is pinned to.
+    ///
+    /// Accepts three pin levels:
+    ///
+    /// - `"1"`: major pin; any `1.x.y` satisfies it. `mago init` emits this
+    ///   by default. Minor/patch drift within major 1 is a warning; a bump to
+    ///   `2.x` is a hard error.
+    /// - `"1.19"`: minor pin; any `1.19.y` satisfies it.
+    /// - `"1.19.3"`: exact pin; any drift is a warning, and this is the only
+    ///   form that `mago self-update --to-project-version` can target without
+    ///   ambiguity.
+    ///
+    /// Empty / missing is currently a no-op; a future mago release is likely
+    /// to start warning when the pin is absent, to prepare projects for 2.0.
+    ///
+    /// # Compatibility invariant (**do not break**)
+    ///
+    /// This field's location (top-level) and type (string) are a load-bearing
+    /// contract for cross-major config compatibility: a future mago 2.x must
+    /// be able to read a mago 1.x `mago.toml` via a permissive top-level TOML
+    /// pass, find this field, and refuse to run with
+    /// "this config is pinned to mago 1" *before* it ever hits its own strict
+    /// schema. That means:
+    ///
+    /// - never move this field into a `[metadata]` section,
+    /// - never rename it,
+    /// - never change it from a string,
+    /// - never change the pin grammar from `major[.minor[.patch]]`.
+    #[serde(default)]
+    pub version: Option<String>,
+
     /// Number of worker threads for parallel processing.
     ///
     /// Controls the thread pool size used by Rayon for parallel operations.
@@ -151,6 +228,18 @@ pub struct Configuration {
     /// or `--allow-unsupported-php-version` CLI flag.
     #[serde(default)]
     pub allow_unsupported_php_version: bool,
+
+    /// Whether to silence the project version drift warning.
+    ///
+    /// Affects only the minor / patch drift warning emitted when the installed
+    /// mago binary does not match the `version` pinned in `mago.toml`. A major
+    /// drift is always fatal and is *not* affected by this flag; the whole
+    /// point of a major pin is to stop runs across incompatible config schemas.
+    ///
+    /// Can be enabled via `MAGO_NO_VERSION_CHECK` environment variable or
+    /// `--no-version-check` CLI flag.
+    #[serde(default)]
+    pub no_version_check: bool,
 
     /// Source discovery and workspace configuration.
     ///
@@ -200,18 +289,6 @@ pub struct Configuration {
     #[serde(default)]
     pub guard: GuardConfiguration,
 
-    /// Log filter for tracing output.
-    ///
-    /// This field exists solely to prevent errors when `MAGO_LOG` environment
-    /// variable is set. Due to `deny_unknown_fields`, without this field serde
-    /// would reject the configuration when `MAGO_LOG` is present in the environment.
-    ///
-    /// This is not a user-facing configuration option and is never serialized.
-    #[serde(default, skip_serializing)]
-    #[schemars(skip)]
-    #[allow(dead_code)]
-    log: Value,
-
     /// Editor URL template for OSC 8 terminal hyperlinks on file paths in diagnostics.
     ///
     /// When set, file paths in diagnostic output become clickable links in terminals
@@ -244,115 +321,100 @@ pub struct Configuration {
 }
 
 impl Configuration {
-    /// Loads and merges configuration from multiple sources.
+    /// Locate, parse, merge (`extends` chain), and normalize the configuration.
     ///
-    /// This method orchestrates the complete configuration loading process, combining
-    /// settings from files, environment variables, and CLI arguments with proper
-    /// precedence handling. The configuration is then normalized and validated.
+    /// See the [module-level documentation](self) for the full file-discovery, `extends`,
+    /// merge, and precedence rules. In short:
     ///
-    /// # Loading Process
-    ///
-    /// The method follows this workflow:
-    ///
-    /// 1. **Create Base Configuration**: Initialize with workspace-specific defaults
-    /// 2. **Load Global Configs**: Merge `$XDG_CONFIG_HOME/mago.toml` and `$HOME/mago.toml`
-    ///    (skipped if explicit config file is provided)
-    /// 3. **Load Workspace Config**: Merge `<workspace>/mago.toml`
-    ///    (skipped if explicit config file is provided)
-    /// 4. **Load Explicit Config**: If `file` is provided, load it as the sole config file
-    /// 5. **Apply Environment Variables**: Override with `MAGO_*` environment variables
-    /// 6. **Apply CLI Overrides**: Apply specific CLI argument overrides
-    /// 7. **Normalize and Validate**: Ensure all values are within valid ranges
-    ///
-    /// # Precedence Order
-    ///
-    /// Settings are merged with the following precedence (highest to lowest):
-    ///
-    /// 1. CLI arguments (`php_version`, `threads`, `allow_unsupported_php_version`)
-    /// 2. Environment variables (`MAGO_*`)
-    /// 3. Workspace config file (`<workspace>/mago.toml`)
-    /// 4. Global config files (`$XDG_CONFIG_HOME/mago.toml`, `$HOME/mago.toml`)
-    /// 5. Explicit config file (if provided via `file` parameter, bypasses 3 and 4)
-    /// 6. Default values
+    /// 1. Pick the entry config file: explicit `--config` if given, else search for one.
+    /// 2. Recursively load it: each layer's `extends` is resolved (relative to that file's
+    ///    directory) and merged before the layer's own keys apply.
+    /// 3. Deserialize the merged document into [`Configuration`] once.
+    /// 4. Apply env-var overrides for the top-level scalars (`MAGO_PHP_VERSION`, …).
+    /// 5. Apply the explicit CLI overrides passed in here.
+    /// 6. Normalize (clamp, validate, fill defaults).
     ///
     /// # Arguments
     ///
-    /// * `workspace` - Optional workspace directory path. If not provided, uses current directory.
-    ///   This directory is scanned for source files and may contain a `mago.toml` file.
-    /// * `file` - Optional explicit path to a configuration file. When provided, global and
-    ///   workspace config files are not loaded. The specified file must exist.
-    /// * `php_version` - Optional PHP version override. Takes precedence over all config sources.
-    /// * `threads` - Optional thread count override. Takes precedence over all config sources.
-    /// * `allow_unsupported_php_version` - If `true`, enables support for PHP versions outside
-    ///   the officially supported range. Only overrides the config if `true`.
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(Configuration)` - Successfully loaded and validated configuration
-    /// - `Err(Error::Configuration)` - Failed to parse TOML or deserialize configuration
-    /// - `Err(Error::IOError)` - Failed to read configuration file (when `file` is provided)
+    /// * `workspace` — workspace directory; defaults to cwd.
+    /// * `file` — explicit config file (`--config`); when given, fallback search is skipped.
+    /// * `php_version` — CLI override for `php-version`.
+    /// * `threads` — CLI override for `threads`.
+    /// * `allow_unsupported_php_version` — only forces `true`; never forces `false`.
+    /// * `no_version_check` — only forces `true`; never forces `false`. Does not affect
+    ///   the fatal behaviour on major-version drift.
     ///
     /// # Errors
     ///
-    /// This method may fail if:
-    /// - The specified config file does not exist or cannot be read (when `file` is provided)
-    /// - Configuration files contain invalid TOML syntax
-    /// - Configuration values fail validation (e.g., unknown field names due to `deny_unknown_fields`)
-    /// - Required configuration fields are missing
-    /// - Normalization fails (e.g., invalid source paths)
+    /// - `ReadConfigFile` / `ParseConfigFile` — I/O or syntax failures on any layer.
+    /// - `UnsupportedConfigExtension` — explicit file or `extends` entry has a non-recognised extension.
+    /// - `CircularExtends` — `extends` chain visits the same canonical file twice.
+    /// - `ExtendsTargetNotFound` — `extends` entry does not exist on disk.
+    /// - `InvalidExtendsEntry` — `extends` is not a string or array of strings.
+    /// - `EnvVarParse` — an `MAGO_*` env var is set but its value can't be parsed.
+    /// - Normalization errors (invalid source paths, etc.).
     pub fn load(
         workspace: Option<PathBuf>,
         file: Option<&Path>,
         php_version: Option<PHPVersion>,
         threads: Option<usize>,
         allow_unsupported_php_version: bool,
+        no_version_check: bool,
     ) -> Result<Configuration, Error> {
         let workspace_dir = workspace.clone().unwrap_or_else(|| CURRENT_DIR.to_path_buf());
 
-        let mut configuration = Configuration::from_workspace(workspace_dir.clone());
-        let mut builder = Config::builder().add_source(Config::try_from(&configuration)?);
-
-        let resolved_config_file;
+        let resolved_config_file: Option<(PathBuf, ConfigFormat)>;
         let config_file_is_explicit;
         if let Some(file) = file {
             tracing::debug!("Sourcing configuration from {}.", file.display());
 
-            resolved_config_file = Some(file.to_path_buf());
+            resolved_config_file = Some((
+                file.to_path_buf(),
+                ConfigFormat::for_path(file).ok_or_else(|| Error::UnsupportedConfigExtension(file.to_path_buf()))?,
+            ));
+
             config_file_is_explicit = true;
-            builder = builder.add_source(File::from(file).required(true));
         } else {
-            let formats = [FileFormat::Toml, FileFormat::Yaml, FileFormat::Json];
-            // Check workspace first, then XDG, then ~/.config, then ~ (workspace has highest precedence)
             let fallback_roots = [
                 std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
                 home_dir().map(|h| h.join(".config")),
                 home_dir(),
             ];
 
-            if let Some((config_file, format)) = Self::find_config_files(&workspace_dir, &fallback_roots, &formats) {
+            resolved_config_file = Self::find_config_files(&workspace_dir, &fallback_roots);
+            if let Some((config_file, _)) = &resolved_config_file {
                 tracing::debug!("Sourcing configuration from {}.", config_file.display());
-                resolved_config_file = Some(config_file.clone());
-                builder = builder.add_source(File::from(config_file).format(format).required(false));
             } else {
                 tracing::debug!("No configuration file found, using defaults and environment variables.");
-                resolved_config_file = None;
             }
 
             config_file_is_explicit = false;
         }
 
-        configuration = builder
-            .add_source(Environment::with_prefix(ENVIRONMENT_PREFIX).convert_case(Case::Kebab))
-            .build()?
-            .try_deserialize::<Configuration>()?;
+        let mut configuration: Configuration = if let Some((path, format)) = &resolved_config_file {
+            let mut visited: HashSet<PathBuf> = HashSet::new();
+            let merged = load_layer(path, *format, &mut visited)?;
+            serde_json::from_value::<Configuration>(merged)
+                .map_err(|e| Error::ParseConfigFile { path: path.clone(), source: Box::new(e) })?
+        } else {
+            Configuration::from_workspace(workspace_dir.clone())
+        };
 
-        configuration.config_file = resolved_config_file;
+        configuration.apply_env_overrides()?;
+
+        configuration.config_file = resolved_config_file.as_ref().map(|(p, _)| p.clone());
         configuration.config_file_is_explicit = config_file_is_explicit;
 
         if allow_unsupported_php_version && !configuration.allow_unsupported_php_version {
             tracing::warn!("Allowing unsupported PHP versions.");
 
             configuration.allow_unsupported_php_version = true;
+        }
+
+        if no_version_check && !configuration.no_version_check {
+            tracing::info!("Silencing project version drift warning.");
+
+            configuration.no_version_check = true;
         }
 
         if let Some(php_version) = php_version {
@@ -412,34 +474,73 @@ impl Configuration {
     /// 4. The first match (by name and directory order) wins
     ///
     /// This prevents global configuration files from overriding project-local configuration.
-    fn find_config_files(
-        root_dir: &Path,
-        fallback_roots: &[Option<PathBuf>],
-        file_formats: &[FileFormat],
-    ) -> Option<(PathBuf, FileFormat)> {
+    fn find_config_files(root_dir: &Path, fallback_roots: &[Option<PathBuf>]) -> Option<(PathBuf, ConfigFormat)> {
         let config_files = [CONFIGURATION_FILE_NAME, CONFIGURATION_DIST_FILE_NAME];
 
         for name in config_files.iter() {
-            let base = root_dir.join(name);
-
-            for format in file_formats.iter() {
-                if let Some(ext) = format.file_extensions().iter().find(|ext| base.with_added_extension(ext).exists()) {
-                    return Some((base.with_added_extension(ext), *format));
+            let mut candidate = root_dir.join(name);
+            // The base path has no extension yet, so the first `set_extension` adds it
+            // rather than replacing — equivalent to `with_added_extension(ext)`.
+            for format in ConfigFormat::ALL.iter() {
+                for ext in format.extensions() {
+                    candidate.set_extension(ext);
+                    if candidate.exists() {
+                        return Some((candidate, *format));
+                    }
                 }
             }
         }
 
         for root in fallback_roots.iter().flatten() {
-            let base = root.join(CONFIGURATION_FILE_NAME);
-
-            for format in file_formats.iter() {
-                if let Some(ext) = format.file_extensions().iter().find(|ext| base.with_added_extension(ext).exists()) {
-                    return Some((base.with_added_extension(ext), *format));
+            let mut candidate = root.join(CONFIGURATION_FILE_NAME);
+            for format in ConfigFormat::ALL.iter() {
+                for ext in format.extensions() {
+                    candidate.set_extension(ext);
+                    if candidate.exists() {
+                        return Some((candidate, *format));
+                    }
                 }
             }
         }
 
         None
+    }
+
+    /// Apply environment-variable overrides for the small set of documented top-level
+    /// scalar fields. We do **not** auto-map nested keys — anyone who needs to override
+    /// nested settings does so via the config file. The supported variables are:
+    ///
+    /// - `MAGO_PHP_VERSION` — overrides `php-version`
+    /// - `MAGO_THREADS` — overrides `threads`
+    /// - `MAGO_STACK_SIZE` — overrides `stack-size`
+    /// - `MAGO_ALLOW_UNSUPPORTED_PHP_VERSION` — overrides `allow-unsupported-php-version`
+    /// - `MAGO_NO_VERSION_CHECK` — overrides `no-version-check`
+    /// - `MAGO_EDITOR_URL` — overrides `editor-url`
+    fn apply_env_overrides(&mut self) -> Result<(), Error> {
+        // Env-var names are static — no per-call allocation.
+        if let Ok(v) = std::env::var(ENV_PHP_VERSION) {
+            self.php_version =
+                v.parse().map_err(|e| Error::EnvVarParse { name: ENV_PHP_VERSION, source: Box::new(e) })?;
+        }
+        if let Ok(v) = std::env::var(ENV_THREADS) {
+            self.threads = v.parse().map_err(|e| Error::EnvVarParse { name: ENV_THREADS, source: Box::new(e) })?;
+        }
+        if let Ok(v) = std::env::var(ENV_STACK_SIZE) {
+            self.stack_size =
+                v.parse().map_err(|e| Error::EnvVarParse { name: ENV_STACK_SIZE, source: Box::new(e) })?;
+        }
+        if let Ok(v) = std::env::var(ENV_ALLOW_UNSUPPORTED_PHP_VERSION) {
+            self.allow_unsupported_php_version = parse_bool(&v)
+                .map_err(|e| Error::EnvVarParse { name: ENV_ALLOW_UNSUPPORTED_PHP_VERSION, source: Box::new(e) })?;
+        }
+        if let Ok(v) = std::env::var(ENV_NO_VERSION_CHECK) {
+            self.no_version_check =
+                parse_bool(&v).map_err(|e| Error::EnvVarParse { name: ENV_NO_VERSION_CHECK, source: Box::new(e) })?;
+        }
+        if let Ok(v) = std::env::var(ENV_EDITOR_URL) {
+            self.editor_url = Some(v);
+        }
+        Ok(())
     }
 
     /// Creates a default configuration anchored to a specific workspace directory.
@@ -474,17 +575,19 @@ impl Configuration {
     /// A new `Configuration` instance with default values and the specified workspace.
     pub fn from_workspace(workspace: PathBuf) -> Self {
         Self {
+            _schema: None,
+            version: None,
             threads: *LOGICAL_CPUS,
             stack_size: DEFAULT_STACK_SIZE,
             php_version: DEFAULT_PHP_VERSION,
             allow_unsupported_php_version: false,
+            no_version_check: false,
             source: SourceConfiguration::from_workspace(workspace),
             linter: LinterConfiguration::default(),
             parser: ParserConfiguration::default(),
             formatter: FormatterConfiguration::default(),
             analyzer: AnalyzerConfiguration::default(),
             guard: GuardConfiguration::default(),
-            log: Value::new(None, ValueKind::Nil),
             editor_url: None,
             config_file: None,
             config_file_is_explicit: false,
@@ -498,12 +601,14 @@ impl Configuration {
     /// This method excludes linter rules that don't match the configured integrations,
     /// so that only applicable rules are shown in the output.
     #[must_use]
-    pub fn to_filtered_value(&self) -> serde_json::Value {
+    pub fn to_filtered_value(&self) -> Value {
         serde_json::json!({
+            "version": self.version,
             "threads": self.threads,
             "stack-size": self.stack_size,
             "php-version": self.php_version,
             "allow-unsupported-php-version": self.allow_unsupported_php_version,
+            "no-version-check": self.no_version_check,
             "source": self.source,
             "linter": self.linter.to_filtered_value(self.php_version),
             "parser": self.parser,
@@ -591,6 +696,24 @@ impl Configuration {
 
         self.source.normalize()?;
 
+        if let Some(b) = self.analyzer.baseline.take() {
+            let resolved = if b.is_relative() { self.source.workspace.join(&b) } else { b };
+            tracing::debug!("Analyzer baseline configuration from {}.", resolved.display());
+            self.analyzer.baseline = Some(resolved);
+        }
+
+        if let Some(b) = self.linter.baseline.take() {
+            let resolved = if b.is_relative() { self.source.workspace.join(&b) } else { b };
+            tracing::debug!("Linter baseline configuration from {}.", resolved.display());
+            self.linter.baseline = Some(resolved);
+        }
+
+        if let Some(b) = self.guard.baseline.take() {
+            let resolved = if b.is_relative() { self.source.workspace.join(&b) } else { b };
+            tracing::debug!("Guard baseline configuration from {}.", resolved.display());
+            self.guard.baseline = Some(resolved);
+        }
+
         Ok(())
     }
 }
@@ -617,7 +740,7 @@ mod tests {
                 ("MAGO_PHP_VERSION", None),
                 ("MAGO_ALLOW_UNSUPPORTED_PHP_VERSION", None),
             ],
-            || Configuration::load(Some(workspace_path), None, None, None, false).unwrap(),
+            || Configuration::load(Some(workspace_path), None, None, None, false, false).unwrap(),
         );
 
         assert_eq!(config.threads, *LOGICAL_CPUS)
@@ -632,7 +755,7 @@ mod tests {
         create_tmp_file("threads: 2\nphp-version: \"7.4.0\"", &workspace_path, "yaml");
         create_tmp_file("{\"threads\": 1,\"php-version\":\"8.1.0\"}", &workspace_path, "json");
 
-        let config = Configuration::load(Some(workspace_path), None, None, None, false).unwrap();
+        let config = Configuration::load(Some(workspace_path), None, None, None, false, false).unwrap();
 
         assert_eq!(config.threads, 3);
         assert_eq!(config.php_version.to_string(), DEFAULT_PHP_VERSION.to_string())
@@ -656,7 +779,7 @@ mod tests {
                 ("MAGO_PHP_VERSION", None),
                 ("MAGO_ALLOW_UNSUPPORTED_PHP_VERSION", None),
             ],
-            || Configuration::load(Some(workspace_path), Some(&config_file_path), None, None, false).unwrap(),
+            || Configuration::load(Some(workspace_path), Some(&config_file_path), None, None, false, false).unwrap(),
         );
 
         assert_eq!(config.threads, 3);
@@ -680,7 +803,7 @@ mod tests {
                 ("MAGO_PHP_VERSION", None),
                 ("MAGO_ALLOW_UNSUPPORTED_PHP_VERSION", None),
             ],
-            || Configuration::load(Some(workspace_path), Some(&config_file_path), None, None, false).unwrap(),
+            || Configuration::load(Some(workspace_path), Some(&config_file_path), None, None, false, false).unwrap(),
         );
 
         assert_eq!(config.threads, 1);
@@ -693,7 +816,6 @@ mod tests {
         let xdg_config_home_path = temp_dir().join("xdg-config-home-3");
         let workspace_path = temp_dir().join("workspace-3");
 
-        // Clean up any existing directories from previous test runs
         let _ = std::fs::remove_dir_all(&home_path);
         let _ = std::fs::remove_dir_all(&xdg_config_home_path);
         let _ = std::fs::remove_dir_all(&workspace_path);
@@ -714,7 +836,7 @@ mod tests {
                 ("MAGO_PHP_VERSION", None),
                 ("MAGO_ALLOW_UNSUPPORTED_PHP_VERSION", None),
             ],
-            || Configuration::load(Some(workspace_path.clone()), None, None, None, false).unwrap(),
+            || Configuration::load(Some(workspace_path.clone()), None, None, None, false, false).unwrap(),
         );
 
         assert_eq!(config.threads, 2);
@@ -727,6 +849,204 @@ mod tests {
         let config_path = folder.join(CONFIGURATION_FILE_NAME).with_extension(extension);
         fs::write(&config_path, config_content).unwrap();
         config_path
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+
+    fn load_isolated(file: &Path) -> Configuration {
+        temp_env::with_vars(
+            [
+                ("HOME", None::<&str>),
+                ("XDG_CONFIG_HOME", None),
+                ("MAGO_THREADS", None),
+                ("MAGO_PHP_VERSION", None),
+                ("MAGO_ALLOW_UNSUPPORTED_PHP_VERSION", None),
+            ],
+            || Configuration::load(None, Some(file), None, None, false, false).unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_extends_single_string() {
+        let dir = temp_dir().join("extends-single");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        write_file(&dir.join("base.toml"), "threads = 7\nphp-version = \"8.0.0\"\n");
+        write_file(&dir.join("mago.toml"), "extends = \"base.toml\"\nphp-version = \"8.3.0\"\n");
+
+        let config = load_isolated(&dir.join("mago.toml"));
+        assert_eq!(config.threads, 7);
+        assert_eq!(config.php_version.to_string(), "8.3.0");
+    }
+
+    #[test]
+    fn test_extends_array_in_order() {
+        let dir = temp_dir().join("extends-array");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        write_file(&dir.join("a.toml"), "threads = 1\nphp-version = \"8.0.0\"\n");
+        write_file(&dir.join("b.toml"), "threads = 2\n");
+        write_file(&dir.join("mago.toml"), "extends = [\"a.toml\", \"b.toml\"]\n");
+
+        let config = load_isolated(&dir.join("mago.toml"));
+        assert_eq!(config.threads, 2);
+        assert_eq!(config.php_version.to_string(), "8.0.0");
+    }
+
+    #[test]
+    fn test_extends_relative_to_config_file_not_cwd() {
+        let dir = temp_dir().join("extends-relative");
+        let _ = fs::remove_dir_all(&dir);
+        let nested = dir.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+
+        write_file(&nested.join("base.toml"), "threads = 9\n");
+        write_file(&nested.join("mago.toml"), "extends = \"base.toml\"\n");
+
+        let config = load_isolated(&nested.join("mago.toml"));
+        assert_eq!(config.threads, 9);
+    }
+
+    #[test]
+    fn test_extends_directory_picks_up_mago_file() {
+        let dir = temp_dir().join("extends-dir");
+        let _ = fs::remove_dir_all(&dir);
+        let configs = dir.join("configs");
+        fs::create_dir_all(&configs).unwrap();
+
+        write_file(&configs.join("mago.toml"), "threads = 5\n");
+        write_file(&dir.join("mago.toml"), "extends = \"configs\"\n");
+
+        let config = load_isolated(&dir.join("mago.toml"));
+        assert_eq!(config.threads, 5);
+    }
+
+    #[test]
+    fn test_extends_directory_without_config_warns_and_skips() {
+        let dir = temp_dir().join("extends-empty-dir");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("empty")).unwrap();
+        write_file(&dir.join("mago.toml"), "extends = \"empty\"\nthreads = 3\n");
+
+        let config = load_isolated(&dir.join("mago.toml"));
+        assert_eq!(config.threads, 3);
+    }
+
+    #[test]
+    fn test_extends_array_excludes_concat() {
+        let dir = temp_dir().join("extends-array-concat");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        write_file(&dir.join("base.toml"), "[source]\nexcludes = [\"vendor\", \"node_modules\"]\n");
+        write_file(&dir.join("mago.toml"), "extends = \"base.toml\"\n[source]\nexcludes = [\"build\"]\n");
+
+        let config = load_isolated(&dir.join("mago.toml"));
+        assert_eq!(config.source.excludes, vec!["vendor", "node_modules", "build"]);
+    }
+
+    #[test]
+    fn test_extends_cycle_is_detected() {
+        let dir = temp_dir().join("extends-cycle");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        write_file(&dir.join("a.toml"), "extends = \"b.toml\"\n");
+        write_file(&dir.join("b.toml"), "extends = \"a.toml\"\n");
+
+        let result = Configuration::load(None, Some(&dir.join("a.toml")), None, None, false, false);
+        assert!(result.is_err(), "expected cycle to be detected");
+    }
+
+    #[test]
+    fn test_extends_transitive_chain() {
+        let dir = temp_dir().join("extends-transitive");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        write_file(&dir.join("grandparent.toml"), "threads = 1\nphp-version = \"8.0.0\"\n");
+        write_file(&dir.join("parent.toml"), "extends = \"grandparent.toml\"\nthreads = 2\n");
+        write_file(&dir.join("mago.toml"), "extends = \"parent.toml\"\n");
+
+        let config = load_isolated(&dir.join("mago.toml"));
+        assert_eq!(config.threads, 2);
+        assert_eq!(config.php_version.to_string(), "8.0.0");
+    }
+
+    #[test]
+    fn test_extends_mixed_formats() {
+        let dir = temp_dir().join("extends-mixed");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        write_file(&dir.join("base.json"), "{\"threads\": 4}\n");
+        write_file(&dir.join("middle.yaml"), "extends: \"base.json\"\nphp-version: \"8.2.0\"\n");
+        write_file(&dir.join("mago.toml"), "extends = \"middle.yaml\"\n");
+
+        let config = load_isolated(&dir.join("mago.toml"));
+        assert_eq!(config.threads, 4);
+        assert_eq!(config.php_version.to_string(), "8.2.0");
+    }
+
+    /// A 5-deep chain mixing every supported format. Each layer contributes one distinct
+    /// piece of the final configuration so we can assert the whole stack merged correctly.
+    ///
+    /// Chain (innermost to outermost):
+    ///
+    ///   bottom.toml      -> stack-size = 16_777_216         (deepest base, within bounds)
+    ///   layer-yml.yml    extends bottom.toml,
+    ///                    threads = 7
+    ///   layer-json.json  extends layer-yml.yml,
+    ///                    php-version = "8.1.0"
+    ///   layer-yaml.yaml  extends layer-json.json,
+    ///                    allow-unsupported-php-version = true
+    ///   mago.toml        extends layer-yaml.yaml,
+    ///                    php-version = "8.3.0"  (overrides layer-json)
+    #[test]
+    fn test_extends_long_mixed_format_chain() {
+        let dir = temp_dir().join("extends-long-chain");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        write_file(&dir.join("bottom.toml"), "stack-size = 16777216\n");
+        write_file(&dir.join("layer-yml.yml"), "extends: \"bottom.toml\"\nthreads: 7\n");
+        write_file(
+            &dir.join("layer-json.json"),
+            "{\n  \"extends\": \"layer-yml.yml\",\n  \"php-version\": \"8.1.0\"\n}\n",
+        );
+        write_file(&dir.join("layer-yaml.yaml"), "extends: \"layer-json.json\"\nallow-unsupported-php-version: true\n");
+        write_file(&dir.join("mago.toml"), "extends = \"layer-yaml.yaml\"\nphp-version = \"8.3.0\"\n");
+
+        let config = load_isolated(&dir.join("mago.toml"));
+        // Deepest layer survives as long as no later layer overrides it.
+        assert_eq!(config.stack_size, 16_777_216);
+        // Set in layer-yml.yml, never overridden.
+        assert_eq!(config.threads, 7);
+        // Set in layer-json.json, then overridden by the outermost mago.toml.
+        assert_eq!(config.php_version.to_string(), "8.3.0");
+        // Set in layer-yaml.yaml.
+        assert!(config.allow_unsupported_php_version);
+    }
+
+    #[test]
+    fn test_supports_schema_in_config() {
+        let dir = temp_dir().join("supports-schema-in-config");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("mago.toml");
+
+        write_file(&config_path, "\"$schema\" = \"mago_json_schema.json\"\n");
+
+        let config = load_isolated(&config_path);
+
+        // Really we don't care about this we just want to make sure
+        // that `load_isolated` doesn't panic.
+        assert!(config._schema.is_some());
     }
 }
 
@@ -771,4 +1091,226 @@ fn detect_editor_url() -> Option<String> {
     }
 
     None
+}
+
+/// Configuration file format. Order of variants is the precedence order used during
+/// auto-discovery within a directory: TOML wins over YAML wins over JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfigFormat {
+    Toml,
+    Yaml,
+    Json,
+}
+
+impl ConfigFormat {
+    pub(crate) const ALL: &'static [ConfigFormat] = &[ConfigFormat::Toml, ConfigFormat::Yaml, ConfigFormat::Json];
+
+    /// Extensions matched for this format, in preference order.
+    pub(crate) fn extensions(&self) -> &'static [&'static str] {
+        match self {
+            ConfigFormat::Toml => &["toml"],
+            ConfigFormat::Yaml => &["yaml", "yml"],
+            ConfigFormat::Json => &["json"],
+        }
+    }
+
+    /// Detect format from a file path's extension; returns `None` if unrecognised.
+    pub(crate) fn for_path(path: &Path) -> Option<ConfigFormat> {
+        let ext = path.extension().and_then(|e| e.to_str())?;
+        for f in Self::ALL {
+            if f.extensions().iter().any(|x| x.eq_ignore_ascii_case(ext)) {
+                return Some(*f);
+            }
+        }
+        None
+    }
+
+    /// Parse raw file content into a generic `serde_json::Value` tree using the right serde
+    /// driver. We use `serde_json::Value` as the universal merge type because it covers TOML,
+    /// YAML, and JSON (TOML datetimes get coerced to strings, which is fine — Configuration
+    /// doesn't have datetime fields). `path` is included in error messages.
+    pub(crate) fn parse_to_value(&self, content: &str, path: &Path) -> Result<Value, Error> {
+        match self {
+            ConfigFormat::Toml => toml::from_str::<Value>(content)
+                .map_err(|e| Error::ParseConfigFile { path: path.to_path_buf(), source: Box::new(e) }),
+            ConfigFormat::Yaml => serde_norway::from_str::<Value>(content)
+                .map_err(|e| Error::ParseConfigFile { path: path.to_path_buf(), source: Box::new(e) }),
+            ConfigFormat::Json => serde_json::from_str::<Value>(content)
+                .map_err(|e| Error::ParseConfigFile { path: path.to_path_buf(), source: Box::new(e) }),
+        }
+    }
+}
+
+/// Recursively load a config file into its merged `serde_json::Value` representation.
+///
+/// Each layer's `extends` directive is processed before the layer's own values are applied,
+/// so the precedence order is: defaults < extends[0] < extends[1] < … < this file's keys.
+/// `extends` paths are resolved relative to the directory of the file declaring them (not
+/// against cwd) — important when running with `--config some/dir/config.toml`.
+fn load_layer(path: &Path, format: ConfigFormat, visited: &mut HashSet<PathBuf>) -> Result<Value, Error> {
+    let canonical = path.canonicalize().map_err(|e| Error::ReadConfigFile { path: path.to_path_buf(), source: e })?;
+    if visited.contains(&canonical) {
+        return Err(Error::CircularExtends(canonical));
+    }
+    visited.insert(canonical);
+
+    let content =
+        std::fs::read_to_string(path).map_err(|e| Error::ReadConfigFile { path: path.to_path_buf(), source: e })?;
+    let mut value = format.parse_to_value(&content, path)?;
+
+    let extends = extract_extends(&mut value, path)?;
+    if extends.is_empty() {
+        return Ok(value);
+    }
+
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut accumulator = Value::Object(serde_json::Map::new());
+    for entry in &extends {
+        match resolve_extends_entry(entry, base_dir)? {
+            Some((resolved_path, resolved_format)) => {
+                tracing::debug!("Extending configuration from {}.", resolved_path.display());
+                let parent_value = load_layer(&resolved_path, resolved_format, visited)?;
+                merge_into(&mut accumulator, parent_value);
+            }
+            None => {
+                tracing::warn!(
+                    "Configuration `extends` entry `{}` (resolved relative to `{}`) is a directory \
+                     without a `mago.toml`/`mago.yaml`/`mago.yml`/`mago.json` — skipping.",
+                    entry,
+                    base_dir.display()
+                );
+            }
+        }
+    }
+
+    merge_into(&mut accumulator, value);
+
+    Ok(accumulator)
+}
+
+/// Pop the `extends` key off the top-level table and normalise it to a list of strings.
+/// Errors if it's present but not a string or array of strings.
+fn extract_extends(value: &mut Value, path: &Path) -> Result<Vec<String>, Error> {
+    let Some(obj) = value.as_object_mut() else {
+        return Ok(Vec::new());
+    };
+    let Some(raw) = obj.remove("extends") else {
+        return Ok(Vec::new());
+    };
+
+    match raw {
+        Value::String(s) => Ok(vec![s]),
+        Value::Array(arr) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for v in arr {
+                match v {
+                    Value::String(s) => out.push(s),
+                    other => {
+                        return Err(Error::InvalidExtendsEntry {
+                            path: path.to_path_buf(),
+                            reason: format!("expected string, got {}", json_value_kind(&other)),
+                        });
+                    }
+                }
+            }
+            Ok(out)
+        }
+        other => Err(Error::InvalidExtendsEntry {
+            path: path.to_path_buf(),
+            reason: format!("expected string or array of strings, got {}", json_value_kind(&other)),
+        }),
+    }
+}
+
+/// Resolve a single `extends` entry against `base_dir` (the directory of the file declaring
+/// the extends). Returns `None` if the entry is a directory with no recognised config file
+/// inside (caller logs a warning and skips). Returns an error if the entry doesn't exist or
+/// has an unrecognised extension.
+fn resolve_extends_entry(entry: &str, base_dir: &Path) -> Result<Option<(PathBuf, ConfigFormat)>, Error> {
+    let entry_path = Path::new(entry);
+    let resolved = if entry_path.is_absolute() { entry_path.to_path_buf() } else { base_dir.join(entry_path) };
+
+    let metadata = std::fs::metadata(&resolved).map_err(|e| Error::ExtendsTargetNotFound {
+        entry: entry.to_string(),
+        resolved: resolved.clone(),
+        source: e,
+    })?;
+
+    if metadata.is_dir() {
+        // Reuse a single PathBuf; only its trailing extension changes per probe.
+        let mut candidate = resolved.join(CONFIGURATION_FILE_NAME);
+        for format in ConfigFormat::ALL {
+            for ext in format.extensions() {
+                candidate.set_extension(ext);
+                if candidate.exists() {
+                    return Ok(Some((candidate, *format)));
+                }
+            }
+        }
+
+        return Ok(None);
+    }
+
+    let format =
+        ConfigFormat::for_path(&resolved).ok_or_else(|| Error::UnsupportedConfigExtension(resolved.clone()))?;
+    Ok(Some((resolved, format)))
+}
+
+/// Recursively merge `source` into `target`. Object keys from `source` override / merge with
+/// `target`'s. Arrays are concatenated (target first, source second). Scalars in `source`
+/// replace scalars in `target`.
+fn merge_into(target: &mut Value, source: Value) {
+    use serde_json::Value;
+    match (target, source) {
+        (Value::Object(t), Value::Object(s)) => {
+            for (k, v) in s {
+                match t.get_mut(&k) {
+                    Some(existing) => merge_into(existing, v),
+                    None => {
+                        t.insert(k, v);
+                    }
+                }
+            }
+        }
+        (Value::Array(t), Value::Array(s)) => {
+            t.extend(s);
+        }
+        (target, source) => {
+            *target = source;
+        }
+    }
+}
+
+fn json_value_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// Parse a boolean from an env var. Accepts: 1/0, true/false, yes/no, on/off (any case).
+fn parse_bool(s: &str) -> Result<bool, std::io::Error> {
+    let trimmed = s.trim();
+    if trimmed == "1"
+        || trimmed.eq_ignore_ascii_case("true")
+        || trimmed.eq_ignore_ascii_case("yes")
+        || trimmed.eq_ignore_ascii_case("on")
+    {
+        return Ok(true);
+    }
+
+    if trimmed.is_empty()
+        || trimmed == "0"
+        || trimmed.eq_ignore_ascii_case("false")
+        || trimmed.eq_ignore_ascii_case("no")
+        || trimmed.eq_ignore_ascii_case("off")
+    {
+        return Ok(false);
+    }
+
+    Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid boolean: `{s}`")))
 }

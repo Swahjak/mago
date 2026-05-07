@@ -413,10 +413,63 @@ generate_formatter_settings! {
     /// Default: false
     preserve_breaking_member_access_chain: bool => "default_false",
 
+    /// When preserving a broken object method chain, keep the first method call on the same line as the receiver.
+    ///
+    /// This only affects already-broken object chains preserved by
+    /// `preserve_breaking_member_access_chain`, and does not change the default
+    /// breaking style for newly broken chains.
+    ///
+    /// When enabled:
+    /// ```php
+    /// $object->method1()
+    ///     ->method2()
+    ///     ->method3();
+    /// ```
+    ///
+    /// When disabled:
+    /// ```php
+    /// $object
+    ///     ->method1()
+    ///     ->method2()
+    ///     ->method3();
+    /// ```
+    ///
+    /// Default: false
+    preserve_breaking_member_access_chain_first_method_on_same_line: bool => "default_false",
+
     /// Whether to preserve line breaks in argument lists, even if they could fit on a single line.
     ///
     /// Default: false
     preserve_breaking_argument_list: bool => "default_false",
+
+    /// Keep a call's single value-shaped argument inline even when the line
+    /// overflows `print-width`.
+    ///
+    /// When the only argument of a call is a "value" (literal, variable,
+    /// identifier, class constant, etc.), breaking the parentheses around it
+    /// adds an indented newline and a closing-paren line without making the
+    /// argument itself any shorter. The result occupies more lines for no
+    /// readability gain. Enabling this option suppresses that break:
+    ///
+    /// Disabled (default):
+    /// ```php
+    /// $foo->description(
+    ///     'Filter notices affecting flights departing or arriving between the specified dates...',
+    /// );
+    /// ```
+    ///
+    /// Enabled:
+    /// ```php
+    /// $foo->description('Filter notices affecting flights departing or arriving between the specified dates...');
+    /// ```
+    ///
+    /// Only applies when the argument is positional, has no surrounding
+    /// comments, and is shaped like a value (no internal calls, arrays, or
+    /// closures). Multi-argument calls and complex expressions still follow
+    /// the normal break-on-overflow logic.
+    ///
+    /// Default: false
+    inline_single_breaking_value_argument: bool => "default_false",
 
     /// Whether to preserve line breaks in array-like structures, even if they could fit on a single line.
     ///
@@ -526,6 +579,63 @@ generate_formatter_settings! {
     /// Default: false
     indent_binary_expression_continuation: bool => "default_false",
 
+    /// Whether to omit redundant parentheses around arithmetic binary expressions under comparison and null coalesce expressions.
+    ///
+    /// When enabled, parentheses are omitted where PHP precedence already preserves meaning:
+    /// ```php
+    /// if ($i === $retries - 1) {
+    /// }
+    /// ```
+    ///
+    /// When disabled, arithmetic binary expressions keep Mago's default grouping style:
+    /// ```php
+    /// if ($i === ($retries - 1)) {
+    /// }
+    /// ```
+    ///
+    /// Default: false
+    omit_redundant_arithmetic_binary_expression_parentheses: bool => "default_false",
+
+    /// Whether to omit redundant parentheses around bitwise binary child expressions.
+    ///
+    /// When enabled, parentheses are omitted around bitwise binary child expressions where PHP precedence and
+    /// associativity already preserve meaning:
+    /// ```php
+    /// if ($mask === $flags << 1) {
+    /// }
+    /// ```
+    ///
+    /// When disabled, bitwise binary child expressions keep Mago's default grouping style:
+    /// ```php
+    /// if ($mask === ($flags << 1)) {
+    /// }
+    /// ```
+    ///
+    /// Default: false
+    omit_redundant_bitwise_binary_expression_parentheses: bool => "default_false",
+
+    /// Whether to preserve author-written parentheses around logical binary sub-expressions
+    /// even when PHP's operator precedence makes them redundant.
+    ///
+    /// When enabled, explicit grouping parentheses that an author added for clarity are kept:
+    /// ```php
+    /// if (($var1 > 200 && $var2 < 1) || ($var1 <= 200 && $var2 < 3)) {
+    /// }
+    /// ```
+    ///
+    /// When disabled (the default), the formatter removes parentheses that the precedence rules
+    /// already imply:
+    /// ```php
+    /// if ($var1 > 200 && $var2 < 1 || $var1 <= 200 && $var2 < 3) {
+    /// }
+    /// ```
+    ///
+    /// This only applies to logical operators (`&&`, `||`, `and`, `or`, `xor`): parentheses
+    /// that group a logical sub-expression inside another logical expression.
+    ///
+    /// Default: false
+    preserve_redundant_logical_binary_expression_parentheses: bool => "default_false",
+
     /// Whether to always break named argument lists into multiple lines.
     ///
     /// When enabled:
@@ -552,6 +662,29 @@ generate_formatter_settings! {
     ///
     /// Default: false
     always_break_attribute_named_argument_lists: bool => "default_false",
+
+    /// Whether to align named arguments in multiline argument lists.
+    ///
+    /// When enabled:
+    /// ```php
+    /// some_function(
+    ///     short:       1,
+    ///     longerName:  2,
+    ///     longestName: 3,
+    /// );
+    /// ```
+    ///
+    /// Single-line argument lists remain inline, and positional arguments are not aligned.
+    ///
+    /// Default: false
+    align_named_arguments: bool => "default_false",
+
+    /// Whether to align multiline function and method parameter lists by the variable column.
+    ///
+    /// This is especially useful for promoted constructor properties with visibility modifiers.
+    ///
+    /// Default: false
+    align_parameters: bool => "default_false",
 
     /// Whether to use table-style alignment for arrays.
     ///
@@ -1202,6 +1335,7 @@ fn default_true() -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

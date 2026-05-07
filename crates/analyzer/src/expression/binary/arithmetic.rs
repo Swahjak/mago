@@ -2,9 +2,12 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use mago_codex::metadata::CodebaseMetadata;
 use mago_codex::ttype::TType;
 use mago_codex::ttype::atomic::TAtomic;
 use mago_codex::ttype::atomic::array::TArray;
+use mago_codex::ttype::atomic::array::key::ArrayKey;
+use mago_codex::ttype::atomic::array::keyed::TKeyedArray;
 use mago_codex::ttype::atomic::mixed::TMixed;
 use mago_codex::ttype::atomic::scalar::TScalar;
 use mago_codex::ttype::atomic::scalar::float::TFloat;
@@ -43,8 +46,8 @@ pub fn analyze_arithmetic_operation<'ctx, 'arena>(
     block_context.flags.set_inside_general_use(was_inside_general_use);
 
     let fallback = Rc::new(get_mixed());
-    let left_type = artifacts.get_rc_expression_type(&binary.lhs).cloned().unwrap_or_else(|| fallback.clone());
-    let right_type = artifacts.get_rc_expression_type(&binary.rhs).cloned().unwrap_or_else(|| fallback.clone());
+    let left_type = artifacts.get_rc_expression_type(&binary.lhs).cloned().unwrap_or_else(|| Rc::clone(&fallback));
+    let right_type = artifacts.get_rc_expression_type(&binary.rhs).cloned().unwrap_or_else(|| Rc::clone(&fallback));
 
     if left_type.is_never() || right_type.is_never() {
         assign_arithmetic_type(artifacts, get_never(), binary);
@@ -78,6 +81,8 @@ pub fn analyze_arithmetic_operation<'ctx, 'arena>(
                 "Ensure the left operand is non-null before the operation, potentially using checks or assertions.",
             ),
         );
+    } else {
+        // left operand is not null and not possibly-null; no nullability diagnostic needed
     }
 
     if right_type.is_null() {
@@ -103,12 +108,16 @@ pub fn analyze_arithmetic_operation<'ctx, 'arena>(
                 "Ensure the right operand is non-null before the operation, potentially using checks or assertions.",
             ),
         );
+    } else {
+        // right operand is not null and not possibly-null; no nullability diagnostic needed
     }
 
     if is_arithmetic_compatible_generic(context, &left_type, &right_type) {
         final_result_type = Some(left_type.as_ref().clone());
     } else if is_arithmetic_compatible_generic(context, &right_type, &left_type) {
         final_result_type = Some(right_type.as_ref().clone());
+    } else {
+        // neither operand is a compatible generic; fall through to per-atomic arithmetic resolution
     }
 
     if let Some(final_result_type) = final_result_type {
@@ -117,7 +126,16 @@ pub fn analyze_arithmetic_operation<'ctx, 'arena>(
         return Ok(());
     }
 
-    if left_type.is_false() {
+    let is_bitwise = matches!(
+        binary.operator,
+        BinaryOperator::BitwiseAnd(_)
+            | BinaryOperator::BitwiseOr(_)
+            | BinaryOperator::BitwiseXor(_)
+            | BinaryOperator::LeftShift(_)
+            | BinaryOperator::RightShift(_)
+    );
+
+    if left_type.is_false() && !is_bitwise {
         context.collector.report_with_code(
             IssueCode::FalseOperand,
             Issue::warning(
@@ -131,7 +149,7 @@ pub fn analyze_arithmetic_operation<'ctx, 'arena>(
         );
         // We'll treat it as 0 in the loop below, but the warning is issued.
         // If *only* false, Psalm might bail; let's continue for now
-    } else if left_type.is_falsable() && !left_type.ignore_falsable_issues() {
+    } else if left_type.is_falsable() && !left_type.ignore_falsable_issues() && !is_bitwise {
         context.collector.report_with_code(
             IssueCode::PossiblyFalseOperand,
             Issue::warning(format!(
@@ -149,9 +167,11 @@ pub fn analyze_arithmetic_operation<'ctx, 'arena>(
                 "Ensure the left operand is non-falsy before the operation, or explicitly cast if coercion is intended."
             ),
         );
+    } else {
+        // left operand is bitwise-safe or not falsable; no false-operand diagnostic needed
     }
 
-    if right_type.is_false() {
+    if right_type.is_false() && !is_bitwise {
         context.collector.report_with_code(
             IssueCode::FalseOperand,
             Issue::warning(
@@ -168,7 +188,7 @@ pub fn analyze_arithmetic_operation<'ctx, 'arena>(
                 "Ensure the right operand is a number (int/float). Using `false` directly in arithmetic is discouraged."
             ),
         );
-    } else if right_type.is_falsable() && !right_type.ignore_falsable_issues() {
+    } else if right_type.is_falsable() && !right_type.ignore_falsable_issues() && !is_bitwise {
         context.collector.report_with_code(
             IssueCode::PossiblyFalseOperand,
             Issue::warning(format!(
@@ -186,6 +206,8 @@ pub fn analyze_arithmetic_operation<'ctx, 'arena>(
                 "Ensure the right operand is non-falsy before the operation, or explicitly cast if coercion is intended."
             ),
         );
+    } else {
+        // right operand is bitwise-safe or not falsable; no false-operand diagnostic needed
     }
 
     let mut result_atomic_types: Vec<TAtomic> = Vec::new();
@@ -223,6 +245,8 @@ pub fn analyze_arithmetic_operation<'ctx, 'arena>(
     for mut left_atomic in left_atomic_types {
         left_atomic = match left_atomic {
             TAtomic::Scalar(TScalar::Bool(bool)) if bool.is_false() => TAtomic::Scalar(TScalar::literal_int(0)),
+            TAtomic::Scalar(TScalar::Bool(bool)) if bool.is_true() => TAtomic::Scalar(TScalar::literal_int(1)),
+            TAtomic::Scalar(TScalar::Bool(_)) => TAtomic::Scalar(TScalar::int()),
             TAtomic::Null => continue,
             atomic => atomic,
         };
@@ -230,6 +254,8 @@ pub fn analyze_arithmetic_operation<'ctx, 'arena>(
         for right_atomic in &right_atomic_types {
             let right_atomic = match right_atomic {
                 TAtomic::Scalar(TScalar::Bool(bool)) if bool.is_false() => TAtomic::Scalar(TScalar::literal_int(0)),
+                TAtomic::Scalar(TScalar::Bool(bool)) if bool.is_true() => TAtomic::Scalar(TScalar::literal_int(1)),
+                TAtomic::Scalar(TScalar::Bool(_)) => TAtomic::Scalar(TScalar::int()),
                 TAtomic::Null => continue,
                 atomic => atomic.clone(),
             };
@@ -295,33 +321,8 @@ pub fn analyze_arithmetic_operation<'ctx, 'arena>(
             if matches!(binary.operator, BinaryOperator::Addition(_))
                 && (left_atomic.is_array() || right_atomic.is_array())
             {
-                if left_atomic.is_array() && right_atomic.is_array() {
-                    // PHP array addition: $a + $b keeps all keys from $a and adds keys from $b that don't exist in $a
-                    // If either operand is non-empty, the result is non-empty
-                    // We use the combiner for merging types but fix the non_empty flag afterwards
-                    let mut combined = combiner::combine(
-                        vec![left_atomic.clone(), right_atomic.clone()],
-                        context.codebase,
-                        context.settings.combiner_options(),
-                    );
-
-                    // Fix the non_empty flag: if either operand is non-empty, result is non-empty
-                    if let (TAtomic::Array(left_array), TAtomic::Array(right_array)) = (&left_atomic, right_atomic) {
-                        let should_be_non_empty = left_array.is_non_empty() || right_array.is_non_empty();
-
-                        for atomic in &mut combined {
-                            if let TAtomic::Array(result_array) = atomic {
-                                match result_array {
-                                    TArray::Keyed(keyed) => {
-                                        keyed.non_empty = should_be_non_empty;
-                                    }
-                                    TArray::List(list) => {
-                                        list.non_empty = should_be_non_empty;
-                                    }
-                                }
-                            }
-                        }
-                    }
+                if let (TAtomic::Array(left_array), TAtomic::Array(right_array)) = (&left_atomic, &right_atomic) {
+                    let combined = compose_array_plus(left_array, right_array, context);
 
                     pair_result_atomics.extend(combined);
 
@@ -344,7 +345,25 @@ pub fn analyze_arithmetic_operation<'ctx, 'arena>(
                     has_valid_right_operand = true;
                     invalid_pair = true;
                 }
+            } else if is_bitwise
+                && matches!(
+                    binary.operator,
+                    BinaryOperator::BitwiseAnd(_) | BinaryOperator::BitwiseOr(_) | BinaryOperator::BitwiseXor(_)
+                )
+                && left_atomic.is_string()
+                && right_atomic.is_string()
+            {
+                pair_result_atomics.push(string_bitwise_result(&binary.operator, &left_atomic, &right_atomic));
+                has_valid_left_operand = true;
+                has_valid_right_operand = true;
             } else if left_atomic.is_numeric() && right_atomic.is_numeric() {
+                if let Some(reason) = definite_arithmetic_runtime_error(&binary.operator, &right_atomic) {
+                    invalid_right_messages.push((reason, binary.rhs.span()));
+                    pair_result_atomics.push(TAtomic::Never);
+                    result_atomic_types.extend(pair_result_atomics);
+                    continue;
+                }
+
                 let numeric_results = determine_numeric_result(
                     &binary.operator,
                     &left_atomic,
@@ -538,6 +557,29 @@ fn determine_numeric_result(op: &BinaryOperator<'_>, left: &TAtomic, right: &TAt
         };
     }
 
+    let is_bitwise_op = matches!(
+        op,
+        BinaryOperator::BitwiseAnd(_)
+            | BinaryOperator::BitwiseOr(_)
+            | BinaryOperator::BitwiseXor(_)
+            | BinaryOperator::LeftShift(_)
+            | BinaryOperator::RightShift(_)
+    );
+
+    if is_bitwise_op {
+        let to_int = |atomic: &TAtomic| match atomic {
+            TAtomic::Scalar(TScalar::Integer(i)) => *i,
+            TAtomic::Scalar(TScalar::Float(TFloat::Literal(v))) => TInteger::Literal(v.into_inner() as i64),
+            _ => TInteger::Unspecified,
+        };
+
+        let left_int = to_int(left);
+        let right_int = to_int(right);
+        let combined = calculate_int_arithmetic(op, left_int, right_int).unwrap_or(TInteger::Unspecified);
+
+        return vec![TAtomic::Scalar(TScalar::Integer(combined))];
+    }
+
     match (left, right) {
         (TAtomic::Scalar(TScalar::Integer(left_int)), TAtomic::Scalar(TScalar::Integer(right_int))) => {
             let result = calculate_int_arithmetic(op, *left_int, *right_int);
@@ -619,6 +661,51 @@ fn determine_numeric_result(op: &BinaryOperator<'_>, left: &TAtomic, right: &TAt
     }
 }
 
+/// Compute the result of `string ^ string`, `string & string`, or
+/// `string | string`. PHP applies the op byte-by-byte; the result is a string
+/// whose length follows the operator (min for AND/XOR, max for OR). Falls
+/// back to a generic `string` when either operand isn't a tracked literal.
+fn string_bitwise_result(op: &BinaryOperator<'_>, left: &TAtomic, right: &TAtomic) -> TAtomic {
+    let (Some(left_str), Some(right_str)) = (left.get_literal_string_value(), right.get_literal_string_value()) else {
+        return TAtomic::Scalar(TScalar::string());
+    };
+
+    let left_bytes = left_str.as_bytes();
+    let right_bytes = right_str.as_bytes();
+
+    let result_bytes: Vec<u8> = match op {
+        BinaryOperator::BitwiseAnd(_) => {
+            let len = left_bytes.len().min(right_bytes.len());
+
+            (0..len).map(|i| left_bytes[i] & right_bytes[i]).collect()
+        }
+        BinaryOperator::BitwiseXor(_) => {
+            let len = left_bytes.len().min(right_bytes.len());
+
+            (0..len).map(|i| left_bytes[i] ^ right_bytes[i]).collect()
+        }
+        BinaryOperator::BitwiseOr(_) => {
+            let (longer, shorter) = if left_bytes.len() >= right_bytes.len() {
+                (left_bytes, right_bytes)
+            } else {
+                (right_bytes, left_bytes)
+            };
+
+            longer
+                .iter()
+                .enumerate()
+                .map(|(i, byte)| if i < shorter.len() { byte | shorter[i] } else { *byte })
+                .collect()
+        }
+        _ => return TAtomic::Scalar(TScalar::string()),
+    };
+
+    match std::str::from_utf8(&result_bytes) {
+        Ok(text) => TAtomic::Scalar(TScalar::literal_string(mago_atom::atom(text))),
+        Err(_) => TAtomic::Scalar(TScalar::string()),
+    }
+}
+
 fn calculate_int_arithmetic(op: &BinaryOperator<'_>, left: TInteger, right: TInteger) -> Option<TInteger> {
     use TInteger::Literal;
     use TInteger::Unspecified;
@@ -660,4 +747,153 @@ fn calculate_int_arithmetic(op: &BinaryOperator<'_>, left: TInteger, right: TInt
     };
 
     if result.is_unspecified() { None } else { Some(result) }
+}
+
+/// Compose two array shapes under PHP's `+` operator.
+fn compose_array_plus(left: &TArray, right: &TArray, context: &Context<'_, '_>) -> Vec<TAtomic> {
+    if let (TArray::Keyed(left_keyed), TArray::Keyed(right_keyed)) = (left, right) {
+        let composed = compose_keyed_plus(left_keyed, right_keyed);
+        return vec![TAtomic::Array(TArray::Keyed(composed))];
+    }
+
+    let mut combined = combiner::combine(
+        vec![TAtomic::Array(left.clone()), TAtomic::Array(right.clone())],
+        context.codebase,
+        context.settings.combiner_options(),
+    );
+
+    let should_be_non_empty = left.is_non_empty() || right.is_non_empty();
+    for atomic in &mut combined {
+        if let TAtomic::Array(result_array) = atomic {
+            match result_array {
+                TArray::Keyed(keyed) => keyed.non_empty = should_be_non_empty,
+                TArray::List(list) => list.non_empty = should_be_non_empty,
+            }
+        }
+    }
+
+    combined
+}
+
+/// `+` composition for two keyed shapes.
+fn compose_keyed_plus(left: &TKeyedArray, right: &TKeyedArray) -> TKeyedArray {
+    use std::collections::BTreeMap;
+
+    let left_known = left.known_items.as_ref();
+    let right_known = right.known_items.as_ref();
+
+    let mut composed_known: BTreeMap<_, _> = BTreeMap::new();
+
+    if let Some(left_known) = left_known {
+        for (key, (left_optional, left_value)) in left_known {
+            if !*left_optional {
+                composed_known.insert(*key, (false, left_value.clone()));
+                continue;
+            }
+
+            if let Some(right_known) = right_known
+                && let Some((right_optional, right_value)) = right_known.get(key)
+            {
+                let merged_value = left_value.clone();
+                let merged_value = mago_codex::ttype::combine_optional_union_types(
+                    Some(&merged_value),
+                    Some(right_value),
+                    &CodebaseMetadata::default(),
+                );
+                let new_optional = *left_optional && *right_optional;
+                composed_known.insert(*key, (new_optional, merged_value));
+                continue;
+            }
+
+            if let Some((right_key_type, right_value_type)) = right.parameters.as_ref() {
+                let key_could_match = key_could_be_in_param(key, right_key_type);
+                if key_could_match {
+                    let merged_value = mago_codex::ttype::combine_optional_union_types(
+                        Some(left_value),
+                        Some(right_value_type),
+                        &CodebaseMetadata::default(),
+                    );
+                    composed_known.insert(*key, (false, merged_value));
+                    continue;
+                }
+            }
+
+            composed_known.insert(*key, (true, left_value.clone()));
+        }
+    }
+
+    if let Some(right_known) = right_known {
+        let left_has_catch_all_for_string_keys =
+            left.parameters.as_ref().is_some_and(|(k, _)| matches!(k.types.first(), Some(t) if !t.is_never()));
+
+        for (key, (right_optional, right_value)) in right_known {
+            if composed_known.contains_key(key) {
+                continue;
+            }
+
+            if left_has_catch_all_for_string_keys
+                && let Some((left_key_type, left_value_type)) = left.parameters.as_ref()
+                && key_could_be_in_param(key, left_key_type)
+            {
+                let merged_value = mago_codex::ttype::combine_optional_union_types(
+                    Some(left_value_type),
+                    Some(right_value),
+                    &CodebaseMetadata::default(),
+                );
+
+                composed_known.insert(*key, (*right_optional, merged_value));
+            } else {
+                composed_known.insert(*key, (*right_optional, right_value.clone()));
+            }
+        }
+    }
+
+    let composed_parameters = match (left.parameters.as_ref(), right.parameters.as_ref()) {
+        (Some((lk, lv)), Some((rk, rv))) => {
+            let merged_k =
+                mago_codex::ttype::combine_optional_union_types(Some(lk), Some(rk), &CodebaseMetadata::default());
+            let merged_v =
+                mago_codex::ttype::combine_optional_union_types(Some(lv), Some(rv), &CodebaseMetadata::default());
+            Some((Arc::new(merged_k), Arc::new(merged_v)))
+        }
+        (Some(p), None) | (None, Some(p)) => Some(p.clone()),
+        (None, None) => None,
+    };
+
+    let non_empty =
+        left.is_non_empty() || right.is_non_empty() || composed_known.values().any(|(optional, _)| !*optional);
+
+    TKeyedArray {
+        known_items: Some(composed_known).filter(|m| !m.is_empty()),
+        parameters: composed_parameters,
+        non_empty,
+    }
+}
+
+fn key_could_be_in_param(key: &ArrayKey, param: &TUnion) -> bool {
+    match key {
+        ArrayKey::Integer(_) => param.has_int(),
+        ArrayKey::String(_) => param.has_string(),
+        ArrayKey::ClassLikeConstant { .. } => true,
+    }
+}
+
+/// Detect arithmetic operations that are statically guaranteed to throw at
+/// runtime, where the failure does not surface as `Never` from
+/// [`determine_numeric_result`].
+fn definite_arithmetic_runtime_error(op: &BinaryOperator<'_>, right: &TAtomic) -> Option<String> {
+    match op {
+        BinaryOperator::Modulo(_) => {
+            let zero = matches!(right.get_literal_int_value(), Some(0))
+                || matches!(right.get_literal_float_value(), Some(0.0));
+
+            if zero { Some("Modulo by zero".to_string()) } else { None }
+        }
+        BinaryOperator::LeftShift(_) | BinaryOperator::RightShift(_) => {
+            let value = right.get_literal_int_value()?;
+
+            if value < 0 { Some(format!("Bit shift by a negative number (`{value}`)")) } else { None }
+        }
+        _ => None,
+    }
 }

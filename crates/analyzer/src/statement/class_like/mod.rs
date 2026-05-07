@@ -1,3 +1,4 @@
+use foldhash::HashMap;
 use foldhash::HashSet;
 use foldhash::fast::RandomState;
 use indexmap::IndexMap;
@@ -8,6 +9,7 @@ use mago_atom::ascii_lowercase_atom;
 use mago_atom::atom;
 use mago_codex::context::ScopeContext;
 
+use mago_codex::metadata::CodebaseMetadata;
 use mago_codex::metadata::class_like::ClassLikeMetadata;
 use mago_codex::metadata::function_like::FunctionLikeMetadata;
 use mago_codex::metadata::property::PropertyMetadata;
@@ -23,9 +25,9 @@ use mago_codex::ttype::expander::TypeExpansionOptions;
 use mago_codex::ttype::expander::expand_union;
 use mago_codex::ttype::template::GenericTemplate;
 use mago_codex::ttype::template::TemplateResult;
+use mago_codex::ttype::template::definition_type_replacer;
+use mago_codex::ttype::template::definition_type_replacer::DefinitionReplacementOptions;
 use mago_codex::ttype::template::inferred_type_replacer;
-use mago_codex::ttype::template::standin_type_replacer;
-use mago_codex::ttype::template::standin_type_replacer::StandinOptions;
 use mago_codex::ttype::union::TUnion;
 use mago_codex::visibility::Visibility;
 use mago_names::kind::NameKind;
@@ -95,8 +97,32 @@ fn report_duplicate_definition(
 /// This is a convenience wrapper around `union_comparator::is_contained_by` with standard
 /// settings for inheritance checks (no null/false ignoring, not inside assertion).
 #[inline]
-fn is_type_compatible(codebase: &mago_codex::metadata::CodebaseMetadata, child: &TUnion, parent: &TUnion) -> bool {
+fn is_type_compatible(codebase: &CodebaseMetadata, child: &TUnion, parent: &TUnion) -> bool {
     union_comparator::is_contained_by(codebase, child, parent, false, false, false, &mut ComparisonResult::default())
+}
+
+/// Checks whether a child's property type violates the variance rules imposed by the parent.
+///
+/// - When the parent has only a `get` hook, covariance (declaring narrower than parent) is allowed.
+/// - When the parent has only a `set` hook, contravariance (declaring wider than parent) is allowed.
+/// - Otherwise, invariance is required.
+///
+/// Returns `true` when the declaring type is incompatible with the parent under these rules.
+#[inline]
+fn is_property_type_variance_invalid(
+    codebase: &CodebaseMetadata,
+    declaring_type: &TUnion,
+    parent_type: &TUnion,
+    parent_only_get: bool,
+    parent_only_set: bool,
+) -> bool {
+    let declaring_is_subtype_of_parent = is_type_compatible(codebase, declaring_type, parent_type);
+    let parent_is_subtype_of_declaring = is_type_compatible(codebase, parent_type, declaring_type);
+
+    let declaring_is_narrower = declaring_is_subtype_of_parent && !parent_is_subtype_of_declaring;
+    let declaring_is_wider = parent_is_subtype_of_declaring && !declaring_is_subtype_of_parent;
+
+    (declaring_is_wider && !parent_only_set) || (declaring_is_narrower && !parent_only_get)
 }
 
 /// Represents different types of property conflicts between traits
@@ -132,12 +158,14 @@ impl PropertyConflict {
                 (Some(type1), Some(type2)) => format!("type declaration differs ({type1} vs {type2})"),
                 (Some(type1), None) => format!("type declaration differs ({type1} vs untyped)"),
                 (None, Some(type2)) => format!("type declaration differs (untyped vs {type2})"),
+                #[allow(clippy::unreachable)]
                 (None, None) => unreachable!(),
             },
             PropertyConflict::Default(d1, d2) => match (d1, d2) {
                 (Some(def1), Some(def2)) => format!("default value differs ({def1} vs {def2})"),
                 (Some(def1), None) => format!("default value differs ({def1} vs no default)"),
                 (None, Some(def2)) => format!("default value differs (no default vs {def2})"),
+                #[allow(clippy::unreachable)]
                 (None, None) => unreachable!(),
             },
             PropertyConflict::HookedProperty => {
@@ -1083,6 +1111,7 @@ pub(crate) fn analyze_class_like<'ctx, 'ast, 'arena>(
     Ok(())
 }
 
+#[allow(clippy::unwrap_used)]
 fn check_class_like_extends<'ctx, 'arena>(
     context: &mut Context<'ctx, 'arena>,
     class_like_metadata: &'ctx ClassLikeMetadata,
@@ -1229,6 +1258,8 @@ fn check_class_like_extends<'ctx, 'arena>(
                         .with_note("A non-`readonly` class can only be extended by another non-`readonly` class.")
                         .with_help(format!("To resolve this, either make the `{using_name}` class non-`readonly`, or extend a different, readonly class.")),
                 );
+            } else {
+                // readonly status matches between parent and child; no inheritance error
             }
 
             if let Some(required_interface) =
@@ -1273,6 +1304,7 @@ fn check_class_like_extends<'ctx, 'arena>(
     }
 }
 
+#[allow(clippy::unwrap_used)]
 fn check_class_like_implements<'ctx, 'arena>(
     context: &mut Context<'ctx, 'arena>,
     class_like_metadata: &'ctx ClassLikeMetadata,
@@ -1390,6 +1422,7 @@ fn check_class_like_implements<'ctx, 'arena>(
     }
 }
 
+#[allow(clippy::unwrap_used)]
 fn check_class_like_use<'ctx, 'arena>(
     context: &mut Context<'ctx, 'arena>,
     class_like_metadata: &'ctx ClassLikeMetadata,
@@ -1560,6 +1593,8 @@ fn check_template_parameters<'ctx>(
     inheritance: InheritanceKind,
 ) {
     let expected_parameters_count = parent_metadata.template_types.len();
+    let min_required_parameters_count =
+        parent_metadata.template_types.values().take_while(|t| t.default.is_none()).count();
 
     let class_name = class_like_metadata.original_name;
     let class_kind_str = class_like_metadata.kind.as_str();
@@ -1573,9 +1608,9 @@ fn check_template_parameters<'ctx>(
         InheritanceKind::Use(_) => ("uses", "@use"),
     };
 
-    if expected_parameters_count > actual_parameters_count {
+    if min_required_parameters_count > actual_parameters_count {
         let issue = Issue::error(format!(
-            "Too few template arguments for `{parent_name}`: expected {expected_parameters_count}, but found {actual_parameters_count}."
+            "Too few template arguments for `{parent_name}`: expected at least {min_required_parameters_count}, but found {actual_parameters_count}."
         ))
         .with_annotation(
             Annotation::primary(primary_annotation_span)
@@ -1611,6 +1646,8 @@ fn check_template_parameters<'ctx>(
         .with_help(format!("Remove the extra arguments from the `{inheritance_tag}` tag for `{class_name}`."));
 
         context.collector.report_with_code(IssueCode::ExcessTemplateParameter, issue);
+    } else {
+        // template argument count matches expectation; nothing to report
     }
 
     let own_template_parameters_len = class_like_metadata.template_types.len();
@@ -1665,7 +1702,7 @@ fn check_template_parameters<'ctx>(
 
             if parent_metadata
                 .template_variance
-                .get(&i)
+                .get(i)
                 .is_some_and(mago_codex::ttype::template::variance::Variance::is_invariant)
             {
                 for extended_type_atomic in extended_type.types.as_ref() {
@@ -1683,7 +1720,7 @@ fn check_template_parameters<'ctx>(
 
                     if class_like_metadata
                         .template_variance
-                        .get(&local_offset)
+                        .get(local_offset)
                         .is_some_and(mago_codex::ttype::template::variance::Variance::is_covariant)
                     {
                         let child_template_name = generic_parameter.parameter_name;
@@ -1727,6 +1764,8 @@ fn check_template_parameters<'ctx>(
                                 .with_note(format!("Because `{parent_name}` is marked `@consistent-templates`, the constraints of its template parameters must be identical in child classes."))
                                 .with_help("Adjust the constraint on the child template parameter to match the parent's."),
                         );
+                    } else {
+                        // child template name resolves to a matching constraint; no inconsistency to report
                     }
                 }
             }
@@ -1737,15 +1776,12 @@ fn check_template_parameters<'ctx>(
                     .or_default()
                     .push(GenericTemplate::new(GenericParent::ClassLike(parent_metadata.name), extended_type));
             } else {
-                let mut template_result = TemplateResult::new(previous_extended_types.clone(), Default::default());
-                let mut replaced_template_type = standin_type_replacer::replace(
+                let mut template_result = TemplateResult::new(previous_extended_types.clone(), HashMap::default());
+                let mut replaced_template_type = definition_type_replacer::replace(
                     &template_type,
                     &mut template_result,
                     context.codebase,
-                    &None,
-                    None,
-                    None,
-                    StandinOptions::default(),
+                    DefinitionReplacementOptions::default(),
                 );
 
                 expand_union(
@@ -2396,7 +2432,7 @@ fn get_substituted_method(
     method: &FunctionLikeMetadata,
     class_like_metadata: &ClassLikeMetadata,
     parent_class_name: Atom,
-    codebase: &mago_codex::metadata::CodebaseMetadata,
+    codebase: &CodebaseMetadata,
 ) -> FunctionLikeMetadata {
     let template_mapping =
         class_like_metadata.template_extended_parameters.get(&parent_class_name).cloned().unwrap_or_default();
@@ -2416,7 +2452,7 @@ fn get_substituted_method(
 fn apply_template_substitution_to_method(
     method: &FunctionLikeMetadata,
     template_result: &TemplateResult,
-    codebase: &mago_codex::metadata::CodebaseMetadata,
+    codebase: &CodebaseMetadata,
 ) -> FunctionLikeMetadata {
     let mut substituted_method = method.clone();
 
@@ -2687,6 +2723,7 @@ fn report_signature_compatibility_issue<'ctx>(
     }
 }
 
+#[allow(clippy::similar_names)]
 fn check_class_like_properties<'ctx>(context: &mut Context<'ctx, '_>, class_like_metadata: &'ctx ClassLikeMetadata) {
     if class_like_metadata.kind.is_enum() {
         return;
@@ -2970,21 +3007,31 @@ fn check_class_like_properties<'ctx>(context: &mut Context<'ctx, '_>, class_like
                     );
             }
 
+            // Determine allowed variance based on parent hooks:
+            // - Virtual property with only `get` hook: covariance (declaring narrower than parent)
+            //   is safe because consumers only read, so a more specific type upholds the contract.
+            // - Virtual property with only `set` hook: contravariance (declaring wider than parent)
+            //   is safe because consumers only write, so accepting a wider type upholds the contract.
+            // - Otherwise, invariance is required.
+            let parent_is_virtual = parent_property.flags.is_virtual_property();
+            let parent_has_get_hook = parent_property.hooks.contains_key(&atom("get"));
+            let parent_has_set_hook = parent_property.hooks.contains_key(&atom("set"));
+            let parent_only_get = parent_is_virtual && parent_has_get_hook && !parent_has_set_hook;
+            let parent_only_set = parent_is_virtual && parent_has_set_hook && !parent_has_get_hook;
+
             let mut has_type_incompatibility = false;
             match (
                 property_metadata.type_declaration_metadata.as_ref(),
                 parent_property.type_declaration_metadata.as_ref(),
             ) {
                 (Some(declaring_type), Some(parent_type)) => {
-                    let contains_parent =
-                        is_type_compatible(context.codebase, &declaring_type.type_union, &parent_type.type_union);
-
-                    let contains_declaring =
-                        is_type_compatible(context.codebase, &parent_type.type_union, &declaring_type.type_union);
-
-                    let is_wider = contains_parent && !contains_declaring;
-                    let is_narrower = contains_declaring && !contains_parent;
-                    if is_wider || is_narrower {
+                    if is_property_type_variance_invalid(
+                        context.codebase,
+                        &declaring_type.type_union,
+                        &parent_type.type_union,
+                        parent_only_get,
+                        parent_only_set,
+                    ) {
                         has_type_incompatibility = true;
 
                         let declaring_type_id = declaring_type.type_union.get_id();
@@ -3070,8 +3117,13 @@ fn check_class_like_properties<'ctx>(context: &mut Context<'ctx, '_>, class_like
                 && let Some(declaring_type) = &property_metadata.type_metadata
                 && declaring_type.from_docblock
                 && let Some(parent_type) = &parent_property.type_metadata
-                && (!is_type_compatible(context.codebase, &declaring_type.type_union, &parent_type.type_union)
-                    || !is_type_compatible(context.codebase, &parent_type.type_union, &declaring_type.type_union))
+                && is_property_type_variance_invalid(
+                    context.codebase,
+                    &declaring_type.type_union,
+                    &parent_type.type_union,
+                    parent_only_get,
+                    parent_only_set,
+                )
             {
                 let declaring_type_id = declaring_type.type_union.get_id();
                 let parent_type_id = parent_type.type_union.get_id();
@@ -3463,20 +3515,20 @@ mod tests {
 
     test_analysis! {
         name = direct_interface_incompatible_parameter_name,
-        code = r#"<?php
+        code = "<?php
             interface Sizer {
                 public function getSize(string $document): int;
             }
             class SizerImpl implements Sizer {
                 public function getSize(string $file): int { return 100; }
             }
-        "#,
+        ",
         issues = [IssueCode::IncompatibleParameterName],
     }
 
     test_analysis! {
         name = diamond_inheritance_incompatible_parameter_name,
-        code = r#"<?php
+        code = "<?php
             interface Logger {
                 public function log(string $message): void;
             }
@@ -3485,13 +3537,13 @@ mod tests {
             class CompositeLogger implements FileLogger, DatabaseLogger {
                 public function log(string $entry): void {}
             }
-        "#,
+        ",
         issues = [IssueCode::IncompatibleParameterName],
     }
 
     test_analysis! {
         name = indirect_interface_incompatible_parameter_name,
-        code = r#"<?php
+        code = "<?php
             interface Serializer {
                 public function serialize(mixed $data): string;
             }
@@ -3499,7 +3551,7 @@ mod tests {
             class DefaultJsonSerializer implements JsonSerializer {
                 public function serialize(mixed $payload): string { return ''; }
             }
-        "#,
+        ",
         issues = [IssueCode::IncompatibleParameterName],
     }
 }

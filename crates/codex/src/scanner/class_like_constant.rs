@@ -5,6 +5,7 @@ use mago_reporting::Annotation;
 use mago_reporting::Issue;
 use mago_span::HasSpan;
 use mago_syntax::ast::ClassLikeConstant;
+use mago_syntax::ast::ModifierSequenceExt;
 
 use crate::issue::ScanningIssueKind;
 use crate::metadata::class_like::ClassLikeMetadata;
@@ -17,6 +18,9 @@ use crate::scanner::inference::infer;
 use crate::scanner::ttype::get_type_metadata_from_hint;
 use crate::scanner::ttype::get_type_metadata_from_type_string;
 use crate::scanner::ttype::merge_type_preserving_nullability;
+use crate::ttype::atomic::TAtomic;
+use crate::ttype::atomic::reference::TReference;
+use crate::ttype::atomic::reference::TReferenceMemberSelector;
 use crate::ttype::resolution::TypeResolutionContext;
 use crate::visibility::Visibility;
 
@@ -39,11 +43,7 @@ pub fn scan_class_like_constants<'arena>(
         constant.hint.as_ref().map(|h| get_type_metadata_from_hint(h, Some(class_like_metadata.name), context));
 
     let mut flags = if is_final { MetadataFlags::FINAL } else { MetadataFlags::empty() };
-    if context.file.file_type.is_host() {
-        flags |= MetadataFlags::USER_DEFINED;
-    } else if context.file.file_type.is_builtin() {
-        flags |= MetadataFlags::BUILTIN;
-    }
+    flags |= MetadataFlags::origin_flags(context.file.file_type);
 
     let docblock = match ConstantDocblockComment::create(context, constant) {
         Ok(docblock) => docblock,
@@ -70,9 +70,19 @@ pub fn scan_class_like_constants<'arena>(
             }
 
             meta.attributes.clone_from(&attributes);
-            meta.inferred_type = infer(context, scope, item.value).map(TUnion::get_single_owned);
+            meta.inferred_type = infer(context, scope, item.value, classname).map(TUnion::get_single_owned);
 
-            if let Some(ref docblock) = docblock {
+            if let Some(TAtomic::Reference(TReference::Member {
+                class_like_name,
+                member_selector: TReferenceMemberSelector::Identifier(member_name),
+            })) = meta.inferred_type.as_ref()
+                && classname.is_some_and(|c| c.eq_ignore_ascii_case(class_like_name))
+                && member_name.eq(item.name.value)
+            {
+                meta.inferred_type = Some(TAtomic::Never);
+            }
+
+            if let Some(docblock) = docblock.as_ref() {
                 if docblock.is_deprecated {
                     meta.flags |= MetadataFlags::DEPRECATED;
                 }
@@ -90,7 +100,8 @@ pub fn scan_class_like_constants<'arena>(
                 }
 
                 if let Some(type_string) = &docblock.type_string {
-                    match get_type_metadata_from_type_string(type_string, classname, type_context, scope) {
+                    match get_type_metadata_from_type_string(context.arena, type_string, classname, type_context, scope)
+                    {
                         Ok(type_metadata) => {
                             let real_type = meta.type_declaration.as_ref();
                             let type_metadata = merge_type_preserving_nullability(type_metadata, real_type);

@@ -172,7 +172,7 @@ impl<'arena> Format<'arena> for Program<'arena> {
                 Document::Array(arr) => {
                     parts.extend(arr);
                 }
-                doc => parts.push(doc),
+                other => parts.push(other),
             }
         }
 
@@ -241,6 +241,7 @@ impl<'arena> Format<'arena> for Statement<'arena> {
                 Statement::HaltCompiler(h) => h.format(f),
                 Statement::Unset(u) => u.format(f),
                 Statement::Noop(_) => Document::String(";"),
+                #[allow(clippy::unreachable)]
                 _ => unreachable!("A statement variant was not handled in formatter: {self:?}"),
             }
         });
@@ -1022,6 +1023,7 @@ impl<'arena> Format<'arena> for Terminator<'arena> {
                 Terminator::ClosingTag(t) => {
                     Document::Array(vec![in f.arena; Document::Space(Space::soft()), t.format(f)])
                 }
+                #[allow(clippy::unreachable)]
                 Terminator::Missing(span) => {
                     unreachable!("Syntax error: a terminator was expected but missing at {:#?}", span)
                 }
@@ -1253,7 +1255,24 @@ impl<'arena> Format<'arena> for Return<'arena> {
                 contents.push(format_return_value(f, value));
             }
 
-            contents.push(self.terminator.format(f));
+            let terminator = self.terminator.format(f);
+
+            if let Some(chain_group_id) = f.take_member_access_chain_group_id()
+                && f.settings.method_chain_semicolon_on_next_line
+            {
+                contents.push(Document::IfBreak(
+                    IfBreak::new(
+                        f.arena,
+                        Document::Array(vec![in f.arena; Document::Line(Line::hard()), Document::String(";")]),
+                        terminator,
+                    )
+                    .with_id(chain_group_id),
+                ));
+
+                return Document::Group(Group::new(contents).with_id(chain_group_id));
+            }
+
+            contents.push(terminator);
 
             Document::Group(Group::new(contents))
         })
@@ -1751,6 +1770,17 @@ impl<'arena> Format<'arena> for FunctionLikeParameter<'arena> {
 
             if self.ellipsis.is_some() {
                 contents.push(Document::String("..."));
+            }
+
+            if let (Some(padding), Some(list_id)) =
+                (f.parameter_state.variable_padding, f.parameter_state.list_group_id)
+                && padding > 0
+            {
+                let mut spaces = Vec::with_capacity_in(padding, f.arena);
+                spaces.resize(padding, b' ');
+                // SAFETY: the buffer holds only ASCII space bytes, which is valid UTF-8.
+                let spaces = Document::String(unsafe { std::str::from_utf8_unchecked(spaces.into_bump_slice()) });
+                contents.push(Document::IfBreak(IfBreak::new(f.arena, spaces, Document::empty()).with_id(list_id)));
             }
 
             contents.push(self.variable.format(f));

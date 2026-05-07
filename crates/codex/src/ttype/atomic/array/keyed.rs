@@ -16,7 +16,8 @@ use crate::ttype::union::TUnion;
 /// Metadata for a PHP array analyzed as a keyed array (map/dictionary-like).
 ///
 /// Corresponds to `array<TKey, TValue>` or `array{'key': TVal, 1: TVal2 ...}` shape.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Eq, Hash, PartialOrd, Ord, Default)]
+#[allow(clippy::derived_hash_with_manual_eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct TKeyedArray {
     /// Specific types known for certain keys (`ArrayKey`). The bool indicates if the element is optional.
     pub known_items: Option<BTreeMap<ArrayKey, (bool, TUnion)>>,
@@ -25,6 +26,36 @@ pub struct TKeyedArray {
     pub parameters: Option<(Arc<TUnion>, Arc<TUnion>)>,
     /// Flag indicating if the array is known to contain at least one element.
     pub non_empty: bool,
+}
+
+impl PartialEq for TKeyedArray {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        if std::ptr::eq(self, other) {
+            return true;
+        }
+
+        if self.non_empty != other.non_empty {
+            return false;
+        }
+
+        if !params_eq(self.parameters.as_ref(), other.parameters.as_ref()) {
+            return false;
+        }
+
+        self.known_items == other.known_items
+    }
+}
+
+#[inline]
+fn params_eq(a: Option<&(Arc<TUnion>, Arc<TUnion>)>, b: Option<&(Arc<TUnion>, Arc<TUnion>)>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some((ak, av)), Some((bk, bv))) => {
+            (Arc::ptr_eq(ak, bk) || **ak == **bk) && (Arc::ptr_eq(av, bv) || **av == **bv)
+        }
+        _ => false,
+    }
 }
 
 impl TKeyedArray {
@@ -134,6 +165,19 @@ impl TKeyedArray {
     #[must_use]
     pub fn as_non_empty_array(&self, non_empty: bool) -> Self {
         Self { non_empty, ..self.clone() }
+    }
+
+    /// Returns `true` if this array is known to have exclusively string keys.
+    ///
+    /// Checks both generic parameters and known items. Returns `false` for
+    /// arrays with no key information at all (empty untyped arrays).
+    #[must_use]
+    pub fn has_exclusively_string_keys(&self) -> bool {
+        let has_key_info = self.parameters.is_some() || self.known_items.as_ref().is_some_and(|i| !i.is_empty());
+
+        has_key_info
+            && self.parameters.as_ref().is_none_or(|(k, _)| k.is_any_string())
+            && self.known_items.as_ref().is_none_or(|i| i.keys().all(|k| matches!(k, ArrayKey::String(_))))
     }
 }
 

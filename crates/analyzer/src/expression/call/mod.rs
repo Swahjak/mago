@@ -35,6 +35,7 @@ use crate::invocation::analyzer::analyze_invocation;
 use crate::invocation::post_process::post_invocation_process;
 use crate::invocation::return_type_fetcher::fetch_invocation_return_type;
 use crate::reconciler::assertion_reconciler;
+use crate::utils::names::display_function_like_identifier;
 
 pub mod function_call;
 pub mod method_call;
@@ -231,8 +232,8 @@ fn analyze_invocation_targets<'ctx, 'ast, 'arena>(
 /// When inside a conditional like `if ($obj->isValid())` where `isValid` has method call
 /// assertions like `@phpstan-assert-if-true Statement $this->first()`, this function
 /// narrows the return type of `first()` from `Statement|null` to `Statement`.
-fn apply_method_call_assertions<'ctx, 'arena>(
-    context: &mut Context<'ctx, 'arena>,
+fn apply_method_call_assertions<'ctx>(
+    context: &mut Context<'ctx, '_>,
     block_context: &BlockContext<'ctx>,
     this_variable: Option<&str>,
     method_name: Option<Atom>,
@@ -358,10 +359,10 @@ fn get_function_like_target_inner<'ctx>(
         if !skip_error_on_not_found {
             let title_str = function_like.title_kind_str();
             let kind_str = function_like.kind_str();
-            let name_str = function_like.as_string();
+            let name_str = display_function_like_identifier(context, &function_like);
 
             let issue = if let Some(alt_id) = alternative {
-                let alt_name_str = alt_id.as_string();
+                let alt_name_str = display_function_like_identifier(context, &alt_id);
 
                 Issue::error(format!(
                     "Could not find definition for {kind_str} `{name_str}` (also tried as `{alt_name_str}` in a broader scope)."
@@ -436,7 +437,7 @@ fn inspect_arguments<'ctx, 'arena>(
     }
 
     let mut argument_annotations = vec![];
-    for (idx, argument) in invocation_arguments.get_arguments().iter().enumerate() {
+    for (idx, argument) in invocation_arguments.iter_arguments().enumerate() {
         let Some(argument_expression) = argument.value() else {
             continue;
         };
@@ -493,18 +494,18 @@ fn confirm_argument_type<'ctx, 'arena>(
         _ => {}
     }
 
-    let arguments = invocation_arguments.get_arguments();
+    let argument_count = invocation_arguments.argument_count();
 
-    if arguments.len() != 2 {
+    if argument_count != 2 {
         context.collector.report_with_code(
             IssueCode::TypeConfirmation,
             Issue::error(format!(
                 "`Mago\\confirm()` expects exactly 2 arguments (a value and an expected type string), but {} {} provided.",
-                arguments.len(),
-                if arguments.len() == 1 { "was" } else { "were" }
+                argument_count,
+                if argument_count == 1 { "was" } else { "were" }
             ))
             .with_annotation(Annotation::primary(target.span())
-                .with_message(if arguments.len() < 2 {
+                .with_message(if argument_count < 2 {
                     "Too few arguments provided: expected a value and a type string."
                 } else {
                     "Too many arguments provided: expected only a value and a type string."
@@ -516,8 +517,12 @@ fn confirm_argument_type<'ctx, 'arena>(
         return Ok(());
     }
 
-    let value_to_check_argument = &arguments[0];
-    let expected_type_string_argument = &arguments[1];
+    let Some(value_to_check_argument) = invocation_arguments.get_argument(0) else {
+        return Ok(());
+    };
+    let Some(expected_type_string_argument) = invocation_arguments.get_argument(1) else {
+        return Ok(());
+    };
 
     let Some(value_expression) = value_to_check_argument.value() else {
         return Ok(());
